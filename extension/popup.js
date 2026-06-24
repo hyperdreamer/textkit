@@ -6,7 +6,6 @@ const shortProgressEl = document.getElementById('short-progress');
 const progressEl = document.getElementById('progress');
 const resultEl = document.getElementById('result');
 const startButton = document.getElementById('start');
-const translateButton = document.getElementById('translate-text');
 const stopButton = document.getElementById('stop');
 const retryButton = document.getElementById('retry');
 const copyButton = document.getElementById('copy');
@@ -53,7 +52,6 @@ tabs.forEach(tab => {
 // ── OCR panel listeners ───────────────────────────────────────
 document.addEventListener('DOMContentLoaded', init);
 startButton.addEventListener('click', startCapture);
-translateButton.addEventListener('click', translateOcrText);
 stopButton.addEventListener('click', stopCapture);
 retryButton.addEventListener('click', retryCapture);
 copyButton.addEventListener('click', copyOcrText);
@@ -170,38 +168,6 @@ async function startCapture() {
   }
 }
 
-async function translateOcrText() {
-  const text = resultEl.value.trim();
-  if (!text) return;
-  const language = languageSelect.value;
-  if (language === 'original') { progressEl.textContent = 'Select a target language.'; return; }
-  translateButton.disabled = true;
-  progressEl.textContent = `Translating to ${language}...`;
-  try {
-    const host = hostInput.value.trim() || 'localhost';
-    const port = parseInt(portInput.value, 10) || 8000;
-    // Load saved prompt for the target language
-    const key = `translatePrompt:${language}`;
-    const stored = await chrome.storage.local.get(key);
-    const response = await fetch(`http://${host}:${port}/translate`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, language, prompt: stored[key] || undefined })
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const payload = await response.json();
-    if (payload.error) throw new Error(payload.error);
-    resultEl.value = payload.text || '';
-    latestState.mergedText = payload.text || '';
-    if (currentTabId) await chrome.storage.local.set({ [`lastResult:${currentTabId}`]: payload.text || '' });
-    progressEl.textContent = 'Translation complete.';
-    copyButton.disabled = downloadButton.disabled = false;
-  } catch (e) {
-    progressEl.textContent = `Translation failed: ${e.message}`;
-  } finally {
-    translateButton.disabled = false;
-  }
-}
-
 async function stopCapture() { stopButton.disabled = true; await chrome.runtime.sendMessage({ type: 'popup:stop' }); }
 async function retryCapture() {
   retryButton.disabled = true;
@@ -226,7 +192,6 @@ function renderState(state) {
   if (mergedText) resultEl.value = mergedText;
 
   startButton.disabled = isActive;
-  translateButton.disabled = !hasText || isActive || languageSelect.value === 'original';
   stopButton.classList.toggle('hidden', !isActive);
   retryButton.classList.toggle('hidden', !canRetry);
   copyButton.disabled = !hasText;
