@@ -17,8 +17,14 @@ const state = {
   progress: 'Ready',
   mergedText: '',
   fragments: [],
-  error: ''
+  error: '',
+  lastRegion: null
 };
+
+// Load saved region on startup
+chrome.storage.local.get('lastRegion', (items) => {
+  if (items.lastRegion) state.lastRegion = items.lastRegion;
+});
 
 // ── keyboard shortcut ──────────────────────────────────────────
 
@@ -52,6 +58,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
   if (message?.type === 'selection:complete') {
+    // Remember region for reuse
+    const { x, y, width, height } = message.region;
+    const saved = { x, y, width, height };
+    chrome.storage.local.set({ lastRegion: saved });
+    state.lastRegion = saved;
+    broadcastState();
     runCaptureLoop(sender.tab, message.region)
       .then(() => sendResponse({ ok: true }))
       .catch((error) => {
@@ -59,6 +71,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         updateState({ active: false, status: 'Error', error: error.message, progress: 'Failed.' });
         sendResponse({ ok: false, error: error.message });
       });
+    return true;
+  }
+  if (message?.type === 'popup:start-with-region') {
+    handleReuseRegion().then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
   }
   if (message?.type === 'selection:cancelled') {
@@ -77,6 +93,29 @@ async function handlePopupStart() {
   resetState();
   updateState({ active: true, status: 'Selecting', progress: 'Drag a rectangle.' });
   await chrome.tabs.sendMessage(tab.id, { type: 'selection:start' });
+  return { ok: true };
+}
+
+async function handleReuseRegion() {
+  const region = state.lastRegion;
+  if (!region) throw new Error('No saved region. Select a region first.');
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab?.id) throw new Error('No active tab found.');
+  if (tab.windowId == null || tab.windowId < 0) throw new Error('Invalid windowId.');
+  await ensureContentScript(tab.id);
+  // Get actual viewport dimensions from the content script
+  const vp = await chrome.tabs.sendMessage(tab.id, { type: 'get-viewport' });
+  const fullRegion = {
+    ...region,
+    viewportWidth: vp?.width || 1920,
+    viewportHeight: vp?.height || 1080,
+    devicePixelRatio: vp?.dpr || 1
+  };
+  // Run capture directly — no overlay needed
+  runCaptureLoop(tab, fullRegion).catch((e) => {
+    console.error('Reuse capture failed:', e);
+    updateState({ active: false, status: 'Error', error: e.message, progress: 'Failed.' });
+  });
   return { ok: true };
 }
 

@@ -5,15 +5,18 @@ const shortProgressEl = document.getElementById('short-progress');
 const progressEl = document.getElementById('progress');
 const resultEl = document.getElementById('result');
 const startButton = document.getElementById('start');
+const reuseButton = document.getElementById('reuse');
 const copyButton = document.getElementById('copy');
 const downloadButton = document.getElementById('download');
 const hostInput = document.getElementById('ocr-host');
 const portInput = document.getElementById('ocr-port');
+const lastRegionEl = document.getElementById('last-region');
 
 let latestState = null;
 
 document.addEventListener('DOMContentLoaded', init);
 startButton.addEventListener('click', startCapture);
+reuseButton.addEventListener('click', reuseCapture);
 copyButton.addEventListener('click', copyText);
 downloadButton.addEventListener('click', downloadText);
 hostInput.addEventListener('change', saveSettings);
@@ -30,6 +33,15 @@ async function init() {
   hostInput.value = items.ocrHost;
   portInput.value = items.ocrPort;
   await refreshState();
+  // Load saved region for display
+  chrome.storage.local.get('lastRegion', (r) => {
+    if (r.lastRegion) {
+      lastRegionEl.textContent = `Last region: ${r.lastRegion.width}×${r.lastRegion.height}px`;
+      reuseButton.disabled = false;
+    } else {
+      lastRegionEl.textContent = 'No saved region';
+    }
+  });
 }
 
 async function saveSettings() {
@@ -48,6 +60,7 @@ async function refreshState() {
 
 async function startCapture() {
   startButton.disabled = true;
+  reuseButton.disabled = true;
   progressEl.textContent = 'Starting region selection.';
 
   const response = await chrome.runtime.sendMessage({ type: 'popup:start' });
@@ -57,10 +70,24 @@ async function startCapture() {
   }
 }
 
+async function reuseCapture() {
+  reuseButton.disabled = true;
+  startButton.disabled = true;
+  progressEl.textContent = 'Reusing last region...';
+
+  const response = await chrome.runtime.sendMessage({ type: 'popup:start-with-region' });
+  if (!response?.ok) {
+    progressEl.textContent = response?.error || 'No saved region.';
+    reuseButton.disabled = false;
+    startButton.disabled = false;
+  }
+}
+
 function renderState(state) {
   latestState = state || {};
   const mergedText = latestState.mergedText || '';
   const hasText = mergedText.trim().length > 0;
+  const savedRegion = latestState.lastRegion;
 
   statusEl.textContent = latestState.status || 'Idle';
   currentPageEl.textContent = String(latestState.currentPage || 0);
@@ -69,8 +96,13 @@ function renderState(state) {
   progressEl.textContent = latestState.error || latestState.progress || 'Ready';
   resultEl.value = mergedText;
   startButton.disabled = Boolean(latestState.active);
+  reuseButton.disabled = !savedRegion || Boolean(latestState.active);
   copyButton.disabled = !hasText;
   downloadButton.disabled = !hasText;
+
+  if (savedRegion) {
+    lastRegionEl.textContent = `Last region: ${savedRegion.width}×${savedRegion.height}px`;
+  }
 }
 
 async function copyText() {
@@ -82,7 +114,6 @@ async function copyText() {
     copyButton.textContent = 'Copied!';
     setTimeout(() => { copyButton.textContent = prev; }, 1500);
   } catch {
-    // Fallback for non-secure contexts
     resultEl.select();
     document.execCommand('copy');
   }

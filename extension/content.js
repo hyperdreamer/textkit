@@ -22,6 +22,11 @@
       return true;
     }
 
+    if (message?.type === 'get-viewport') {
+      sendResponse({ width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio || 1 });
+      return false;
+    }
+
     return false;
   });
 

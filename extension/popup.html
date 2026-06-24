@@ -125,6 +125,13 @@
         background: #e2e8f0;
         cursor: default;
       }
+
+      #last-region {
+        margin-top: 8px;
+        color: #64748b;
+        font-size: 11px;
+        text-align: center;
+      }
     </style>
   </head>
   <body>
@@ -156,9 +163,11 @@
       <textarea id="result" readonly placeholder="Merged OCR text will appear here."></textarea>
       <div class="actions">
         <button id="start" type="button" class="secondary">Select Region</button>
+        <button id="reuse" type="button" class="secondary" disabled>Reuse</button>
         <button id="copy" type="button" disabled>Copy</button>
         <button id="download" type="button" disabled>Download</button>
       </div>
+      <div id="last-region"></div>
     </main>
     <script src="popup.js"></script>
   </body>
