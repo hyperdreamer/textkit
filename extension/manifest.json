@@ -24,8 +24,8 @@
   "commands": {
     "start-region-capture": {
       "suggested_key": {
-        "default": "Ctrl+Shift+O",
-        "mac": "Command+Shift+O"
+        "default": "Ctrl+Shift+C",
+        "mac": "Command+Shift+C"
       },
       "description": "Select a region and start OCR capture"
     }
