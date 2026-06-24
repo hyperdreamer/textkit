@@ -122,7 +122,7 @@ async function init() {
   currentTabId = tab?.id || null;
 
   const items = await chrome.storage.sync.get({
-    ocrHost: 'localhost', ocrPort: 8000,
+    ocrHost: 'localhost', ocrPort: 8765,
     ocrLanguage: 'original',
     ocrAutoscroll: true, ocrAutoCopy: true,
     ocrAutoTranslate: false
@@ -235,7 +235,7 @@ async function onTlLanguageChange() {
 async function saveSettings() {
   await chrome.storage.sync.set({
     ocrHost: hostInput.value.trim() || 'localhost',
-    ocrPort: parseInt(portInput.value, 10) || 8000,
+    ocrPort: parseInt(portInput.value, 10) || 8765,
     ocrLanguage: languageSelect.value || 'original',
     ocrAutoscroll: autoscrollCheckbox.checked,
     ocrAutoCopy: autocopyCheckbox.checked,
@@ -349,7 +349,7 @@ async function doTranslation() {
   setTl2Progress(`Translating to ${language}...`);
   try {
     const host = hostInput.value.trim() || 'localhost';
-    const port = parseInt(portInput.value, 10) || 8000;
+    const port = parseInt(portInput.value, 10) || 8765;
     const key = `translatePrompt:${language}`;
     const stored = await chrome.storage.local.get(key);
     const response = await fetch(`http://${host}:${port}/translate`, {

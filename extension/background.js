@@ -1,6 +1,6 @@
 
 const DEFAULT_HOST = 'localhost';
-const DEFAULT_PORT = 8000;
+const DEFAULT_PORT = 8765;
 const DEFAULT_LANGUAGE = 'original';
 const OVERLAP_PX = 50;
 const AFTER_SEND_DELAY_MS = 0;

@@ -1,8 +1,8 @@
 # Server bind address. Defaults to "0.0.0.0" when omitted.
 host: "0.0.0.0"
 
-# Server port. Defaults to 8000 when omitted.
-port: 8000
+# Server port. Defaults to 8765 when omitted.
+port: 8765
 
 # AI provider settings.
 ai:

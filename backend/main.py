@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 CONFIG_PATH = Path(__file__).with_name("config.yaml")
 DEFAULT_HOST = "0.0.0.0"
-DEFAULT_PORT = 8000
+DEFAULT_PORT = 8765
 OCR_PROMPT = "Transcribe all text visible in this image. Return only the transcription."
 DEDUP_PROMPT = (
     "Remove any duplicate or overlapping content. Return only the deduplicated text. "
