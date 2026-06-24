@@ -153,10 +153,18 @@ async function init() {
       tl2Progress.textContent = p;
     }
   }
-  // Always reset button to normal state on open
-  tl2Translate.textContent = 'Translate';
-  tl2Translate.classList.remove('danger');
-  tl2AbortController = null;
+  // Restore translating state from storage (survives popup close/reopen)
+  const tl2transKey = currentTabId ? `tl2Translating:${currentTabId}` : null;
+  const tl2trans = tl2transKey ? await chrome.storage.local.get(tl2transKey) : {};
+  if (tl2trans[tl2transKey]) {
+    tl2Translate.textContent = 'Stop';
+    tl2Translate.classList.add('danger');
+    tl2Copy.disabled = tl2Download.disabled = true;
+  } else {
+    tl2Translate.textContent = 'Translate';
+    tl2Translate.classList.remove('danger');
+    tl2AbortController = null;
+  }
   updateTranslationButtons();
 
   chrome.storage.local.get('lastRegion', (r) => {
@@ -319,6 +327,7 @@ async function doTranslation() {
   tl2AbortController = new AbortController();
   tl2Translate.textContent = 'Stop';
   tl2Translate.classList.add('danger');
+  if (currentTabId) chrome.storage.local.set({ [`tl2Translating:${currentTabId}`]: true });
   setTl2Progress(`Translating to ${language}...`);
   try {
     const host = hostInput.value.trim() || 'localhost';
@@ -351,6 +360,7 @@ async function doTranslation() {
     tl2AbortController = null;
     tl2Translate.textContent = 'Translate';
     tl2Translate.classList.remove('danger');
+    if (currentTabId) chrome.storage.local.remove(`tl2Translating:${currentTabId}`);
   }
 }
 
@@ -358,6 +368,11 @@ function stopTranslation() {
   if (tl2AbortController) {
     tl2AbortController.abort();
     tl2AbortController = null;
+    tl2Translate.textContent = 'Translate';
+    tl2Translate.classList.remove('danger');
+    if (currentTabId) chrome.storage.local.remove(`tl2Translating:${currentTabId}`);
+    updateTranslationButtons();
+    setTl2Progress('Translation stopped.');
   }
 }
 
