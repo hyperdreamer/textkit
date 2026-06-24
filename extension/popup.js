@@ -54,6 +54,12 @@ async function init() {
 
   await refreshState();
 
+  // Fallback: if background state was empty, restore from storage again
+  if (!resultEl.value) {
+    const fb = await chrome.storage.local.get('lastResult');
+    if (fb.lastResult) resultEl.value = fb.lastResult;
+  }
+
   chrome.storage.local.get('lastRegion', (r) => {
     if (r.lastRegion) {
       lastRegionEl.textContent = `Last region: ${r.lastRegion.width}×${r.lastRegion.height}px`;

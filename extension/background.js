@@ -344,6 +344,7 @@ async function finalizePostCapture(mergedText, fragments) {
     console.error('Dedup failed:', e);
     state.retryStage = 'dedup';
     state.pendingText = mergedText;
+    chrome.storage.local.set({ lastResult: mergedText });
     updateState({
       active: true,
       status: 'Error',
@@ -369,6 +370,7 @@ async function retryTranslateAndFinalize(finalText, fragments) {
     console.error('Translation failed:', e);
     state.retryStage = 'translate';
     state.pendingText = finalText;
+    chrome.storage.local.set({ lastResult: finalText });
     updateState({
       active: true,
       status: 'Error',
