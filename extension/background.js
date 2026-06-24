@@ -96,7 +96,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === 'popup:stop') {
     state.stopRequested = true;
-    updateState({ progress: 'Stopping...' });
+    // If in error state (waiting for retry), finalize collected fragments now
+    if (state.status === 'Error' && state.fragments?.length > 0) {
+      finalizePostCapture(mergeFragments(state.fragments), state.fragments);
+    } else {
+      updateState({ progress: 'Stopping...' });
+    }
     sendResponse({ ok: true });
     return false;
   }
@@ -202,8 +207,8 @@ async function runCaptureLoop(tab, region) {
 
   while (true) {
     if (state.stopRequested) {
-      updateState({ progress: 'Stopped by user.' });
-      break;
+      await finalizePostCapture(mergeFragments(fragments), fragments);
+      return;
     }
     // Check autoscroll setting
     const { ocrAutoscroll } = await chrome.storage.sync.get({ ocrAutoscroll: true });
@@ -272,8 +277,8 @@ async function resumeCaptureLoop(rs) {
 
   while (true) {
     if (state.stopRequested) {
-      updateState({ progress: 'Stopped by user.' });
-      break;
+      await finalizePostCapture(mergeFragments(fragments), fragments);
+      return;
     }
     // Check autoscroll setting
     const { ocrAutoscroll } = await chrome.storage.sync.get({ ocrAutoscroll: true });
