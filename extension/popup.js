@@ -234,6 +234,11 @@ async function saveSettings() {
 async function saveOcrText() {
   if (!currentTabId) return;
   await chrome.storage.local.set({ [`lastResult:${currentTabId}`]: resultEl.value });
+  // Update button states when user edits text
+  const hasText = resultEl.value.trim().length > 0;
+  copyButton.disabled = !hasText;
+  downloadButton.disabled = !hasText;
+  updateTranslationButtons();
 }
 
 async function refreshState() {
