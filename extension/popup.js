@@ -14,6 +14,7 @@ const hostInput = document.getElementById('ocr-host');
 const portInput = document.getElementById('ocr-port');
 const languageSelect = document.getElementById('ocr-language');
 const autoscrollCheckbox = document.getElementById('ocr-autoscroll');
+const autocopyCheckbox = document.getElementById('ocr-autocopy');
 const lastRegionEl = document.getElementById('last-region');
 
 let latestState = null;
@@ -29,6 +30,7 @@ hostInput.addEventListener('change', saveSettings);
 portInput.addEventListener('change', saveSettings);
 languageSelect.addEventListener('change', saveSettings);
 autoscrollCheckbox.addEventListener('change', saveSettings);
+autocopyCheckbox.addEventListener('change', saveSettings);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'state:update') {
@@ -41,12 +43,14 @@ async function init() {
     ocrHost: 'localhost',
     ocrPort: 8000,
     ocrLanguage: 'original',
-    ocrAutoscroll: true
+    ocrAutoscroll: true,
+    ocrAutoCopy: true
   });
   hostInput.value = items.ocrHost;
   portInput.value = items.ocrPort;
   languageSelect.value = items.ocrLanguage;
   autoscrollCheckbox.checked = items.ocrAutoscroll;
+  autocopyCheckbox.checked = items.ocrAutoCopy;
 
   // Load stored last result in case background state is empty (race condition on startup)
   const stored = await chrome.storage.local.get('lastResult');
@@ -74,7 +78,8 @@ async function saveSettings() {
     ocrHost: hostInput.value.trim() || 'localhost',
     ocrPort: parseInt(portInput.value, 10) || 8000,
     ocrLanguage: languageSelect.value || 'original',
-    ocrAutoscroll: autoscrollCheckbox.checked
+    ocrAutoscroll: autoscrollCheckbox.checked,
+    ocrAutoCopy: autocopyCheckbox.checked
   });
 }
 

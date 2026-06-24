@@ -395,7 +395,8 @@ async function retryTranslateAndFinalize(finalText, fragments) {
     mergedText: translatedText
   });
   chrome.storage.local.set({ lastResult: translatedText });
-  copyToClipboard(translatedText);
+  const { ocrAutoCopy } = await chrome.storage.sync.get({ ocrAutoCopy: true });
+  if (ocrAutoCopy) copyToClipboard(translatedText);
   return translatedText;
 }
 
