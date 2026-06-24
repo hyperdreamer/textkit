@@ -22,6 +22,7 @@ const translatePrompt = document.getElementById('translate-prompt');
 
 // ── Translation panel elements ────────────────────────────────
 const tl2Language = document.getElementById('tl2-language');
+const tl2Progress = document.getElementById('tl2-progress');
 const tl2Result = document.getElementById('tl2-result');
 const tl2Translate = document.getElementById('tl2-translate');
 const tl2Copy = document.getElementById('tl2-copy');
@@ -215,6 +216,7 @@ async function doTranslation() {
   if (!text) return;
   const language = tl2Language.value;
   tl2Translate.disabled = true;
+  tl2Progress.textContent = `Translating to ${language}...`;
   try {
     const host = hostInput.value.trim() || 'localhost';
     const port = parseInt(portInput.value, 10) || 8000;
@@ -229,9 +231,11 @@ async function doTranslation() {
     if (payload.error) throw new Error(payload.error);
     tl2Result.value = payload.text || '';
     tl2Copy.disabled = tl2Download.disabled = false;
+    tl2Progress.textContent = 'Translation complete.';
     updateTranslationButtons();
   } catch (e) {
     tl2Result.value = `Error: ${e.message}`;
+    tl2Progress.textContent = `Translation failed: ${e.message}`;
     updateTranslationButtons();
   } finally {
     tl2Translate.disabled = false;
