@@ -43,6 +43,13 @@ class DedupRequest(BaseModel):
     text: str
 
 
+class TranslateRequest(BaseModel):
+    """Request body accepted by the translate endpoint."""
+
+    text: str
+    language: str
+
+
 @dataclass(frozen=True)
 class AIConfig:
     """Settings needed to call a configured AI provider."""
@@ -341,6 +348,36 @@ async def deduplicate_text(config: AIConfig, text: str) -> OCRResponse:
     raise HTTPException(status_code=400, detail=f"Unsupported AI provider: {config.provider}")
 
 
+async def translate_text(config: AIConfig, text: str, language: str) -> OCRResponse:
+    """Route a translation request to the configured provider."""
+
+    prompt = f"Translate the following text to {language}. Return only the translation."
+
+    if config.provider == "openai":
+        return await _post_openai_chat_completion(
+            config,
+            [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": text},
+            ],
+        )
+    if config.provider == "anthropic":
+        return await _post_anthropic_message(
+            config,
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "text", "text": text},
+                    ],
+                }
+            ],
+        )
+
+    raise HTTPException(status_code=400, detail=f"Unsupported AI provider: {config.provider}")
+
+
 app = FastAPI(title="Qidian OCR Backend")
 
 
@@ -397,6 +434,21 @@ async def dedup(request: DedupRequest) -> OCRResponse:
         raise HTTPException(status_code=500, detail="AI provider configuration is missing")
 
     return await deduplicate_text(config.ai, request.text)
+
+
+@app.post("/translate", response_model=OCRResponse)
+async def translate(request: TranslateRequest) -> OCRResponse:
+    """Accept text and return a translation from the configured AI model."""
+
+    try:
+        config = load_config()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if config.ai is None:
+        raise HTTPException(status_code=500, detail="AI provider configuration is missing")
+
+    return await translate_text(config.ai, request.text, request.language)
 
 
 if __name__ == "__main__":

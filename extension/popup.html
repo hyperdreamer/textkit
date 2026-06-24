@@ -72,7 +72,8 @@
         text-transform: uppercase;
       }
 
-      .settings input {
+      .settings input,
+      .settings select {
         box-sizing: border-box;
         width: 100%;
         margin-top: 2px;
@@ -168,6 +169,17 @@
       <div class="settings">
         <label>Host <input id="ocr-host" type="text" placeholder="localhost"></label>
         <label>Port <input id="ocr-port" type="number" placeholder="8000"></label>
+        <label>Language
+          <select id="ocr-language">
+            <option value="original">Original</option>
+            <option value="Chinese">Chinese</option>
+            <option value="Japanese">Japanese</option>
+            <option value="Korean">Korean</option>
+            <option value="French">French</option>
+            <option value="German">German</option>
+            <option value="Spanish">Spanish</option>
+          </select>
+        </label>
       </div>
       <textarea id="result" readonly placeholder="Merged OCR text will appear here."></textarea>
       <div class="actions">

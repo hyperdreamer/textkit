@@ -1,6 +1,7 @@
 
 const DEFAULT_HOST = 'localhost';
 const DEFAULT_PORT = 8000;
+const DEFAULT_LANGUAGE = 'original';
 const OVERLAP_PX = 50;
 const AFTER_SEND_DELAY_MS = 200;
 
@@ -237,6 +238,7 @@ async function runCaptureLoop(tab, region) {
     mergedText
   });
   const finalText = await postTextForDedup(mergedText);
+  const translatedText = await translateIfNeeded(finalText);
 
   updateState({
     active: false,
@@ -245,7 +247,7 @@ async function runCaptureLoop(tab, region) {
     fragmentsCollected: fragments.length,
     progress: 'Finished.',
     fragments,
-    mergedText: finalText
+    mergedText: translatedText
   });
 }
 
@@ -306,6 +308,7 @@ async function resumeCaptureLoop(rs) {
   const mergedText = mergeFragments(fragments);
   updateState({ progress: 'Deduplicating merged text...', fragments, mergedText });
   const finalText = await postTextForDedup(mergedText);
+  const translatedText = await translateIfNeeded(finalText);
 
   updateState({
     active: false,
@@ -314,7 +317,7 @@ async function resumeCaptureLoop(rs) {
     fragmentsCollected: fragments.length,
     progress: 'Finished.',
     fragments,
-    mergedText: finalText
+    mergedText: translatedText
   });
 }
 
@@ -377,6 +380,32 @@ async function postTextForDedup(text) {
 
   const payload = await response.json();
   if (payload.error) throw new Error(`Dedup backend error: ${payload.error}`);
+  return String(payload.text ?? '').trim();
+}
+
+async function translateIfNeeded(text) {
+  const items = await chrome.storage.sync.get({ ocrLanguage: DEFAULT_LANGUAGE });
+  const language = items.ocrLanguage || DEFAULT_LANGUAGE;
+  if (language === DEFAULT_LANGUAGE) return text;
+
+  updateState({ progress: `Translating to ${language}...` });
+  return postTextForTranslation(text, language);
+}
+
+async function postTextForTranslation(text, language) {
+  const url = await getBackendEndpoint('/translate');
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, language })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Translate HTTP ${response.status}: ${await response.text().catch(() => '')}`);
+  }
+
+  const payload = await response.json();
+  if (payload.error) throw new Error(`Translate backend error: ${payload.error}`);
   return String(payload.text ?? '').trim();
 }
 
