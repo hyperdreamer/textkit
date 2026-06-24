@@ -221,12 +221,19 @@ async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str
     headers = {"Authorization": f"Bearer {config.api_key}"}
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
+        ) as client:
             response = await client.post(
                 f"{config.api_base}/v1/chat/completions",
                 headers=headers,
                 json=request_body,
             )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="OpenAI API timed out — the text may be too long for the model to process in time",
+        ) from exc
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail=f"OpenAI API request failed: {type(exc).__name__}: {exc}") from exc
 
@@ -285,12 +292,19 @@ async def _post_anthropic_message(config: AIConfig, messages: list[dict[str, Any
     }
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
+        ) as client:
             response = await client.post(
                 f"{config.api_base}/v1/messages",
                 headers=headers,
                 json=request_body,
             )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Anthropic API timed out — the text may be too long for the model to process in time",
+        ) from exc
     except httpx.RequestError as exc:
         raise HTTPException(status_code=502, detail=f"Anthropic API request failed: {exc}") from exc
 
