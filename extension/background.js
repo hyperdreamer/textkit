@@ -12,7 +12,6 @@ async function getBackendEndpoint(path) {
 
 let states = new Map();
 let savedLastRegion = null;
-let savedLastResult = '';
 
 function getState(tabId) {
   if (!states.has(tabId)) {
@@ -33,13 +32,6 @@ chrome.storage.local.get('lastRegion', (items) => {
     states.forEach((state) => { state.lastRegion = savedLastRegion; });
   }
 });
-// Restore last result from previous session
-chrome.storage.local.get('lastResult', (items) => {
-  if (items.lastResult) {
-    savedLastResult = items.lastResult;
-  }
-});
-
 // ── keyboard shortcut ──────────────────────────────────────────
 
 chrome.commands.onCommand.addListener(async (command) => {
@@ -375,8 +367,7 @@ async function finalizePostCapture(tabId, mergedText, fragments) {
     console.error('Dedup failed:', e);
     state.retryStage = 'dedup';
     state.pendingText = mergedText;
-    chrome.storage.local.set({ lastResult: mergedText });
-    savedLastResult = mergedText;
+    chrome.storage.local.set({ [`lastResult:${tabId}`]: mergedText });
     updateState(tabId, {
       active: true,
       status: 'Error',
@@ -403,8 +394,7 @@ async function retryTranslateAndFinalize(tabId, finalText, fragments) {
     console.error('Translation failed:', e);
     state.retryStage = 'translate';
     state.pendingText = finalText;
-    chrome.storage.local.set({ lastResult: finalText });
-    savedLastResult = finalText;
+    chrome.storage.local.set({ [`lastResult:${tabId}`]: finalText });
     updateState(tabId, {
       active: true,
       status: 'Error',
@@ -428,8 +418,7 @@ async function retryTranslateAndFinalize(tabId, finalText, fragments) {
     fragments,
     mergedText: translatedText
   });
-  chrome.storage.local.set({ lastResult: translatedText });
-  savedLastResult = translatedText;
+  chrome.storage.local.set({ [`lastResult:${tabId}`]: translatedText });
   const { ocrAutoCopy } = await chrome.storage.sync.get({ ocrAutoCopy: true });
   if (ocrAutoCopy) copyToClipboard(translatedText);
   return translatedText;

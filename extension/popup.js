@@ -57,16 +57,17 @@ async function init() {
   autoscrollCheckbox.checked = items.ocrAutoscroll;
   autocopyCheckbox.checked = items.ocrAutoCopy;
 
-  // Load stored last result in case background state is empty (race condition on startup)
-  const stored = await chrome.storage.local.get('lastResult');
-  if (stored.lastResult) resultEl.value = stored.lastResult;
+  // Load stored result for this tab only. New tabs stay empty.
+  const resultKey = currentTabId ? `lastResult:${currentTabId}` : null;
+  const stored = resultKey ? await chrome.storage.local.get(resultKey) : {};
+  if (resultKey && stored[resultKey]) resultEl.value = stored[resultKey];
 
   await refreshState();
 
-  // Fallback: if background state was empty, restore from storage again
-  if (!resultEl.value) {
-    const fb = await chrome.storage.local.get('lastResult');
-    if (fb.lastResult) resultEl.value = fb.lastResult;
+  // Fallback: if background state was empty, restore this tab's stored result again.
+  if (!resultEl.value && resultKey) {
+    const fb = await chrome.storage.local.get(resultKey);
+    if (fb[resultKey]) resultEl.value = fb[resultKey];
   }
 
   chrome.storage.local.get('lastRegion', (r) => {
@@ -138,6 +139,9 @@ async function translateText() {
     const translated = payload.text || '';
     resultEl.value = translated;
     latestState.mergedText = translated;
+    if (currentTabId) {
+      await chrome.storage.local.set({ [`lastResult:${currentTabId}`]: translated });
+    }
     progressEl.textContent = 'Translation complete.';
     copyButton.disabled = false;
     downloadButton.disabled = false;
@@ -165,7 +169,7 @@ async function retryCapture() {
 
 function renderState(state) {
   latestState = state || {};
-  const mergedText = latestState.mergedText || resultEl.value || '';
+  const mergedText = latestState.mergedText || '';
   const hasText = mergedText.trim().length > 0;
   const savedRegion = latestState.lastRegion;
   const isActive = Boolean(latestState.active);
