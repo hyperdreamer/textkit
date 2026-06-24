@@ -369,8 +369,8 @@ async function doTranslation() {
       body: JSON.stringify({ text, language, prompt: stored[key] || undefined }),
       signal: tl2AbortController.signal
     });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
     if (payload.error) throw new Error(payload.error);
     tl2Result.value = payload.text || '';
     // Save translated result to storage (per-tab)

@@ -258,7 +258,7 @@ async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str
             )
     except httpx.TimeoutException as exc:
         raise HTTPException(
-            status_code=502,
+            status_code=504,
             detail="OpenAI API timed out — the text may be too long for the model to process in time",
         ) from exc
     except httpx.RequestError as exc:
@@ -334,7 +334,7 @@ async def _post_anthropic_message(config: AIConfig, messages: list[dict[str, Any
             )
     except httpx.TimeoutException as exc:
         raise HTTPException(
-            status_code=502,
+            status_code=504,
             detail="Anthropic API timed out — the text may be too long for the model to process in time",
         ) from exc
     except httpx.RequestError as exc:
