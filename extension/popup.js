@@ -123,9 +123,10 @@ async function init() {
   await loadPromptForLanguage();
 
   // Load Translation tab language and last result
-  const tl2 = await chrome.storage.local.get(['tl2Language', 'tl2Result']);
+  const tl2 = await chrome.storage.local.get(['tl2Language', 'tl2Result', 'tl2Progress']);
   if (tl2.tl2Language) tl2Language.value = tl2.tl2Language;
   if (tl2.tl2Result) { tl2Result.value = tl2.tl2Result; tl2Copy.disabled = tl2Download.disabled = false; }
+  if (tl2.tl2Progress) tl2Progress.textContent = tl2.tl2Progress;
   updateTranslationButtons();
 
   chrome.storage.local.get('lastRegion', (r) => {
@@ -261,7 +262,7 @@ async function doTranslation() {
   tl2AbortController = new AbortController();
   tl2Translate.textContent = 'Stop';
   tl2Translate.classList.add('danger');
-  tl2Progress.textContent = `Translating to ${language}...`;
+  setTl2Progress(`Translating to ${language}...`);
   try {
     const host = hostInput.value.trim() || 'localhost';
     const port = parseInt(portInput.value, 10) || 8000;
@@ -279,14 +280,14 @@ async function doTranslation() {
     // Save translated result to storage
     chrome.storage.local.set({ [`translatedResult:${currentTabId}`]: payload.text || '' });
     tl2Copy.disabled = tl2Download.disabled = false;
-    tl2Progress.textContent = 'Translation complete.';
+    setTl2Progress('Translation complete.');
     updateTranslationButtons();
   } catch (e) {
     if (e.name === 'AbortError') {
-      tl2Progress.textContent = 'Translation stopped.';
+      setTl2Progress('Translation stopped.');
     } else {
       tl2Result.value = `Error: ${e.message}`;
-      tl2Progress.textContent = `Translation failed: ${e.message}`;
+      setTl2Progress(`Translation failed: ${e.message}`);
     }
     updateTranslationButtons();
   } finally {
@@ -307,6 +308,11 @@ function copyResult(textarea, button) {
   const t = textarea.value.trim(); if (!t) return;
   try { navigator.clipboard.writeText(t); button.textContent = 'Copied!'; setTimeout(() => button.textContent = 'Copy', 1500); }
   catch { textarea.select(); document.execCommand('copy'); }
+}
+
+function setTl2Progress(text) {
+  tl2Progress.textContent = text;
+  chrome.storage.local.set({ tl2Progress: text });
 }
 
 function updateTranslationButtons() {
