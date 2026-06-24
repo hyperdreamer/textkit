@@ -52,6 +52,16 @@ class TranslateRequest(BaseModel):
 
 
 @dataclass(frozen=True)
+class TimeoutConfig:
+    """Per-phase HTTP timeouts for AI provider calls (all in seconds)."""
+
+    connect: float = 10.0
+    read: float = 600.0
+    write: float = 60.0
+    pool: float = 10.0
+
+
+@dataclass(frozen=True)
 class AIConfig:
     """Settings needed to call a configured AI provider."""
 
@@ -59,6 +69,7 @@ class AIConfig:
     api_base: str
     api_key: str
     model: str
+    timeout: TimeoutConfig = TimeoutConfig()
 
 
 @dataclass(frozen=True)
@@ -138,6 +149,16 @@ def load_config() -> AppConfig:
     api_base = str(ai_section.get("api_base", "https://api.openai.com")).rstrip("/")
     model = str(ai_section.get("model", "gpt-4.1-mini"))
 
+    # Optional timeout overrides
+    timeout_raw = ai_section.get("timeout")
+    timeout_section = timeout_raw if isinstance(timeout_raw, dict) else {}
+    timeout = TimeoutConfig(
+        connect=float(timeout_section.get("connect", 10.0)),
+        read=float(timeout_section.get("read", 600.0)),
+        write=float(timeout_section.get("write", 60.0)),
+        pool=float(timeout_section.get("pool", 10.0)),
+    )
+
     # Lazy: resolve API key now if available, otherwise store empty string.
     # Actual key requirement is enforced at request time in _call_openai / _call_anthropic.
     try:
@@ -153,6 +174,7 @@ def load_config() -> AppConfig:
             api_base=api_base,
             api_key=api_key,
             model=model,
+            timeout=timeout,
         ),
     )
 
@@ -222,7 +244,12 @@ async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str
 
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
+            timeout=httpx.Timeout(
+                connect=config.timeout.connect,
+                read=config.timeout.read,
+                write=config.timeout.write,
+                pool=config.timeout.pool,
+            )
         ) as client:
             response = await client.post(
                 f"{config.api_base}/v1/chat/completions",
@@ -293,7 +320,12 @@ async def _post_anthropic_message(config: AIConfig, messages: list[dict[str, Any
 
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
+            timeout=httpx.Timeout(
+                connect=config.timeout.connect,
+                read=config.timeout.read,
+                write=config.timeout.write,
+                pool=config.timeout.pool,
+            )
         ) as client:
             response = await client.post(
                 f"{config.api_base}/v1/messages",

@@ -23,3 +23,12 @@ ai:
 
   # Vision-capable model name to use for OCR.
   model: "gpt-4.1-mini"
+
+  # Per-phase HTTP timeouts for AI provider calls (all in seconds).
+  # Omit any key to use its default.  Increase ``read`` when translating
+  # very long text that may take the model several minutes to process.
+  # timeout:
+  #   connect: 10    # TCP/TLS handshake (default: 10)
+  #   read: 600      # waiting for response body (default: 600 = 10 min)
+  #   write: 60      # sending the request body (default: 60)
+  #   pool: 10       # acquiring a connection from the pool (default: 10)
