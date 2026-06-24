@@ -279,6 +279,17 @@ function renderState(state) {
   if (sr) lastRegionEl.textContent = `Last region: ${sr.width}x${sr.height}px`;
 
   updateTranslationButtons();
+
+  // Handle auto-translate state from background
+  if (latestState.tl2Translating) {
+    tl2Translate.textContent = 'Stop';
+    tl2Translate.classList.add('danger');
+    tl2Copy.disabled = tl2Download.disabled = true;
+    setTl2Progress('Translating...');
+  } else if (!latestState.active && !latestState.tl2Translating) {
+    // Only reset button if not actively translating and not in capture
+    if (tl2AbortController) return; // Don't reset during user-initiated translate
+  }
 }
 
 async function copyOcrText() {

@@ -434,7 +434,7 @@ async function autoTranslateIfEnabled(tabId, originalText) {
   });
   if (!ocrAutoTranslate || ocrLanguage === 'original') return;
 
-  chrome.runtime.sendMessage({ type: 'translation:start', tabId }).catch(() => {});
+  updateState(tabId, { tl2Translating: true });
   try {
     const key = `translatePrompt:${ocrLanguage}`;
     const stored = await chrome.storage.local.get(key);
@@ -447,9 +447,11 @@ async function autoTranslateIfEnabled(tabId, originalText) {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const payload = await response.json();
     const translated = payload.text || '';
+    updateState(tabId, { tl2Translating: false });
     chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
   } catch (e) {
     console.error('Auto-translate failed:', e);
+    updateState(tabId, { tl2Translating: false });
     chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: '' }).catch(() => {});
   }
 }
