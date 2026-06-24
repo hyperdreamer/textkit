@@ -233,11 +233,22 @@ function downloadOcrText() {
 }
 
 // ── Translation panel actions ─────────────────────────────────
+let tl2AbortController = null;
+
 async function doTranslation() {
+  // If already translating, treat as Stop
+  if (tl2AbortController) {
+    stopTranslation();
+    return;
+  }
+
   const text = resultEl.value.trim();
   if (!text) return;
   const language = tl2Language.value;
-  tl2Translate.disabled = true;
+
+  tl2AbortController = new AbortController();
+  tl2Translate.textContent = 'Stop';
+  tl2Translate.classList.add('danger');
   tl2Progress.textContent = `Translating to ${language}...`;
   try {
     const host = hostInput.value.trim() || 'localhost';
@@ -246,7 +257,8 @@ async function doTranslation() {
     const stored = await chrome.storage.local.get(key);
     const response = await fetch(`http://${host}:${port}/translate`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, language, prompt: stored[key] || undefined })
+      body: JSON.stringify({ text, language, prompt: stored[key] || undefined }),
+      signal: tl2AbortController.signal
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const payload = await response.json();
@@ -256,11 +268,24 @@ async function doTranslation() {
     tl2Progress.textContent = 'Translation complete.';
     updateTranslationButtons();
   } catch (e) {
-    tl2Result.value = `Error: ${e.message}`;
-    tl2Progress.textContent = `Translation failed: ${e.message}`;
+    if (e.name === 'AbortError') {
+      tl2Progress.textContent = 'Translation stopped.';
+    } else {
+      tl2Result.value = `Error: ${e.message}`;
+      tl2Progress.textContent = `Translation failed: ${e.message}`;
+    }
     updateTranslationButtons();
   } finally {
-    tl2Translate.disabled = false;
+    tl2AbortController = null;
+    tl2Translate.textContent = 'Translate';
+    tl2Translate.classList.remove('danger');
+  }
+}
+
+function stopTranslation() {
+  if (tl2AbortController) {
+    tl2AbortController.abort();
+    tl2AbortController = null;
   }
 }
 
