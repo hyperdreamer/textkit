@@ -3,7 +3,7 @@ const DEFAULT_HOST = 'localhost';
 const DEFAULT_PORT = 8000;
 const DEFAULT_LANGUAGE = 'original';
 const OVERLAP_PX = 50;
-const AFTER_SEND_DELAY_MS = 200;
+const AFTER_SEND_DELAY_MS = 0;
 
 async function getBackendEndpoint(path) {
   const items = await chrome.storage.sync.get({ ocrHost: DEFAULT_HOST, ocrPort: DEFAULT_PORT });
