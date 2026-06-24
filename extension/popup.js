@@ -101,8 +101,8 @@ async function startCapture() {
 }
 
 async function translateText() {
-  const text = latestState?.mergedText || resultEl.value || '';
-  if (!text.trim()) return;
+  const text = resultEl.value.trim();
+  if (!text) return;
 
   const language = languageSelect.value;
   if (language === 'original') {
@@ -186,8 +186,8 @@ function renderState(state) {
 }
 
 async function copyText() {
-  const text = latestState?.mergedText || resultEl.value || '';
-  if (!text.trim()) return;
+  const text = resultEl.value.trim();
+  if (!text) return;
   try {
     await navigator.clipboard.writeText(text);
     const prev = copyButton.textContent;
@@ -200,8 +200,8 @@ async function copyText() {
 }
 
 function downloadText() {
-  const text = latestState?.mergedText || resultEl.value || '';
-  if (!text.trim()) return;
+  const text = resultEl.value.trim();
+  if (!text) return;
   const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
