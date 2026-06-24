@@ -21,7 +21,9 @@ const state = {
   error: '',
   lastRegion: null,
   stopRequested: false,
-  retryState: null
+  retryState: null,
+  retryStage: null,
+  pendingText: ''
 };
 
 // Load saved region on startup
@@ -140,6 +142,20 @@ async function handleReuseRegion() {
 }
 
 async function handleRetry() {
+  if (state.retryStage === 'dedup') {
+    const pendingText = state.pendingText;
+    updateState({ active: true, status: 'Deduplicating', progress: 'Retrying dedup...', error: '' });
+    await finalizePostCapture(pendingText, state.fragments || []);
+    return { ok: true };
+  }
+
+  if (state.retryStage === 'translate') {
+    const pendingText = state.pendingText;
+    updateState({ active: true, status: 'Translating', progress: 'Retrying translation...', error: '' });
+    const translatedText = await retryTranslateAndFinalize(pendingText, state.fragments || []);
+    return { ok: true, translatedText };
+  }
+
   const rs = state.retryState;
   if (!rs) throw new Error('No retry state saved.');
   state.retryState = null;
@@ -237,18 +253,7 @@ async function runCaptureLoop(tab, region) {
     fragments,
     mergedText
   });
-  const finalText = await postTextForDedup(mergedText);
-  const translatedText = await translateIfNeeded(finalText);
-
-  updateState({
-    active: false,
-    status: 'Done',
-    currentPage: fragments.length,
-    fragmentsCollected: fragments.length,
-    progress: 'Finished.',
-    fragments,
-    mergedText: translatedText
-  });
+  await finalizePostCapture(mergedText, fragments);
 }
 
 async function resumeCaptureLoop(rs) {
@@ -307,9 +312,56 @@ async function resumeCaptureLoop(rs) {
 
   const mergedText = mergeFragments(fragments);
   updateState({ progress: 'Deduplicating merged text...', fragments, mergedText });
-  const finalText = await postTextForDedup(mergedText);
-  const translatedText = await translateIfNeeded(finalText);
+  await finalizePostCapture(mergedText, fragments);
+}
 
+async function finalizePostCapture(mergedText, fragments) {
+  let finalText;
+  try {
+    finalText = await postTextForDedup(mergedText);
+  } catch (e) {
+    console.error('Dedup failed:', e);
+    state.retryStage = 'dedup';
+    state.pendingText = mergedText;
+    updateState({
+      active: true,
+      status: 'Error',
+      error: 'Dedup failed. Click Retry.',
+      progress: 'Dedup failed. Click Retry.',
+      fragments,
+      mergedText,
+      fragmentsCollected: fragments.length
+    });
+    return;
+  }
+
+  await retryTranslateAndFinalize(finalText, fragments);
+}
+
+async function retryTranslateAndFinalize(finalText, fragments) {
+  let translatedText;
+  try {
+    state.retryStage = null;
+    state.pendingText = '';
+    translatedText = await translateIfNeeded(finalText);
+  } catch (e) {
+    console.error('Translation failed:', e);
+    state.retryStage = 'translate';
+    state.pendingText = finalText;
+    updateState({
+      active: true,
+      status: 'Error',
+      error: 'Translation failed. Click Retry.',
+      progress: 'Translation failed. Click Retry.',
+      fragments,
+      mergedText: finalText,
+      fragmentsCollected: fragments.length
+    });
+    return null;
+  }
+
+  state.retryStage = null;
+  state.pendingText = '';
   updateState({
     active: false,
     status: 'Done',
@@ -319,6 +371,7 @@ async function resumeCaptureLoop(rs) {
     fragments,
     mergedText: translatedText
   });
+  return translatedText;
 }
 
 // ── crop ───────────────────────────────────────────────────────
@@ -485,7 +538,8 @@ function sleep(ms) {
 
 function resetState() {
   Object.assign(state, { active: false, status: 'Idle', currentPage: 0, fragmentsCollected: 0,
-    progress: 'Ready', mergedText: '', fragments: [], error: '', stopRequested: false });
+    progress: 'Ready', mergedText: '', fragments: [], error: '', stopRequested: false,
+    retryState: null, retryStage: null, pendingText: '' });
   broadcastState();
 }
 

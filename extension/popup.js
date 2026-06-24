@@ -114,7 +114,7 @@ function renderState(state) {
   const savedRegion = latestState.lastRegion;
   const isActive = Boolean(latestState.active);
   const isError = latestState.status === 'Error';
-  const canRetry = isError && latestState.active && state.retryState;
+  const canRetry = (isError && latestState.active && latestState.retryState) || !!latestState.retryStage;
 
   statusEl.textContent = latestState.status || 'Idle';
   currentPageEl.textContent = String(latestState.currentPage || 0);
