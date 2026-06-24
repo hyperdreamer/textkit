@@ -389,7 +389,7 @@ async function retryTranslateAndFinalize(tabId, finalText, fragments) {
   try {
     state.retryStage = null;
     state.pendingText = '';
-    translatedText = await translateIfNeeded(tabId, finalText);
+    translatedText = finalText; // OCR textarea gets original (untranslated) text
   } catch (e) {
     console.error('Translation failed:', e);
     state.retryStage = 'translate';
@@ -421,7 +421,35 @@ async function retryTranslateAndFinalize(tabId, finalText, fragments) {
   chrome.storage.local.set({ [`lastResult:${tabId}`]: translatedText });
   const { ocrAutoCopy } = await chrome.storage.sync.get({ ocrAutoCopy: true });
   if (ocrAutoCopy) copyToClipboard(translatedText);
+
+  // Auto-translate to Translation tab if enabled
+  await autoTranslateIfEnabled(tabId, translatedText);
+
   return translatedText;
+}
+
+async function autoTranslateIfEnabled(tabId, originalText) {
+  const { ocrAutoTranslate, ocrLanguage } = await chrome.storage.sync.get({
+    ocrAutoTranslate: false, ocrLanguage: 'original'
+  });
+  if (!ocrAutoTranslate || ocrLanguage === 'original') return;
+
+  try {
+    const key = `translatePrompt:${ocrLanguage}`;
+    const stored = await chrome.storage.local.get(key);
+    const url = await getBackendEndpoint('/translate');
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: originalText, language: ocrLanguage, prompt: stored[key] || undefined })
+    });
+    if (!response.ok) return;
+    const payload = await response.json();
+    const translated = payload.text || '';
+    chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
+  } catch (e) {
+    console.error('Auto-translate failed:', e);
+  }
 }
 
 // ── crop ───────────────────────────────────────────────────────
