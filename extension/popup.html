@@ -126,6 +126,15 @@
         cursor: default;
       }
 
+      button.danger {
+        border-color: #dc2626;
+        background: #dc2626;
+      }
+
+      .hidden {
+        display: none;
+      }
+
       #last-region {
         margin-top: 8px;
         color: #64748b;
@@ -164,6 +173,7 @@
       <div class="actions">
         <button id="start" type="button" class="secondary">Select Region</button>
         <button id="reuse" type="button" class="secondary" disabled>Reuse</button>
+        <button id="stop" type="button" class="danger hidden">Stop</button>
         <button id="copy" type="button" disabled>Copy</button>
         <button id="download" type="button" disabled>Download</button>
       </div>

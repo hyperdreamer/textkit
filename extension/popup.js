@@ -6,6 +6,7 @@ const progressEl = document.getElementById('progress');
 const resultEl = document.getElementById('result');
 const startButton = document.getElementById('start');
 const reuseButton = document.getElementById('reuse');
+const stopButton = document.getElementById('stop');
 const copyButton = document.getElementById('copy');
 const downloadButton = document.getElementById('download');
 const hostInput = document.getElementById('ocr-host');
@@ -17,6 +18,7 @@ let latestState = null;
 document.addEventListener('DOMContentLoaded', init);
 startButton.addEventListener('click', startCapture);
 reuseButton.addEventListener('click', reuseCapture);
+stopButton.addEventListener('click', stopCapture);
 copyButton.addEventListener('click', copyText);
 downloadButton.addEventListener('click', downloadText);
 hostInput.addEventListener('change', saveSettings);
@@ -33,7 +35,6 @@ async function init() {
   hostInput.value = items.ocrHost;
   portInput.value = items.ocrPort;
   await refreshState();
-  // Load saved region for display
   chrome.storage.local.get('lastRegion', (r) => {
     if (r.lastRegion) {
       lastRegionEl.textContent = `Last region: ${r.lastRegion.width}×${r.lastRegion.height}px`;
@@ -62,7 +63,6 @@ async function startCapture() {
   startButton.disabled = true;
   reuseButton.disabled = true;
   progressEl.textContent = 'Starting region selection.';
-
   const response = await chrome.runtime.sendMessage({ type: 'popup:start' });
   if (!response?.ok) {
     progressEl.textContent = response?.error || 'Unable to start capture.';
@@ -74,7 +74,6 @@ async function reuseCapture() {
   reuseButton.disabled = true;
   startButton.disabled = true;
   progressEl.textContent = 'Reusing last region...';
-
   const response = await chrome.runtime.sendMessage({ type: 'popup:start-with-region' });
   if (!response?.ok) {
     progressEl.textContent = response?.error || 'No saved region.';
@@ -83,11 +82,17 @@ async function reuseCapture() {
   }
 }
 
+async function stopCapture() {
+  stopButton.disabled = true;
+  await chrome.runtime.sendMessage({ type: 'popup:stop' });
+}
+
 function renderState(state) {
   latestState = state || {};
   const mergedText = latestState.mergedText || '';
   const hasText = mergedText.trim().length > 0;
   const savedRegion = latestState.lastRegion;
+  const isActive = Boolean(latestState.active);
 
   statusEl.textContent = latestState.status || 'Idle';
   currentPageEl.textContent = String(latestState.currentPage || 0);
@@ -95,8 +100,10 @@ function renderState(state) {
   shortProgressEl.textContent = latestState.progress || 'Ready';
   progressEl.textContent = latestState.error || latestState.progress || 'Ready';
   resultEl.value = mergedText;
-  startButton.disabled = Boolean(latestState.active);
-  reuseButton.disabled = !savedRegion || Boolean(latestState.active);
+
+  startButton.disabled = isActive;
+  reuseButton.disabled = !savedRegion || isActive;
+  stopButton.classList.toggle('hidden', !isActive);
   copyButton.disabled = !hasText;
   downloadButton.disabled = !hasText;
 
@@ -122,11 +129,9 @@ async function copyText() {
 function downloadText() {
   const text = latestState?.mergedText || resultEl.value || '';
   if (!text.trim()) return;
-
   const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-
   chrome.downloads.download({
     url,
     filename: `qidian-ocr-${timestamp}.txt`,

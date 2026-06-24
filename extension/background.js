@@ -18,7 +18,8 @@ const state = {
   mergedText: '',
   fragments: [],
   error: '',
-  lastRegion: null
+  lastRegion: null,
+  stopRequested: false
 };
 
 // Load saved region on startup
@@ -97,6 +98,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     updateState({ active: false, status: 'Cancelled', progress: 'Selection cancelled.' });
     return false;
   }
+  if (message?.type === 'popup:stop') {
+    state.stopRequested = true;
+    updateState({ progress: 'Stopping...' });
+    sendResponse({ ok: true });
+    return false;
+  }
   return false;
 });
 
@@ -168,6 +175,10 @@ async function runCaptureLoop(tab, region) {
   let lastScrollY = -1;
 
   while (true) {
+    if (state.stopRequested) {
+      updateState({ progress: 'Stopped by user.' });
+      break;
+    }
     const pageNumber = fragments.length + 1;
     updateState({
       currentPage: pageNumber,
@@ -357,7 +368,7 @@ function sleep(ms) {
 
 function resetState() {
   Object.assign(state, { active: false, status: 'Idle', currentPage: 0, fragmentsCollected: 0,
-    progress: 'Ready', mergedText: '', fragments: [], error: '' });
+    progress: 'Ready', mergedText: '', fragments: [], error: '', stopRequested: false });
   broadcastState();
 }
 
