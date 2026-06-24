@@ -16,6 +16,27 @@
   pointer-events: none;
 }
 
+.qidian-ocr-handle {
+  position: fixed;
+  width: 16px;
+  height: 16px;
+  background: #fff;
+  border: 2px solid #25a5ff;
+  border-radius: 3px;
+  z-index: 2147483648;
+  pointer-events: auto;
+  display: none;
+}
+
+.qidian-ocr-handle.nw { cursor: nw-resize; }
+.qidian-ocr-handle.n  { cursor: n-resize; }
+.qidian-ocr-handle.ne { cursor: ne-resize; }
+.qidian-ocr-handle.e  { cursor: e-resize; }
+.qidian-ocr-handle.se { cursor: se-resize; }
+.qidian-ocr-handle.s  { cursor: s-resize; }
+.qidian-ocr-handle.sw { cursor: sw-resize; }
+.qidian-ocr-handle.w  { cursor: w-resize; }
+
 .qidian-ocr-hint {
   position: fixed;
   top: 16px;
