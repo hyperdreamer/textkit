@@ -32,8 +32,8 @@
       }
 
       .stat {
-        min-height: 52px;
-        padding: 8px;
+        min-height: 36px;
+        padding: 5px 8px;
         border: 1px solid #dbe3ef;
         border-radius: 8px;
         background: #fff;
@@ -144,6 +144,8 @@
       }
 
       .option-row {
+        display: flex;
+        gap: 16px;
         margin-bottom: 10px;
       }
 
@@ -151,6 +153,7 @@
         color: #334155;
         font-size: 12px;
         cursor: pointer;
+        white-space: nowrap;
       }
     </style>
   </head>
@@ -193,10 +196,8 @@
         </label>
       </div>
       <div class="option-row">
-        <label><input id="ocr-autoscroll" type="checkbox" checked> Auto-scroll to end</label>
-      </div>
-      <div class="option-row">
-        <label><input id="ocr-autocopy" type="checkbox" checked> Auto-copy to clipboard</label>
+        <label><input id="ocr-autoscroll" type="checkbox" checked> Auto-scroll</label>
+        <label><input id="ocr-autocopy" type="checkbox" checked> Auto-copy</label>
       </div>
       <textarea id="result" readonly placeholder="Merged OCR text will appear here."></textarea>
       <div class="actions">
