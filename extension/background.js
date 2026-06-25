@@ -488,12 +488,17 @@ async function autoTranslateIfEnabled(tabId, originalText) {
   if (!ocrAutoTranslate || ocrLanguage === 'original') return;
 
   updateState(tabId, { tl2Translating: true });
+  await chrome.storage.local.set({
+    [`tl2Translating:${tabId}`]: true,
+    [`tl2Progress:${tabId}`]: `Translating to ${ocrLanguage}...`
+  });
+  await chrome.storage.local.remove(`tl2Result:${tabId}`);
   chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: true }).catch(() => {});
   try {
     const key = `translatePrompt:${ocrLanguage}`;
     const stored = await chrome.storage.local.get(key);
     const url = await getBackendEndpoint('/translate');
-    const response = await fetch(url, {
+    const response = await fetch(url + '?_=' + Date.now(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: originalText, language: ocrLanguage, prompt: stored[key] || undefined })
@@ -502,6 +507,7 @@ async function autoTranslateIfEnabled(tabId, originalText) {
     const payload = await response.json();
     const translated = payload.text || '';
     updateState(tabId, { tl2Translating: false });
+    chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
     chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
   } catch (e) {
     console.error('Auto-translate failed:', e);
