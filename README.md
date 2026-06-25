@@ -1,6 +1,6 @@
-# qidian-ocr
+# AI OCR
 
-qidian-ocr is a local OCR capture tool for reading long web pages through a browser extension and an AI-backed FastAPI service. The Chromium Manifest V3 extension lets you select a fixed region of the current page, capture that region page-by-page while scrolling, merge overlapping OCR fragments, optionally translate the result, and copy or download the final text.
+AI OCR is a local OCR capture tool for reading long web pages through a browser extension and an AI-backed FastAPI service. The Chromium Manifest V3 extension lets you select a fixed region of the current page, capture that region page-by-page while scrolling, merge overlapping OCR fragments, optionally translate the result, and copy or download the final text.
 
 The backend is provider-neutral: it can call OpenAI-compatible chat completion APIs or Anthropic's Messages API, depending on `backend/config.yaml`.
 
@@ -24,27 +24,27 @@ Typical flow:
 ### Backend
 
 ```sh
-cd /data/home/guest/Development/qidian-ocr/backend
+cd backend
 cp config.example.yaml config.yaml
 ```
 
-Edit `config.yaml` for your provider, model, and API key environment variable name.
+Edit `config.yaml` for your provider, model, and API key.
 
 ```sh
 export OCR_API_KEY="your-api-key"
 pip install -r requirements.txt
-bash start.sh
+python main.py
 ```
 
-By default, the server binds to `0.0.0.0:8000`.
+By default, the server binds to `0.0.0.0:8765`.
 
 ### Extension
 
 1. Open `chrome://extensions`.
 2. Enable Developer mode.
 3. Click Load unpacked.
-4. Select `/data/home/guest/Development/qidian-ocr/extension`.
-5. Open the extension popup and confirm the backend host and port, usually `localhost` and `8000`.
+4. Select the `extension/` directory.
+5. Open the extension popup and confirm the backend host and port, usually `localhost` and `8765`.
 
 ## Backend
 
@@ -63,12 +63,12 @@ Example:
 
 ```yaml
 host: "0.0.0.0"
-port: 8000
+port: 8765
 
 ai:
   provider: "openai"
   api_base: "https://api.openai.com"
-  api_key: "OCR_API_KEY"
+  api_key: "$OCR_API_KEY"
   model: "gpt-4.1-mini"
 ```
 
@@ -78,7 +78,7 @@ Supported `ai` fields:
 - `api_base`: base provider URL without a trailing slash.
   - OpenAI-compatible providers must expose `/v1/chat/completions`.
   - Anthropic-compatible providers must expose `/v1/messages`.
-- `api_key`: the name of the environment variable containing the API key. `api_key_env` is also accepted.
+- `api_key`: the API key. Plaintext values are used directly. Prefix with `$` to treat the value as an environment variable name (e.g. `$OCR_API_KEY`). `api_key_env` is also accepted.
 - `model`: the model name to send to the provider.
 
 The backend also falls back to these environment variable names:
@@ -91,17 +91,11 @@ API key loading is lazy. The app can start without an API key in the environment
 
 ### Launching
 
-`backend/start.sh` starts the app with:
-
-```sh
-python main.py
-```
-
-Run it from the `backend/` directory:
+Run from the `backend/` directory:
 
 ```sh
 cd backend
-bash start.sh
+python main.py
 ```
 
 `main.py` reads `config.yaml` and starts Uvicorn with the configured `host` and `port`.
@@ -132,7 +126,7 @@ Form field:
 Example:
 
 ```sh
-curl -X POST "http://localhost:8000/ocr" \
+curl -X POST "http://localhost:8765/ocr" \
   -F "image=@page.png"
 ```
 
@@ -153,7 +147,7 @@ Request body:
 Example:
 
 ```sh
-curl -X POST "http://localhost:8000/dedup" \
+curl -X POST "http://localhost:8765/dedup" \
   -H "Content-Type: application/json" \
   -d '{"text":"first page\nfirst page\nsecond page"}'
 ```
@@ -176,7 +170,7 @@ Request body:
 Example:
 
 ```sh
-curl -X POST "http://localhost:8000/translate" \
+curl -X POST "http://localhost:8765/translate" \
   -H "Content-Type: application/json" \
   -d '{"text":"Hello world","language":"Chinese"}'
 ```
@@ -286,7 +280,7 @@ The extension does not require a build step. Load the `extension/` folder direct
 
 ### Backend starts but requests fail with an API key error
 
-Confirm that `backend/config.yaml` points to the correct environment variable name and that the variable is exported in the shell running `bash start.sh`.
+Confirm that `backend/config.yaml` points to the correct API key or environment variable name and that the variable is exported in the shell running `python main.py`.
 
 Example:
 
@@ -299,7 +293,7 @@ export OCR_API_KEY="your-api-key"
 Check the popup Host and Port fields. For the default backend config, use:
 
 - Host: `localhost`
-- Port: `8000`
+- Port: `8765`
 
 Also confirm that the backend is running and listening on the configured port.
 
