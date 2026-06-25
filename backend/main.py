@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 from dataclasses import dataclass
@@ -233,6 +234,41 @@ def _extract_anthropic_text(payload: dict[str, Any]) -> str:
     ).strip()
 
 
+async def _call_with_retry(
+    config: AIConfig,
+    make_request: Any,
+    provider_name: str,
+) -> httpx.Response:
+    """Call the AI provider with a hard asyncio deadline and one retry.
+
+    The deadline is set slightly above ``config.timeout.read`` so the
+    per-phase httpx timeouts fire first in normal cases.  If the proxy
+    or network silently drops the connection, the hard deadline ensures
+    the backend always returns a response instead of hanging forever.
+    """
+    deadline = config.timeout.read + 60
+
+    last_exc: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            return await asyncio.wait_for(make_request(), timeout=deadline)
+        except asyncio.TimeoutError:
+            last_exc = HTTPException(
+                status_code=504,
+                detail=f"{provider_name} API did not respond within {deadline}s",
+            )
+        except (httpx.RequestError, ValueError) as exc:
+            last_exc = HTTPException(
+                status_code=502,
+                detail=f"{provider_name} API request failed: {type(exc).__name__}: {exc}",
+            )
+        if attempt == 1:
+            await asyncio.sleep(1)
+
+    assert last_exc is not None
+    raise last_exc
+
+
 async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str, Any]]) -> OCRResponse:
     """Send messages to an OpenAI-compatible /v1/chat/completions API."""
 
@@ -248,7 +284,7 @@ async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str
     }
     headers = {"Authorization": f"Bearer {config.api_key}"}
 
-    try:
+    async def _do_request() -> httpx.Response:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(
                 connect=config.timeout.connect,
@@ -257,26 +293,21 @@ async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str
                 pool=config.timeout.pool,
             )
         ) as client:
-            response = await client.post(
+            return await client.post(
                 f"{config.api_base}/v1/chat/completions",
                 headers=headers,
                 json=request_body,
             )
 
-        if response.is_error:
-            detail = response.text
-            if len(detail) > 500:
-                detail = detail[:500] + "..."
-            raise HTTPException(status_code=502, detail=f"OpenAI API failed: {detail}")
+    response = await _call_with_retry(config, _do_request, "OpenAI")
 
-        payload = response.json()
-    except httpx.TimeoutException:
-        raise HTTPException(
-            status_code=504,
-            detail="OpenAI API timed out — the text may be too long for the model to process in time",
-        )
-    except (httpx.RequestError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail=f"OpenAI API request failed: {type(exc).__name__}: {exc}") from exc
+    if response.is_error:
+        detail = response.text
+        if len(detail) > 500:
+            detail = detail[:500] + "..."
+        raise HTTPException(status_code=502, detail=f"OpenAI API failed: {detail}")
+
+    payload = response.json()
 
     usage = payload.get("usage") or {}
     return OCRResponse(
@@ -330,7 +361,7 @@ async def _post_anthropic_message(config: AIConfig, messages: list[dict[str, Any
         "anthropic-version": "2023-06-01",
     }
 
-    try:
+    async def _do_request() -> httpx.Response:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(
                 connect=config.timeout.connect,
@@ -339,27 +370,21 @@ async def _post_anthropic_message(config: AIConfig, messages: list[dict[str, Any
                 pool=config.timeout.pool,
             )
         ) as client:
-            response = await client.post(
+            return await client.post(
                 f"{config.api_base}/v1/messages",
                 headers=headers,
                 json=request_body,
             )
 
-        if response.is_error:
-            detail = response.text
-            if len(detail) > 500:
-                detail = detail[:500] + "..."
-            raise HTTPException(status_code=502, detail=f"Anthropic API failed: {detail}")
+    response = await _call_with_retry(config, _do_request, "Anthropic")
 
-        payload = response.json()
-    except httpx.TimeoutException:
-        raise HTTPException(
-            status_code=504,
-            detail="Anthropic API timed out — the text may be too long for the model to process in time",
-        )
-    except (httpx.RequestError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail=f"Anthropic API request failed: {exc}") from exc
+    if response.is_error:
+        detail = response.text
+        if len(detail) > 500:
+            detail = detail[:500] + "..."
+        raise HTTPException(status_code=502, detail=f"Anthropic API failed: {detail}")
 
+    payload = response.json()
     usage = payload.get("usage") or {}
     tokens_used = int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
     return OCRResponse(
