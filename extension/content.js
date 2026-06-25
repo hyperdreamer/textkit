@@ -193,7 +193,13 @@
     };
 
     removeOverlay();
-    chrome.runtime.sendMessage({ type: 'selection:complete', region: result });
+    // Wait for the browser to finish painting the overlay removal so
+    // captureVisibleTab doesn't snapshot the hint text or selection UI.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        chrome.runtime.sendMessage({ type: 'selection:complete', region: result });
+      });
+    });
   }
 
   function onKeyDown(event) {
