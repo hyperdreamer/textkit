@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Qidian OCR Capture",
+  "name": "AI OCR Capture",
   "version": "1.0.5",
   "description": "Select a page region, OCR repeated viewport captures, and download merged text.",
   "permissions": [
@@ -25,7 +25,7 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Qidian OCR Capture"
+    "default_title": "AI OCR Capture"
   },
   "commands": {
     "start-region-capture": {

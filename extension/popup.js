@@ -371,26 +371,17 @@ async function doTranslation() {
   tl2Copy.disabled = tl2Download.disabled = true;
   setTl2Progress(`Translating to ${language}...`);
 
-  // Delegate the fetch to the background service worker so it survives
-  // popup close.  The popup context is destroyed when the popup closes,
-  // which cancels any in-flight fetch() — this is why the backend
-  // response was never received for long translations.
-  const response = await chrome.runtime.sendMessage({
+  // Fire-and-forget: the background service worker handles the fetch
+  // and sends translation:update / tl2:translating when done.
+  // Don't await — the popup must stay responsive so Stop works.
+  chrome.runtime.sendMessage({
     type: 'translate:start',
     tabId: currentTabId,
     text,
     language,
     host,
     port
-  });
-  if (!response?.ok) {
-    setTl2Progress(`Translation failed: ${response?.error || 'unknown error'}`);
-    tl2Result.value = `Error: ${response?.error || 'unknown error'}`;
-    tl2Translate.textContent = 'Translate';
-    tl2Translate.classList.remove('danger');
-    if (currentTabId) chrome.storage.local.remove(`tl2Translating:${currentTabId}`);
-    updateTranslationButtons();
-  }
+  }).catch(() => {});
 }
 
 function stopTranslation() {
