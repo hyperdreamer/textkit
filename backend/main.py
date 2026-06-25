@@ -602,7 +602,11 @@ async def translate(request: TranslateRequest) -> Response:
     body_bytes = body_str.encode("utf-8")
     print(f"[translate] encoded — {len(body_bytes)} bytes, returning", flush=True)
     # ────────────────────────────────────────────────────────
-    return Response(content=body_bytes, media_type="application/json")
+    return Response(
+        content=body_bytes,
+        media_type="application/json",
+        headers={"Connection": "close"},
+    )
 
 
 if __name__ == "__main__":
