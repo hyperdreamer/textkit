@@ -236,6 +236,12 @@ def _extract_anthropic_text(payload: dict[str, Any]) -> str:
 async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str, Any]]) -> OCRResponse:
     """Send messages to an OpenAI-compatible /v1/chat/completions API."""
 
+    if not config.api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="No API key configured. Set ai.api_key in config.yaml or the OCR_API_KEY environment variable.",
+        )
+
     request_body = {
         "model": config.model,
         "messages": messages,
@@ -265,7 +271,10 @@ async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str
         raise HTTPException(status_code=502, detail=f"OpenAI API request failed: {type(exc).__name__}: {exc}") from exc
 
     if response.is_error:
-        raise HTTPException(status_code=502, detail=f"OpenAI API failed: {response.text}")
+        detail = response.text
+        if len(detail) > 500:
+            detail = detail[:500] + "..."
+        raise HTTPException(status_code=502, detail=f"OpenAI API failed: {detail}")
 
     try:
         payload = response.json()
@@ -308,6 +317,12 @@ def _anthropic_image_source(data_url: str) -> dict[str, str]:
 async def _post_anthropic_message(config: AIConfig, messages: list[dict[str, Any]]) -> OCRResponse:
     """Send messages to Anthropic's /v1/messages API."""
 
+    if not config.api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="No API key configured. Set ai.api_key in config.yaml or the OCR_API_KEY environment variable.",
+        )
+
     request_body = {
         "model": config.model,
         "max_tokens": 4096,
@@ -341,7 +356,10 @@ async def _post_anthropic_message(config: AIConfig, messages: list[dict[str, Any
         raise HTTPException(status_code=502, detail=f"Anthropic API request failed: {exc}") from exc
 
     if response.is_error:
-        raise HTTPException(status_code=502, detail=f"Anthropic API failed: {response.text}")
+        detail = response.text
+        if len(detail) > 500:
+            detail = detail[:500] + "..."
+        raise HTTPException(status_code=502, detail=f"Anthropic API failed: {detail}")
 
     try:
         payload = response.json()

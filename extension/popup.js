@@ -40,6 +40,7 @@ const panels = {
 
 let latestState = null;
 let currentTabId = null;
+let userEditedResult = false;
 
 // ── Tab switching ─────────────────────────────────────────────
 tabs.forEach(tab => {
@@ -137,10 +138,13 @@ async function init() {
   autotranslateCheckbox.checked = items.ocrAutoTranslate;
 
   const resultKey = currentTabId ? `lastResult:${currentTabId}` : null;
-  const stored = resultKey ? await chrome.storage.local.get(resultKey) : {};
-  if (resultKey && stored[resultKey]) resultEl.value = stored[resultKey];
+  if (resultKey) {
+    const stored = await chrome.storage.local.get(resultKey);
+    if (stored[resultKey]) resultEl.value = stored[resultKey];
+  }
   await refreshState();
   if (!resultEl.value && resultKey) {
+    // refreshState may have populated it via renderState; if still empty, retry
     const fb = await chrome.storage.local.get(resultKey);
     if (fb[resultKey]) resultEl.value = fb[resultKey];
   }
@@ -246,6 +250,7 @@ async function saveSettings() {
 // ── OCR actions ───────────────────────────────────────────────
 async function saveOcrText() {
   if (!currentTabId) return;
+  userEditedResult = true;
   await chrome.storage.local.set({ [`lastResult:${currentTabId}`]: resultEl.value });
   // Update button states when user edits text
   const hasText = resultEl.value.trim().length > 0;
@@ -263,6 +268,7 @@ async function refreshState() {
 }
 
 async function startCapture() {
+  userEditedResult = false;
   startButton.disabled = true;
   progressEl.textContent = 'Starting region selection.';
   const response = await chrome.runtime.sendMessage({ type: 'popup:start' });
@@ -293,7 +299,7 @@ function renderState(state) {
   fragmentsEl.textContent = String(latestState.fragmentsCollected || 0);
   shortProgressEl.textContent = latestState.progress || 'Ready';
   progressEl.textContent = latestState.error || latestState.progress || 'Ready';
-  if (mergedText) resultEl.value = mergedText;
+  if (mergedText && !userEditedResult) resultEl.value = mergedText;
 
   startButton.disabled = isActive;
   stopButton.classList.toggle('hidden', !isActive);

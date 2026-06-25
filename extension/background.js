@@ -173,8 +173,8 @@ async function handleRetry() {
   if (state.retryStage === 'translate') {
     const pendingText = state.pendingText;
     updateState(tab.id, { active: true, status: 'Translating', progress: 'Retrying translation...', error: '' });
-    const translatedText = await retryTranslateAndFinalize(tab.id, pendingText, state.fragments || []);
-    return { ok: true, translatedText };
+    const result = await finalizeCapture(tab.id, pendingText, state.fragments || []);
+    return { ok: true, result };
   }
 
   const rs = state.retryState;
@@ -380,35 +380,14 @@ async function finalizePostCapture(tabId, mergedText, fragments) {
     return;
   }
 
-  await retryTranslateAndFinalize(tabId, finalText, fragments);
+  await finalizeCapture(tabId, finalText, fragments);
 }
 
-async function retryTranslateAndFinalize(tabId, finalText, fragments) {
+async function finalizeCapture(tabId, finalText, fragments) {
   const state = getState(tabId);
-  let translatedText;
-  try {
-    state.retryStage = null;
-    state.pendingText = '';
-    translatedText = finalText; // OCR textarea gets original (untranslated) text
-  } catch (e) {
-    console.error('Translation failed:', e);
-    state.retryStage = 'translate';
-    state.pendingText = finalText;
-    chrome.storage.local.set({ [`lastResult:${tabId}`]: finalText });
-    updateState(tabId, {
-      active: true,
-      status: 'Error',
-      error: 'Translation failed. Click Retry.',
-      progress: 'Translation failed. Click Retry.',
-      fragments,
-      mergedText: finalText,
-      fragmentsCollected: fragments.length
-    });
-    return null;
-  }
-
   state.retryStage = null;
   state.pendingText = '';
+
   updateState(tabId, {
     active: false,
     status: 'Done',
@@ -416,16 +395,16 @@ async function retryTranslateAndFinalize(tabId, finalText, fragments) {
     fragmentsCollected: fragments.length,
     progress: 'Finished.',
     fragments,
-    mergedText: translatedText
+    mergedText: finalText
   });
-  chrome.storage.local.set({ [`lastResult:${tabId}`]: translatedText });
+  chrome.storage.local.set({ [`lastResult:${tabId}`]: finalText });
   const { ocrAutoCopy } = await chrome.storage.sync.get({ ocrAutoCopy: true });
-  if (ocrAutoCopy) copyToClipboard(translatedText);
+  if (ocrAutoCopy) copyToClipboard(finalText);
 
   // Auto-translate to Translation tab if enabled
-  await autoTranslateIfEnabled(tabId, translatedText);
+  await autoTranslateIfEnabled(tabId, finalText);
 
-  return translatedText;
+  return finalText;
 }
 
 async function autoTranslateIfEnabled(tabId, originalText) {
