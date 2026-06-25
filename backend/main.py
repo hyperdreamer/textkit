@@ -503,6 +503,24 @@ async def validation_error_handler(_request: Request, exc: RequestValidationErro
     return JSONResponse(status_code=400, content=_error_payload(str(exc)))
 
 
+@app.exception_handler(Exception)
+async def catch_all_handler(_request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all: ensure the backend ALWAYS returns a response.
+    
+    Catches anything the route handlers or other exception handlers miss
+    (e.g. MemoryError during large JSON parsing, serialization failures).
+    Without this, an unhandled exception can leave uvicorn waiting for a
+    response that never comes, causing the client to hang on "Translating...".
+    """
+    import traceback
+
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content=_error_payload(f"Internal error: {type(exc).__name__}: {exc}"),
+    )
+
+
 @app.post("/ocr", response_model=OCRResponse)
 async def ocr(image: UploadFile | None = File(default=None)) -> OCRResponse:
     """Accept an image upload and return text transcribed by the configured AI model."""
