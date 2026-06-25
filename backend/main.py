@@ -262,24 +262,21 @@ async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str
                 headers=headers,
                 json=request_body,
             )
-    except httpx.TimeoutException as exc:
+
+        if response.is_error:
+            detail = response.text
+            if len(detail) > 500:
+                detail = detail[:500] + "..."
+            raise HTTPException(status_code=502, detail=f"OpenAI API failed: {detail}")
+
+        payload = response.json()
+    except httpx.TimeoutException:
         raise HTTPException(
             status_code=504,
             detail="OpenAI API timed out — the text may be too long for the model to process in time",
-        ) from exc
-    except httpx.RequestError as exc:
+        )
+    except (httpx.RequestError, ValueError) as exc:
         raise HTTPException(status_code=502, detail=f"OpenAI API request failed: {type(exc).__name__}: {exc}") from exc
-
-    if response.is_error:
-        detail = response.text
-        if len(detail) > 500:
-            detail = detail[:500] + "..."
-        raise HTTPException(status_code=502, detail=f"OpenAI API failed: {detail}")
-
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail="OpenAI API returned invalid JSON") from exc
 
     usage = payload.get("usage") or {}
     return OCRResponse(
@@ -347,24 +344,21 @@ async def _post_anthropic_message(config: AIConfig, messages: list[dict[str, Any
                 headers=headers,
                 json=request_body,
             )
-    except httpx.TimeoutException as exc:
+
+        if response.is_error:
+            detail = response.text
+            if len(detail) > 500:
+                detail = detail[:500] + "..."
+            raise HTTPException(status_code=502, detail=f"Anthropic API failed: {detail}")
+
+        payload = response.json()
+    except httpx.TimeoutException:
         raise HTTPException(
             status_code=504,
             detail="Anthropic API timed out — the text may be too long for the model to process in time",
-        ) from exc
-    except httpx.RequestError as exc:
+        )
+    except (httpx.RequestError, ValueError) as exc:
         raise HTTPException(status_code=502, detail=f"Anthropic API request failed: {exc}") from exc
-
-    if response.is_error:
-        detail = response.text
-        if len(detail) > 500:
-            detail = detail[:500] + "..."
-        raise HTTPException(status_code=502, detail=f"Anthropic API failed: {detail}")
-
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail="Anthropic API returned invalid JSON") from exc
 
     usage = payload.get("usage") or {}
     tokens_used = int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
