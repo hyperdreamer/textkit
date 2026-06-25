@@ -226,7 +226,7 @@ async function handleTranslateStart(msg) {
   try {
     const key = `translatePrompt:${language}`;
     const stored = await chrome.storage.local.get(key);
-    const url = `http://${host || 'localhost'}:${port || 8765}/translate`;
+    const url = `http://${host || 'localhost'}:${port || 8765}/translate?_=${Date.now()}`;
     const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -244,7 +244,6 @@ async function handleTranslateStart(msg) {
   } finally {
     clearTimeout(timeoutId);
     translateControllers.delete(tabId);
-    chrome.storage.local.remove(`tl2Translating:${tabId}`);
   }
 
   return { ok: true };
