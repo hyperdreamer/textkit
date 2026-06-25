@@ -10,12 +10,16 @@
     "downloads",
     "storage",
     "offscreen",
-    "clipboardWrite"
+    "clipboardWrite",
+    "notifications"
   ],
   "host_permissions": [
     "http://localhost:*/*",
     "https://localhost:*/*"
   ],
+  "icons": {
+    "128": "icons/icon128.png"
+  },
   "background": {
     "service_worker": "background.js"
   },

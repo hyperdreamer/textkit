@@ -446,6 +446,13 @@ async function autoCopyTranslation(text) {
   if (!tl2AutocopyCheckbox.checked || !text) return;
   try {
     await navigator.clipboard.writeText(text);
+    chrome.notifications.create('tl2-auto-copy', {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'AI OCR — Copied',
+      message: 'Translation copied to system clipboard.',
+      priority: 0
+    });
   } catch {
     // Fallback: clipboard write may fail if popup lost focus
   }
@@ -463,6 +470,13 @@ function autoSaveTranslation(text) {
     saveAs: false,
     conflictAction: 'overwrite'
   }, () => setTimeout(() => URL.revokeObjectURL(url), 30000));
+  chrome.notifications.create('tl2-auto-save', {
+    type: 'basic',
+    iconUrl: 'icons/icon128.png',
+    title: 'AI OCR — Saved',
+    message: `Translation saved to ${path}.`,
+    priority: 0
+  });
 }
 
 // ── Filepath autocompletion ───────────────────────────────────

@@ -720,6 +720,14 @@ async function autoCopyIfEnabled(text) {
   if (!tl2AutoCopy || !text) return;
   // Use offscreen clipboard so it works from service worker
   copyToClipboard(text);
+  // Notify user
+  chrome.notifications.create('auto-copy', {
+    type: 'basic',
+    iconUrl: 'icons/icon128.png',
+    title: 'AI OCR — Copied',
+    message: 'Translation copied to system clipboard.',
+    priority: 0
+  });
 }
 
 async function autoSaveIfEnabled(text) {
@@ -735,4 +743,12 @@ async function autoSaveIfEnabled(text) {
     saveAs: false,
     conflictAction: 'overwrite'
   }, () => setTimeout(() => URL.revokeObjectURL(url), 30000));
+  // Notify user
+  chrome.notifications.create('auto-save', {
+    type: 'basic',
+    iconUrl: 'icons/icon128.png',
+    title: 'AI OCR — Saved',
+    message: `Translation saved to ${tl2AutoSavePath}.`,
+    priority: 0
+  });
 }
