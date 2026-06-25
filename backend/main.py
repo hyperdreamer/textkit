@@ -590,13 +590,17 @@ async def translate(request: TranslateRequest) -> JSONResponse:
     if config.ai is None:
         return JSONResponse(status_code=500, content=_error_payload("AI provider configuration is missing"))
 
+    import json as _json
+
     result = await translate_text(config.ai, request.text, request.language, request.prompt)
     # ── debug ──────────────────────────────────────────────
-    print(f"[translate] serializing response — {len(result.text)} chars",
-          flush=True)
-    # ────────────────────────────────────────────────────────
+    print(f"[translate] got result, text len={len(result.text)}", flush=True)
     body = {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
-    return JSONResponse(content=body)
+    print(f"[translate] serializing JSON — {len(result.text)} chars text", flush=True)
+    body_str = _json.dumps(body, ensure_ascii=False)
+    print(f"[translate] JSON done — {len(body_str)} bytes", flush=True)
+    # ────────────────────────────────────────────────────────
+    return JSONResponse(content=body_str, media_type="application/json")
 
 
 if __name__ == "__main__":
