@@ -217,7 +217,7 @@ async function handleTranslateStart(msg) {
   // for a just-completed translation.
   await chrome.storage.local.set({
     [`tl2Translating:${tabId}`]: true,
-    [`tl2Progress:${tabId}`]: `Translating to ${language}...`
+    [`tl2Status:${tabId}`]: `Translating to ${language}...`
   });
   await chrome.storage.local.remove(`tl2Result:${tabId}`);
   chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: true }).catch(() => {});
@@ -472,8 +472,6 @@ async function finalizeCapture(tabId, finalText, fragments) {
     mergedText: finalText
   });
   chrome.storage.local.set({ [`lastResult:${tabId}`]: finalText });
-  const { ocrAutoCopy } = await chrome.storage.sync.get({ ocrAutoCopy: true });
-  if (ocrAutoCopy) copyToClipboard(finalText);
 
   // Auto-translate to Translation tab if enabled
   await autoTranslateIfEnabled(tabId, finalText);
@@ -496,7 +494,7 @@ async function autoTranslateIfEnabled(tabId, originalText) {
   updateState(tabId, { tl2Translating: true });
   await chrome.storage.local.set({
     [`tl2Translating:${tabId}`]: true,
-    [`tl2Progress:${tabId}`]: `Translating to ${ocrLanguage}...`
+    [`tl2Status:${tabId}`]: `Translating to ${ocrLanguage}...`
   });
   await chrome.storage.local.remove(`tl2Result:${tabId}`);
   chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: true }).catch(() => {});
@@ -517,6 +515,9 @@ async function autoTranslateIfEnabled(tabId, originalText) {
     updateState(tabId, { tl2Translating: false });
     chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
     chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
+    // Auto-copy / auto-save translated text
+    if (translated) autoCopyIfEnabled(translated);
+    if (translated) autoSaveIfEnabled(translated);
   } catch (e) {
     if (e.name === 'AbortError') return; // User clicked Stop — silent
     console.error('Auto-translate failed:', e);
@@ -704,4 +705,28 @@ function updateState(tabId, partial) {
 
 function broadcastState(tabId) {
   chrome.runtime.sendMessage({ type: 'state:update', tabId, state: getState(tabId) }).catch(() => {});
+}
+
+// ── Auto-copy / auto-save helpers (for auto-translate) ─────────
+
+async function autoCopyIfEnabled(text) {
+  const { tl2AutoCopy } = await chrome.storage.sync.get({ tl2AutoCopy: false });
+  if (!tl2AutoCopy || !text) return;
+  // Use offscreen clipboard so it works from service worker
+  copyToClipboard(text);
+}
+
+async function autoSaveIfEnabled(text) {
+  const { tl2AutoSave, tl2AutoSavePath } = await chrome.storage.sync.get({
+    tl2AutoSave: false, tl2AutoSavePath: ''
+  });
+  if (!tl2AutoSave || !tl2AutoSavePath || !text) return;
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  chrome.downloads.download({
+    url,
+    filename: tl2AutoSavePath,
+    saveAs: false,
+    conflictAction: 'overwrite'
+  }, () => setTimeout(() => URL.revokeObjectURL(url), 30000));
 }

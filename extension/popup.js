@@ -14,7 +14,6 @@ const hostInput = document.getElementById('ocr-host');
 const portInput = document.getElementById('ocr-port');
 const languageSelect = document.getElementById('ocr-language');
 const autoscrollCheckbox = document.getElementById('ocr-autoscroll');
-const autocopyCheckbox = document.getElementById('ocr-autocopy');
 const autotranslateCheckbox = document.getElementById('ocr-autotranslate');
 const lastRegionEl = document.getElementById('last-region');
 
@@ -24,11 +23,16 @@ const translatePrompt = document.getElementById('translate-prompt');
 
 // ── Translation panel elements ────────────────────────────────
 const tl2Language = document.getElementById('tl2-language');
-const tl2Progress = document.getElementById('tl2-progress');
+const tl2StatusText = document.getElementById('tl2-status-text');
 const tl2Result = document.getElementById('tl2-result');
 const tl2Translate = document.getElementById('tl2-translate');
 const tl2Copy = document.getElementById('tl2-copy');
 const tl2Download = document.getElementById('tl2-download');
+const tl2AutocopyCheckbox = document.getElementById('tl2-autocopy');
+const tl2AutosaveCheckbox = document.getElementById('tl2-autosave');
+const tl2AutosavePath = document.getElementById('tl2-autosave-path');
+const tl2AutosavePathRow = document.getElementById('tl2-autosave-path-row');
+const tl2PathSuggestions = document.getElementById('tl2-path-suggestions');
 
 // ── Tab state ─────────────────────────────────────────────────
 const tabs = document.querySelectorAll('.tab');
@@ -64,7 +68,6 @@ hostInput.addEventListener('change', saveSettings);
 portInput.addEventListener('change', saveSettings);
 languageSelect.addEventListener('change', () => { saveSettings(); syncLanguage('ocr'); });
 autoscrollCheckbox.addEventListener('change', saveSettings);
-autocopyCheckbox.addEventListener('change', saveSettings);
 autotranslateCheckbox.addEventListener('change', saveSettings);
 
 // ── Translate panel listeners ─────────────────────────────────
@@ -76,6 +79,15 @@ tl2Translate.addEventListener('click', doTranslation);
 tl2Copy.addEventListener('click', () => copyResult(tl2Result, tl2Copy));
 tl2Download.addEventListener('click', () => downloadAsFile(tl2Result.value.trim(), 'translate'));
 tl2Language.addEventListener('change', () => { saveTl2Language(); syncLanguage('translation'); });
+tl2AutocopyCheckbox.addEventListener('change', saveTl2Settings);
+tl2AutosaveCheckbox.addEventListener('change', () => {
+  tl2AutosavePathRow.classList.toggle('hidden', !tl2AutosaveCheckbox.checked);
+  saveTl2Settings();
+});
+tl2AutosavePath.addEventListener('input', () => {
+  saveTl2Settings();
+  updatePathSuggestions(tl2AutosavePath.value);
+});
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'state:update') {
@@ -94,6 +106,9 @@ chrome.runtime.onMessage.addListener((message) => {
     chrome.storage.local.remove(`tl2Translating:${currentTabId}`);
     setTl2Progress(message.text ? 'Translation complete.' : 'Translation failed.');
     updateTranslationButtons();
+    // Auto-copy / auto-save translated text
+    if (message.text) autoCopyTranslation(message.text);
+    if (message.text) autoSaveTranslation(message.text);
   }
   if (message?.type === 'tl2:translating') {
     if (message.tabId !== currentTabId) return;
@@ -118,7 +133,7 @@ async function init() {
   const items = await chrome.storage.sync.get({
     ocrHost: 'localhost', ocrPort: 8765,
     ocrLanguage: 'original',
-    ocrAutoscroll: true, ocrAutoCopy: true,
+    ocrAutoscroll: true,
     ocrAutoTranslate: false
   });
   hostInput.value = items.ocrHost;
@@ -127,7 +142,6 @@ async function init() {
   tlLanguage.value = items.ocrLanguage;
   tl2Language.value = items.ocrLanguage;
   autoscrollCheckbox.checked = items.ocrAutoscroll;
-  autocopyCheckbox.checked = items.ocrAutoCopy;
   autotranslateCheckbox.checked = items.ocrAutoTranslate;
 
   const resultKey = currentTabId ? `lastResult:${currentTabId}` : null;
@@ -150,17 +164,17 @@ async function init() {
   // Load Translation tab language and last result (per-tab)
   const tl2k = (k) => currentTabId ? `${k}:${currentTabId}` : k;
   const tl2 = currentTabId ? await chrome.storage.local.get([
-    `tl2Language:${currentTabId}`, `tl2Result:${currentTabId}`, `tl2Progress:${currentTabId}`
+    `tl2Language:${currentTabId}`, `tl2Result:${currentTabId}`, `tl2Status:${currentTabId}`
   ]) : {};
   if (tl2[tl2k('tl2Language')]) tl2Language.value = tl2[tl2k('tl2Language')];
   if (tl2[tl2k('tl2Result')]) { tl2Result.value = tl2[tl2k('tl2Result')]; tl2Copy.disabled = tl2Download.disabled = false; }
-  if (tl2[tl2k('tl2Progress')]) {
+  if (tl2[tl2k('tl2Status')]) {
     // Clear stale "Translating..." state from previous session
-    const p = tl2[tl2k('tl2Progress')];
+    const p = tl2[tl2k('tl2Status')];
     if (p === 'Translating...') {
-      tl2Progress.textContent = '';
+      tl2StatusText.textContent = 'Ready';
     } else {
-      tl2Progress.textContent = p;
+      tl2StatusText.textContent = p;
     }
   }
   // Restore translating state from storage (survives popup close/reopen)
@@ -176,18 +190,28 @@ async function init() {
     tl2Result.value = tl2res[tl2resKey];
     tl2Copy.disabled = tl2Download.disabled = false;
     chrome.storage.local.remove(tl2transKey);
-    tl2Progress.textContent = 'Completed while popup was closed';
+    tl2StatusText.textContent = 'Completed while popup was closed';
   } else if (tl2trans[tl2transKey]) {
     tl2Translate.textContent = 'Stop';
     tl2Translate.classList.add('danger');
     tl2Copy.disabled = tl2Download.disabled = true;
-    tl2Progress.textContent = 'Translating...';
+    tl2StatusText.textContent = 'Translating...';
   } else {
     tl2Translate.textContent = 'Translate';
     tl2Translate.classList.remove('danger');
-    tl2Progress.textContent = '';
+    tl2StatusText.textContent = 'Ready';
   }
   updateTranslationButtons();
+
+  // Load Translation tab settings (auto-copy, auto-save, auto-save-path)
+  const tl2Settings = await chrome.storage.sync.get({
+    tl2AutoCopy: false, tl2AutoSave: false, tl2AutoSavePath: ''
+  });
+  tl2AutocopyCheckbox.checked = tl2Settings.tl2AutoCopy;
+  tl2AutosaveCheckbox.checked = tl2Settings.tl2AutoSave;
+  tl2AutosavePath.value = tl2Settings.tl2AutoSavePath || '';
+  tl2AutosavePathRow.classList.toggle('hidden', !tl2AutosaveCheckbox.checked);
+  loadPathSuggestions();
 
   chrome.storage.local.get('lastRegion', (r) => {
     lastRegionEl.textContent = r.lastRegion
@@ -247,7 +271,6 @@ async function saveSettings() {
     ocrPort: parseInt(portInput.value, 10) || 8765,
     ocrLanguage: languageSelect.value || 'original',
     ocrAutoscroll: autoscrollCheckbox.checked,
-    ocrAutoCopy: autocopyCheckbox.checked,
     ocrAutoTranslate: autotranslateCheckbox.checked
   });
 }
@@ -396,8 +419,8 @@ function copyResult(textarea, button) {
 }
 
 function setTl2Progress(text) {
-  tl2Progress.textContent = text;
-  if (currentTabId) chrome.storage.local.set({ [`tl2Progress:${currentTabId}`]: text });
+  tl2StatusText.textContent = text;
+  if (currentTabId) chrome.storage.local.set({ [`tl2Status:${currentTabId}`]: text });
 }
 
 function updateTranslationButtons() {
@@ -415,4 +438,67 @@ function downloadAsFile(text, prefix) {
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
   chrome.downloads.download({ url, filename: `${prefix}-${ts}.txt`, saveAs: true },
     () => setTimeout(() => URL.revokeObjectURL(url), 30000));
+}
+
+// ── Translation tab settings ──────────────────────────────────
+
+async function saveTl2Settings() {
+  await chrome.storage.sync.set({
+    tl2AutoCopy: tl2AutocopyCheckbox.checked,
+    tl2AutoSave: tl2AutosaveCheckbox.checked,
+    tl2AutoSavePath: tl2AutosavePath.value.trim()
+  });
+}
+
+async function autoCopyTranslation(text) {
+  if (!tl2AutocopyCheckbox.checked || !text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // Fallback: clipboard write may fail if popup lost focus
+  }
+}
+
+function autoSaveTranslation(text) {
+  if (!tl2AutosaveCheckbox.checked || !text) return;
+  const path = tl2AutosavePath.value.trim();
+  if (!path) return;
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  chrome.downloads.download({
+    url,
+    filename: path,
+    saveAs: false,
+    conflictAction: 'overwrite'
+  }, () => setTimeout(() => URL.revokeObjectURL(url), 30000));
+}
+
+// ── Filepath autocompletion ───────────────────────────────────
+
+const PATH_HISTORY_KEY = 'tl2PathHistory';
+const MAX_PATH_HISTORY = 20;
+
+function loadPathSuggestions() {
+  chrome.storage.local.get(PATH_HISTORY_KEY, (r) => {
+    const history = r[PATH_HISTORY_KEY] || [];
+    tl2PathSuggestions.innerHTML = history
+      .map(p => `<option value="${escapeHtml(p)}">`)
+      .join('');
+  });
+}
+
+function updatePathSuggestions(current) {
+  if (!current) return;
+  chrome.storage.local.get(PATH_HISTORY_KEY, (r) => {
+    let history = r[PATH_HISTORY_KEY] || [];
+    history = history.filter(p => p !== current);
+    history.unshift(current);
+    if (history.length > MAX_PATH_HISTORY) history = history.slice(0, MAX_PATH_HISTORY);
+    chrome.storage.local.set({ [PATH_HISTORY_KEY]: history });
+    loadPathSuggestions();
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
