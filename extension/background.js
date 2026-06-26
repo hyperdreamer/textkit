@@ -236,8 +236,12 @@ async function handleTranslateStart(msg) {
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
     if (payload.error) throw new Error(payload.error);
 
-    chrome.storage.local.set({ [`tl2Result:${tabId}`]: payload.text || '' });
-    chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: payload.text || '' }).catch(() => {});
+    const translated = payload.text || '';
+    chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
+    chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
+    // Auto-copy / auto-save translated text
+    if (translated) autoCopyIfEnabled(translated);
+    if (translated) autoSaveIfEnabled(translated);
   } catch (e) {
     chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: '' }).catch(() => {});
     // Clear translating state so the popup doesn't reopen stuck on "Stop"
