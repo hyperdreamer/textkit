@@ -104,9 +104,9 @@ chrome.runtime.onMessage.addListener((message) => {
     chrome.storage.local.remove(`tl2Translating:${currentTabId}`);
     setTl2Progress(message.text ? 'Translation complete.' : 'Translation failed.');
     updateTranslationButtons();
-    // Auto-copy / auto-save translated text
-    if (message.text) autoCopyTranslation(message.text);
-    if (message.text) autoSaveTranslation(message.text);
+    // Auto-copy / auto-save is handled by the background service worker
+    // (autoCopyIfEnabled / autoSaveIfEnabled) — doing it here as well would
+    // double-copy and double-save.
   }
   if (message?.type === 'tl2:translating') {
     if (message.tabId !== currentTabId) return;

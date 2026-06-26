@@ -162,7 +162,7 @@ async function handleStop() {
   state.stopRequested = true;
   // If in error state (waiting for retry), finalize collected fragments now
   if (state.status === 'Error' && state.fragments?.length > 0) {
-    finalizePostCapture(tab.id, mergeFragments(state.fragments), state.fragments);
+    await finalizePostCapture(tab.id, mergeFragments(state.fragments), state.fragments);
   } else {
     updateState(tab.id, { progress: 'Stopping...' });
   }
@@ -243,6 +243,7 @@ async function handleTranslateStart(msg) {
     if (translated) autoCopyIfEnabled(translated);
     if (translated) autoSaveIfEnabled(translated);
   } catch (e) {
+    if (e.name === 'AbortError') return { ok: true }; // User clicked Stop — silent
     chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: '' }).catch(() => {});
     // Clear translating state so the popup doesn't reopen stuck on "Stop"
     chrome.storage.local.remove(`tl2Translating:${tabId}`);
