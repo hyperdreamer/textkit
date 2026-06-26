@@ -53,6 +53,13 @@ class TranslateRequest(BaseModel):
     prompt: str | None = None
 
 
+class SaveRequest(BaseModel):
+    """Request body accepted by the save endpoint."""
+
+    text: str
+    path: str
+
+
 @dataclass(frozen=True)
 class TimeoutConfig:
     """Per-phase HTTP timeouts for AI provider calls (all in seconds)."""
@@ -616,6 +623,23 @@ async def translate(request: TranslateRequest) -> Response:
         media_type="application/json",
         headers={"Connection": "close"},
     )
+
+
+@app.post("/save")
+async def save_text(request: SaveRequest) -> dict[str, str | bool]:
+    """Write text to a local path on the backend machine."""
+
+    raw_path = request.path.strip()
+    if not raw_path:
+        raise HTTPException(status_code=400, detail="Missing save path")
+
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(request.text, encoding="utf-8")
+    return {"ok": True, "path": str(path)}
 
 
 if __name__ == "__main__":

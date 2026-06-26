@@ -416,24 +416,46 @@ function updateTranslationButtons() {
   tl2Download.disabled = !hasResult;
 }
 
-function saveTranslation() {
+async function saveTranslation() {
   const text = tl2Result.value.trim();
   if (!text) return;
   const path = tl2AutosavePath.value.trim();
-  const filename = path || `translation-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
-  // Data URL directly in popup — user gesture present, no SW limitations
-  const dataUrl = 'data:text/plain;charset=utf-8,' + encodeURIComponent(text);
-  chrome.downloads.download({ url: dataUrl, filename, saveAs: false, conflictAction: 'overwrite' });
-  tl2Save.textContent = 'Saved!';
-  setTimeout(() => tl2Save.textContent = 'Save', 1500);
-  setTl2Progress(`Saved to ${filename}.`);
-  chrome.notifications.create('tl2-manual-save', {
-    type: 'basic',
-    iconUrl: 'icons/icon128.png',
-    title: 'AI OCR — Saved',
-    message: `Translation saved to ${filename}.`,
-    priority: 0
-  });
+  if (!path) {
+    setTl2Progress('Set a Save path first.');
+    return;
+  }
+
+  try {
+    const url = `http://${hostInput.value.trim() || 'localhost'}:${parseInt(portInput.value, 10) || 8765}/save`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, path })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.error) throw new Error(payload.error || `HTTP ${response.status}`);
+
+    const savedPath = payload.path || path;
+    tl2Save.textContent = 'Saved!';
+    setTimeout(() => tl2Save.textContent = 'Save', 1500);
+    setTl2Progress(`Saved to ${savedPath}.`);
+    chrome.notifications.create('tl2-manual-save', {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'AI OCR — Saved',
+      message: `Translation saved to ${savedPath}.`,
+      priority: 0
+    });
+  } catch (e) {
+    setTl2Progress(`Save failed: ${e.message}`);
+    chrome.notifications.create('tl2-manual-save-failed', {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'AI OCR — Save failed',
+      message: e.message,
+      priority: 1
+    });
+  }
 }
 
 function downloadAsFile(text, prefix) {

@@ -270,12 +270,17 @@ function handleTranslateStop(tabId) {
 }
 
 async function handleSaveTranslation(msg) {
-  const { text, filename } = msg;
-  if (!text || !filename) return { ok: false, error: 'Missing text or filename' };
-  // Use data URL — works directly from service worker, no blob URL issues
-  const dataUrl = 'data:text/plain;charset=utf-8,' + encodeURIComponent(text);
-  chrome.downloads.download({ url: dataUrl, filename, saveAs: false, conflictAction: 'overwrite' });
-  return { ok: true };
+  const { text, path } = msg;
+  if (!text || !path) return { ok: false, error: 'Missing text or path' };
+  const url = await getBackendEndpoint('/save');
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, path })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload.error) return { ok: false, error: payload.error || `HTTP ${response.status}` };
+  return { ok: true, path: payload.path || path };
 }
 
 async function getActiveTab() {
@@ -753,20 +758,24 @@ async function autoSaveIfEnabled(text) {
     tl2AutoSave: false, tl2AutoSavePath: ''
   });
   if (!tl2AutoSave || !tl2AutoSavePath || !text) return;
-  // Use data URL — works directly from service worker, no blob URL issues
-  const dataUrl = 'data:text/plain;charset=utf-8,' + encodeURIComponent(text);
-  chrome.downloads.download({
-    url: dataUrl,
-    filename: tl2AutoSavePath,
-    saveAs: false,
-    conflictAction: 'overwrite'
-  });
-  // Notify user
-  chrome.notifications.create('auto-save', {
-    type: 'basic',
-    iconUrl: 'icons/icon128.png',
-    title: 'AI OCR — Saved',
-    message: `Translation saved to ${tl2AutoSavePath}.`,
-    priority: 0
-  });
+  try {
+    const result = await handleSaveTranslation({ text, path: tl2AutoSavePath });
+    if (!result.ok) throw new Error(result.error || 'Save failed');
+    chrome.notifications.create('auto-save', {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'AI OCR — Saved',
+      message: `Translation saved to ${result.path || tl2AutoSavePath}.`,
+      priority: 0
+    });
+  } catch (e) {
+    console.error('Auto-save failed:', e);
+    chrome.notifications.create('auto-save-failed', {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'AI OCR — Save failed',
+      message: e.message,
+      priority: 1
+    });
+  }
 }
