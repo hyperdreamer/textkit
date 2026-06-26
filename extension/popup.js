@@ -25,6 +25,7 @@ const tl2StatusText = document.getElementById('tl2-status-text');
 const tl2Result = document.getElementById('tl2-result');
 const tl2Translate = document.getElementById('tl2-translate');
 const tl2Copy = document.getElementById('tl2-copy');
+const tl2Save = document.getElementById('tl2-save');
 const tl2Download = document.getElementById('tl2-download');
 const tl2AutocopyCheckbox = document.getElementById('tl2-autocopy');
 const tl2AutosaveCheckbox = document.getElementById('tl2-autosave');
@@ -75,6 +76,7 @@ translatePrompt.addEventListener('input', saveTlState);
 tl2Translate.addEventListener('click', doTranslation);
 tl2Copy.addEventListener('click', () => copyResult(tl2Result, tl2Copy));
 tl2Download.addEventListener('click', () => downloadAsFile(tl2Result.value.trim(), 'translate'));
+tl2Save.addEventListener('click', saveTranslation);
 tl2Language.addEventListener('change', () => { saveTl2Language(); syncLanguage('translation'); });
 tl2AutocopyCheckbox.addEventListener('change', saveTl2Settings);
 tl2AutosaveCheckbox.addEventListener('change', () => {
@@ -98,7 +100,7 @@ chrome.runtime.onMessage.addListener((message) => {
       tl2Result.value = message.text;
       chrome.storage.local.set({ [`tl2Result:${currentTabId}`]: message.text });
     }
-    tl2Copy.disabled = tl2Download.disabled = !message.text;
+    tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = !message.text;
     tl2Translate.textContent = 'Translate';
     tl2Translate.classList.remove('danger');
     chrome.storage.local.remove(`tl2Translating:${currentTabId}`);
@@ -113,7 +115,7 @@ chrome.runtime.onMessage.addListener((message) => {
     if (message.value) {
       tl2Translate.textContent = 'Stop';
       tl2Translate.classList.add('danger');
-      tl2Copy.disabled = tl2Download.disabled = true;
+      tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = true;
       setTl2Progress('Translating...');
     } else {
       tl2Translate.textContent = 'Translate';
@@ -161,7 +163,7 @@ async function init() {
     `tl2Language:${currentTabId}`, `tl2Result:${currentTabId}`, `tl2Status:${currentTabId}`
   ]) : {};
   if (tl2[tl2k('tl2Language')]) tl2Language.value = tl2[tl2k('tl2Language')];
-  if (tl2[tl2k('tl2Result')]) { tl2Result.value = tl2[tl2k('tl2Result')]; tl2Copy.disabled = tl2Download.disabled = false; }
+  if (tl2[tl2k('tl2Result')]) { tl2Result.value = tl2[tl2k('tl2Result')]; tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = false; }
   if (tl2[tl2k('tl2Status')]) {
     // Clear stale "Translating..." state from previous session
     const p = tl2[tl2k('tl2Status')];
@@ -182,13 +184,13 @@ async function init() {
     tl2Translate.textContent = 'Translate';
     tl2Translate.classList.remove('danger');
     tl2Result.value = tl2res[tl2resKey];
-    tl2Copy.disabled = tl2Download.disabled = false;
+    tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = false;
     chrome.storage.local.remove(tl2transKey);
     tl2StatusText.textContent = 'Completed while popup was closed';
   } else if (tl2trans[tl2transKey]) {
     tl2Translate.textContent = 'Stop';
     tl2Translate.classList.add('danger');
-    tl2Copy.disabled = tl2Download.disabled = true;
+    tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = true;
     tl2StatusText.textContent = 'Translating...';
   } else {
     tl2Translate.textContent = 'Translate';
@@ -335,7 +337,7 @@ function renderState(state) {
   if (latestState.tl2Translating) {
     tl2Translate.textContent = 'Stop';
     tl2Translate.classList.add('danger');
-    tl2Copy.disabled = tl2Download.disabled = true;
+    tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = true;
     setTl2Progress('Translating...');
   }
 }
@@ -368,7 +370,7 @@ async function doTranslation() {
   tl2Translate.textContent = 'Stop';
   tl2Translate.classList.add('danger');
   tl2Result.value = '';
-  tl2Copy.disabled = tl2Download.disabled = true;
+  tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = true;
   setTl2Progress(`Translating to ${language}...`);
 
   // Fire-and-forget: the background service worker handles the fetch
@@ -410,7 +412,21 @@ function updateTranslationButtons() {
   const hasResult = tl2Result.value.trim().length > 0;
   tl2Translate.disabled = !hasSource;
   tl2Copy.disabled = !hasResult;
+  tl2Save.disabled = !hasResult;
   tl2Download.disabled = !hasResult;
+}
+
+function saveTranslation() {
+  const text = tl2Result.value.trim();
+  if (!text) return;
+  const path = tl2AutosavePath.value.trim();
+  const filename = path || `translation-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  chrome.downloads.download({ url, filename, saveAs: false, conflictAction: 'overwrite' },
+    () => setTimeout(() => URL.revokeObjectURL(url), 30000));
+  tl2Save.textContent = 'Saved!';
+  setTimeout(() => tl2Save.textContent = 'Save', 1500);
 }
 
 function downloadAsFile(text, prefix) {
