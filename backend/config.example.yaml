@@ -22,7 +22,15 @@ ai:
   api_key: "$OCR_API_KEY"
 
   # Vision-capable model name to use for OCR.
+  # When ``ocr_model`` is set (below), it overrides this for OCR requests.
   model: "gpt-4.1-mini"
+
+  # Optional per-task model overrides.  Each defaults to ``model`` when empty.
+  # Set ``ocr_model`` to use a different (typically vision-capable) model for
+  # OCR, and ``text_model`` to use a different model for text processing
+  # (deduplication and translation).
+  # ocr_model: "gpt-4.1"
+  # text_model: "gpt-4.1-mini"
 
   # Per-phase HTTP timeouts for AI provider calls (all in seconds).
   # Omit any key to use its default.  Increase ``read`` when translating

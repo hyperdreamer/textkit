@@ -65,13 +65,20 @@ class TimeoutConfig:
 
 @dataclass(frozen=True)
 class AIConfig:
-    """Settings needed to call a configured AI provider."""
+    """Settings needed to call a configured AI provider.
+
+    ``model`` is the fallback used when a per-task model is not configured.
+    ``ocr_model`` overrides ``model`` for vision (OCR) requests.
+    ``text_model`` overrides ``model`` for text processing (dedup + translate).
+    """
 
     provider: str
     api_base: str
     api_key: str
     model: str
     timeout: TimeoutConfig = TimeoutConfig()
+    ocr_model: str = ""
+    text_model: str = ""
 
 
 @dataclass(frozen=True)
@@ -150,6 +157,8 @@ def load_config() -> AppConfig:
     provider = str(ai_section.get("provider", "openai")).lower()
     api_base = str(ai_section.get("api_base", "https://api.openai.com")).rstrip("/")
     model = str(ai_section.get("model", "gpt-4.1-mini"))
+    ocr_model = str(ai_section.get("ocr_model", ""))
+    text_model = str(ai_section.get("text_model", ""))
 
     # Optional timeout overrides
     timeout_raw = ai_section.get("timeout")
@@ -177,6 +186,8 @@ def load_config() -> AppConfig:
             api_key=api_key,
             model=model,
             timeout=timeout,
+            ocr_model=ocr_model,
+            text_model=text_model,
         ),
     )
 
@@ -275,7 +286,11 @@ async def _call_with_retry(
     raise last_exc
 
 
-async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str, Any]]) -> OCRResponse:
+async def _post_openai_chat_completion(
+    config: AIConfig,
+    messages: list[dict[str, Any]],
+    model_override: str | None = None,
+) -> OCRResponse:
     """Send messages to an OpenAI-compatible /v1/chat/completions API."""
 
     if not config.api_key:
@@ -284,8 +299,9 @@ async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str
             detail="No API key configured. Set ai.api_key in config.yaml or the OCR_API_KEY environment variable.",
         )
 
+    effective_model = model_override or config.model
     request_body = {
-        "model": config.model,
+        "model": effective_model,
         "messages": messages,
     }
     headers = {"Authorization": f"Bearer {config.api_key}"}
@@ -323,7 +339,7 @@ async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str
     )
 
 
-async def _call_openai(config: AIConfig, data_url: str) -> OCRResponse:
+async def _call_openai(config: AIConfig, data_url: str, model_override: str | None = None) -> OCRResponse:
     """Send the image to an OpenAI-compatible /v1/chat/completions API."""
 
     return await _post_openai_chat_completion(
@@ -337,6 +353,7 @@ async def _call_openai(config: AIConfig, data_url: str) -> OCRResponse:
                 ],
             }
         ],
+        model_override=model_override,
     )
 
 
@@ -348,7 +365,11 @@ def _anthropic_image_source(data_url: str) -> dict[str, str]:
     return {"type": "base64", "media_type": media_type, "data": encoded}
 
 
-async def _post_anthropic_message(config: AIConfig, messages: list[dict[str, Any]]) -> OCRResponse:
+async def _post_anthropic_message(
+    config: AIConfig,
+    messages: list[dict[str, Any]],
+    model_override: str | None = None,
+) -> OCRResponse:
     """Send messages to Anthropic's /v1/messages API."""
 
     if not config.api_key:
@@ -357,8 +378,9 @@ async def _post_anthropic_message(config: AIConfig, messages: list[dict[str, Any
             detail="No API key configured. Set ai.api_key in config.yaml or the OCR_API_KEY environment variable.",
         )
 
+    effective_model = model_override or config.model
     request_body = {
-        "model": config.model,
+        "model": effective_model,
         "max_tokens": 4096,
         "messages": messages,
     }
@@ -400,7 +422,7 @@ async def _post_anthropic_message(config: AIConfig, messages: list[dict[str, Any
     )
 
 
-async def _call_anthropic(config: AIConfig, data_url: str) -> OCRResponse:
+async def _call_anthropic(config: AIConfig, data_url: str, model_override: str | None = None) -> OCRResponse:
     """Send the image to Anthropic's /v1/messages API."""
 
     return await _post_anthropic_message(
@@ -414,22 +436,27 @@ async def _call_anthropic(config: AIConfig, data_url: str) -> OCRResponse:
                 ],
             }
         ],
+        model_override=model_override,
     )
 
 
 async def transcribe_image(config: AIConfig, data_url: str) -> OCRResponse:
     """Route an OCR request to the configured provider."""
 
+    ocr_model = config.ocr_model or None  # None → use config.model fallback
+
     if config.provider == "openai":
-        return await _call_openai(config, data_url)
+        return await _call_openai(config, data_url, model_override=ocr_model)
     if config.provider == "anthropic":
-        return await _call_anthropic(config, data_url)
+        return await _call_anthropic(config, data_url, model_override=ocr_model)
 
     raise HTTPException(status_code=400, detail=f"Unsupported AI provider: {config.provider}")
 
 
 async def deduplicate_text(config: AIConfig, text: str) -> OCRResponse:
     """Route a deduplication request to the configured provider."""
+
+    text_model = config.text_model or None  # None → use config.model fallback
 
     if config.provider == "openai":
         return await _post_openai_chat_completion(
@@ -438,6 +465,7 @@ async def deduplicate_text(config: AIConfig, text: str) -> OCRResponse:
                 {"role": "system", "content": DEDUP_PROMPT},
                 {"role": "user", "content": text},
             ],
+            model_override=text_model,
         )
     if config.provider == "anthropic":
         return await _post_anthropic_message(
@@ -451,6 +479,7 @@ async def deduplicate_text(config: AIConfig, text: str) -> OCRResponse:
                     ],
                 }
             ],
+            model_override=text_model,
         )
 
     raise HTTPException(status_code=400, detail=f"Unsupported AI provider: {config.provider}")
@@ -460,6 +489,7 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
     """Route a translation request to the configured provider."""
 
     system_prompt = prompt or f"Translate the following text to {language}. Return only the translation."
+    text_model = config.text_model or None  # None → use config.model fallback
 
     if config.provider == "openai":
         return await _post_openai_chat_completion(
@@ -468,6 +498,7 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": text},
             ],
+            model_override=text_model,
         )
     if config.provider == "anthropic":
         return await _post_anthropic_message(
@@ -481,6 +512,7 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
                     ],
                 }
             ],
+            model_override=text_model,
         )
 
     raise HTTPException(status_code=400, detail=f"Unsupported AI provider: {config.provider}")

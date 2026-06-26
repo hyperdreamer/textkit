@@ -70,6 +70,10 @@ ai:
   api_base: "https://api.openai.com"
   api_key: "$OCR_API_KEY"
   model: "gpt-4.1-mini"
+
+  # Optional per-task overrides:
+  # ocr_model: "gpt-4.1"
+  # text_model: "gpt-4.1-mini"
 ```
 
 Supported `ai` fields:
@@ -79,7 +83,9 @@ Supported `ai` fields:
   - OpenAI-compatible providers must expose `/v1/chat/completions`.
   - Anthropic-compatible providers must expose `/v1/messages`.
 - `api_key`: the API key. Plaintext values are used directly. Prefix with `$` to treat the value as an environment variable name (e.g. `$OCR_API_KEY`). `api_key_env` is also accepted.
-- `model`: the model name to send to the provider.
+- `model`: the model name to send to the provider. This is the fallback model used for all operations unless per-task overrides are set.
+- `ocr_model` (optional): overrides `model` for vision (OCR) requests. Useful when you want a stronger vision model for OCR but a faster/cheaper model for text processing.
+- `text_model` (optional): overrides `model` for text processing (deduplication and translation).
 
 The backend also falls back to these environment variable names:
 
