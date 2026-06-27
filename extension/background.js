@@ -417,7 +417,6 @@ async function runCaptureLoop(tab, region) {
         status: 'Error',
         error: e.message,
         progress: `Failed on page ${pageNumber}. Click Retry to continue.`,
-        mergedText: mergeFragments(fragments),
         fragmentsCollected: fragments.length
       });
       return;
@@ -426,7 +425,6 @@ async function runCaptureLoop(tab, region) {
     updateState(tabId, {
       fragments,
       fragmentsCollected: fragments.length,
-      mergedText: mergeFragments(fragments),
       progress: `Collected ${fragments.length} fragment${fragments.length === 1 ? '' : 's'}.`
     });
 
@@ -451,8 +449,7 @@ async function runCaptureLoop(tab, region) {
   const mergedText = mergeFragments(fragments);
   updateState(tabId, {
     progress: 'Deduplicating merged text...',
-    fragments,
-    mergedText
+    fragments
   });
   await finalizePostCapture(tabId, mergedText, fragments);
 }
@@ -496,7 +493,6 @@ async function resumeCaptureLoop(rs) {
         status: 'Error',
         error: e.message,
         progress: `Failed on page ${pageNumber}. Click Retry to continue.`,
-        mergedText: mergeFragments(fragments),
         fragmentsCollected: fragments.length
       });
       return;
@@ -505,7 +501,6 @@ async function resumeCaptureLoop(rs) {
     updateState(tabId, {
       fragments,
       fragmentsCollected: fragments.length,
-      mergedText: mergeFragments(fragments),
       progress: `Collected ${fragments.length} fragment${fragments.length === 1 ? '' : 's'}.`
     });
 
@@ -528,7 +523,7 @@ async function resumeCaptureLoop(rs) {
   }
 
   const mergedText = mergeFragments(fragments);
-  updateState(tabId, { progress: 'Deduplicating merged text...', fragments, mergedText });
+  updateState(tabId, { progress: 'Deduplicating merged text...', fragments });
   await finalizePostCapture(tabId, mergedText, fragments);
 }
 
