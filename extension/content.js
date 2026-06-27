@@ -123,7 +123,7 @@
     const ex = clamp(event.clientX, 0, window.innerWidth);
     const ey = clamp(event.clientY, 0, window.innerHeight);
     const dx = ex - dragStart.ex;
-    const dy = ey - dragStart.dy;
+    const dy = ey - dragStart.ey;
 
     switch (dragMode) {
       case 'new':

@@ -396,9 +396,9 @@ function stopTranslation() {
   setTl2Progress('Translation stopped.');
 }
 
-function copyResult(textarea, button) {
+async function copyResult(textarea, button) {
   const t = textarea.value.trim(); if (!t) return;
-  try { navigator.clipboard.writeText(t); button.textContent = 'Copied!'; setTimeout(() => button.textContent = 'Copy', 1500); }
+  try { await navigator.clipboard.writeText(t); button.textContent = 'Copied!'; setTimeout(() => button.textContent = 'Copy', 1500); }
   catch { textarea.select(); document.execCommand('copy'); }
 }
 
@@ -475,43 +475,6 @@ async function saveTl2Settings() {
     tl2AutoSave: tl2AutosaveCheckbox.checked,
     tl2AutoSavePath: tl2AutosavePath.value.trim(),
     ocrAutoTranslate: tl2AutotranslateCheckbox.checked
-  });
-}
-
-async function autoCopyTranslation(text) {
-  if (!tl2AutocopyCheckbox.checked || !text) return;
-  try {
-    await navigator.clipboard.writeText(text);
-    chrome.notifications.create('tl2-auto-copy', {
-      type: 'basic',
-      iconUrl: 'icons/icon128.png',
-      title: 'AI OCR — Copied',
-      message: 'Translation copied to system clipboard.',
-      priority: 0
-    });
-  } catch {
-    // Fallback: clipboard write may fail if popup lost focus
-  }
-}
-
-function autoSaveTranslation(text) {
-  if (!tl2AutosaveCheckbox.checked || !text) return;
-  const path = tl2AutosavePath.value.trim();
-  if (!path) return;
-  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  chrome.downloads.download({
-    url,
-    filename: path,
-    saveAs: false,
-    conflictAction: 'overwrite'
-  }, () => setTimeout(() => URL.revokeObjectURL(url), 30000));
-  chrome.notifications.create('tl2-auto-save', {
-    type: 'basic',
-    iconUrl: 'icons/icon128.png',
-    title: 'AI OCR — Saved',
-    message: `Translation saved to ${path}.`,
-    priority: 0
   });
 }
 
