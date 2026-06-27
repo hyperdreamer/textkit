@@ -312,6 +312,9 @@ async function startCapture() {
   resultEl.value = '';
   copyButton.disabled = true;
   downloadButton.disabled = true;
+  tl2Result.value = '';
+  tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = true;
+  setTl2Progress('Ready');
   startButton.disabled = true;
   progressEl.textContent = 'Starting region selection.';
   try {
@@ -361,6 +364,13 @@ function renderState(state) {
   shortProgressEl.textContent = latestState.progress || 'Ready';
   progressEl.textContent = latestState.error || latestState.progress || 'Ready';
   if (!userEditedResult) resultEl.value = mergedText;
+
+  // Clear translation result when a new capture starts
+  if (latestState.status === 'Selecting') {
+    tl2Result.value = '';
+    tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = true;
+    setTl2Progress('Ready');
+  }
 
   startButton.disabled = isActive;
   stopButton.classList.toggle('hidden', !isActive);
