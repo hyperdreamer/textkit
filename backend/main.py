@@ -698,18 +698,21 @@ async def save_text(request: SaveRequest) -> dict[str, str | bool]:
         raise HTTPException(status_code=400, detail="Missing save path")
 
     _validate_text_size(request.text, config)
-    save_root = config.save_root.expanduser().resolve()
+    save_root_expanded = config.save_root.expanduser()
+    save_root = save_root_expanded.resolve()
     candidate = Path(raw_path).expanduser()
-    path = candidate if candidate.is_absolute() else save_root / candidate
-    path = path.resolve()
+    path = candidate if candidate.is_absolute() else save_root_expanded / candidate
 
+    # Guard: check against expanded (pre-symlink) root so symlinks through ~ are allowed
     try:
-        path.relative_to(save_root)
+        path.relative_to(save_root_expanded)
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
             detail=f"Save path must stay under configured save_root: {save_root}",
         ) from exc
+
+    path = path.resolve()
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
