@@ -229,6 +229,15 @@ async function handleTranslateStart(msg) {
   try {
     const key = `translatePrompt:${language}`;
     const stored = await chrome.storage.local.get(key);
+    // "Original" with no custom prompt → pass through unchanged
+    if (language === 'original' && !stored[key]) {
+      const translated = text;
+      chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
+      chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
+      if (translated) autoCopyIfEnabled(translated);
+      if (translated) autoSaveIfEnabled(translated);
+      return { ok: true };
+    }
     const url = `http://${host || 'localhost'}:${port || 8765}/translate?_=${Date.now()}`;
     const response = await fetch(url, {
       method: 'POST',
@@ -512,7 +521,12 @@ async function autoTranslateIfEnabled(tabId, originalText) {
   const tl2LangKey = `tl2Language:${tabId}`;
   const tl2Lang = await chrome.storage.local.get(tl2LangKey);
   const language = tl2Lang[tl2LangKey] || 'original';
-  if (language === 'original') return;
+  // "Original" with no custom prompt → skip (nothing to do)
+  if (language === 'original') {
+    const promptKey = 'translatePrompt:original';
+    const promptStored = await chrome.storage.local.get(promptKey);
+    if (!promptStored[promptKey]) return;
+  }
 
   // Abort any in-flight translation for this tab
   handleTranslateStop(tabId);
