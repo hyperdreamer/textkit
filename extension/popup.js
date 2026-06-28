@@ -148,15 +148,12 @@ async function init() {
   autoscrollCheckbox.checked = items.ocrAutoscroll;
 
   const resultKey = currentTabId ? `lastResult:${currentTabId}` : null;
-  if (resultKey) {
+  // Get live state first so renderState has the right mergedText
+  await refreshState();
+  // Fallback: if textarea is still empty, load from storage
+  if (!resultEl.value && resultKey) {
     const stored = await chrome.storage.local.get(resultKey);
     if (stored[resultKey]) resultEl.value = stored[resultKey];
-  }
-  await refreshState();
-  if (!resultEl.value && resultKey) {
-    // refreshState may have populated it via renderState; if still empty, retry
-    const fb = await chrome.storage.local.get(resultKey);
-    if (fb[resultKey]) resultEl.value = fb[resultKey];
   }
 
   // Load last persisted status for status bar
