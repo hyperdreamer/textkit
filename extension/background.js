@@ -7,9 +7,16 @@ const BACKEND_TIMEOUT_MS = 12 * 60 * 1000;
 const MAX_CAPTURE_PAGES = 500;
 const LOCAL_BACKEND_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 
+let _backendBaseUrl = null;
+let _backendBaseUrlExpiry = 0;
+
 async function getBackendEndpoint(path) {
-  const items = await chrome.storage.sync.get({ ocrHost: DEFAULT_HOST, ocrPort: DEFAULT_PORT });
-  return buildBackendEndpoint(items.ocrHost, items.ocrPort, path);
+  if (!_backendBaseUrl || Date.now() > _backendBaseUrlExpiry) {
+    const items = await chrome.storage.sync.get({ ocrHost: DEFAULT_HOST, ocrPort: DEFAULT_PORT });
+    _backendBaseUrl = buildBackendEndpoint(items.ocrHost, items.ocrPort, '');
+    _backendBaseUrlExpiry = Date.now() + 60_000;  // cache 1 minute
+  }
+  return _backendBaseUrl + path;
 }
 
 function buildBackendEndpoint(host, port, path) {
