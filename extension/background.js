@@ -427,7 +427,7 @@ async function runCaptureLoop(tab, region) {
 
       updateState(tabId, { progress: `Sending page ${pageNumber} to OCR...` });
       let ocrErr = null;
-      for (let attempt = 1; attempt <= 3; attempt++) {
+      for (let attempt = 1; ; attempt++) {
         try {
           const text = await postImageForOcr(croppedBlob, pageNumber, controller.signal);
           fragments.push(text);
@@ -436,14 +436,12 @@ async function runCaptureLoop(tab, region) {
         } catch (e) {
           if (state.stopRequested || e.name === 'AbortError') { ocrErr = null; break; }
           ocrErr = e;
-          if (attempt < 3) {
-            updateState(tabId, { progress: `Retrying page ${pageNumber} (${attempt + 1}/3)...` });
-            await sleep(2000);
-          }
+          updateState(tabId, { progress: `Retrying page ${pageNumber} (attempt ${attempt + 1})...` });
+          await sleep(2000);
         }
       }
       if (ocrErr) {
-        // All retries exhausted — save retry state
+        // Should never reach here with infinite retry, but guard anyway
         state.retryState = { tab, region: normalizedRegion, winId, fragments, lastScrollY };
         chrome.storage.local.set({ [`retryState:${tabId}`]: state.retryState }).catch(() => {});
         updateState(tabId, {
@@ -533,7 +531,7 @@ async function resumeCaptureLoop(rs) {
 
       updateState(tabId, { progress: `Sending page ${pageNumber} to OCR...` });
       let ocrErr = null;
-      for (let attempt = 1; attempt <= 3; attempt++) {
+      for (let attempt = 1; ; attempt++) {
         try {
           const text = await postImageForOcr(croppedBlob, pageNumber, controller.signal);
           fragments.push(text);
@@ -601,31 +599,14 @@ async function resumeCaptureLoop(rs) {
 async function finalizePostCapture(tabId, mergedText, fragments) {
   const state = getState(tabId);
   let finalText;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; ; attempt++) {
     try {
       finalText = await postTextForDedup(mergedText);
       break;
     } catch (e) {
       if (state.stopRequested) { finalText = null; break; }
-      if (attempt < 3) {
-        updateState(tabId, { progress: `Retrying dedup (${attempt + 1}/3)...` });
-        await sleep(2000);
-        continue;
-      }
-      console.error('Dedup failed:', e);
-      state.retryStage = 'dedup';
-      state.pendingText = mergedText;
-      chrome.storage.local.set({ [`lastResult:${tabId}`]: mergedText });
-      updateState(tabId, {
-        active: true,
-        status: 'Error',
-        error: 'Dedup failed. Click Retry.',
-        progress: 'Dedup failed. Click Retry.',
-        fragments,
-        mergedText,
-        fragmentsCollected: fragments.length
-      });
-      return;
+      updateState(tabId, { progress: `Retrying dedup (attempt ${attempt + 1})...` });
+      await sleep(2000);
     }
   }
 
