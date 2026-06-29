@@ -12,6 +12,7 @@
   box-sizing: border-box;
   border: 2px solid #000;
   background: transparent;
+  box-shadow: 0 0 0 9999px rgba(139, 90, 43, 0.22);
   pointer-events: none;
 }
 
