@@ -3,7 +3,7 @@
   inset: 0;
   z-index: 2147483647;
   cursor: crosshair;
-  background: rgba(0, 0, 0, 0.36);
+  background: rgba(144, 238, 144, 0.40);
   user-select: none;
 }
 
@@ -12,7 +12,7 @@
   box-sizing: border-box;
   border: 2px solid #25a5ff;
   background: rgba(37, 165, 255, 0.16);
-  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.32);
+  box-shadow: 0 0 0 9999px rgba(144, 238, 144, 0.36);
   pointer-events: none;
 }
 
