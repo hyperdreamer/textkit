@@ -573,10 +573,24 @@ async def ocr(image: UploadFile | None = File(default=None)) -> OCRResponse:
 
     image_bytes = await _read_limited_upload(image, config.max_upload_bytes)
     _debug("ocr", f"request: {len(image_bytes)} bytes", enabled=config.debug)
+
+    # Debug: save last screenshot for manual inspection
+    try:
+        Path("/tmp/last_screenshot.png").write_bytes(image_bytes)
+    except OSError:
+        pass
+
     data_url = _image_to_data_url(image_bytes, image.content_type)
     _debug("ocr", f"calling model={config.ai.model} ocr_model={config.ai.ocr.model if config.ai.ocr else '-'}", enabled=config.debug)
     result = await transcribe_image(config.ai, data_url)
     _debug("ocr", f"response: {len(result.text)} chars model={result.model}", enabled=config.debug)
+
+    # Debug: save last OCR text (before dedup) for manual inspection
+    try:
+        Path("/tmp/last_ocr.txt").write_text(result.text, encoding="utf-8")
+    except OSError:
+        pass
+
     return result
 
 
