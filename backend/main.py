@@ -595,9 +595,16 @@ async def dedup(request: DedupRequest) -> Response:
     _validate_text_size(request.text, config)
     _debug("dedup", f"request: {len(request.text)} chars", enabled=config.debug)
     # Debug: always save pre-dedup text for retry troubleshooting
+    # Timestamped so historical runs aren't lost — quick access via /tmp/dedup_last.txt
     try:
-        _DEBUG_DEDUP_PATH = Path("/tmp/dedup_last.txt")
-        _DEBUG_DEDUP_PATH.write_text(request.text, encoding="utf-8")
+        import datetime
+        dump_dir = Path("/tmp/ai-ocr-debug")
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        dedup_path = dump_dir / f"pre-dedup-{ts}.txt"
+        dedup_path.write_text(request.text, encoding="utf-8")
+        # Also write to dedup_last.txt for quick access
+        (dump_dir / "dedup_last.txt").write_text(request.text, encoding="utf-8")
     except OSError:
         pass
     _debug("dedup", "calling provider...", enabled=config.debug)
