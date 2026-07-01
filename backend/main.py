@@ -82,7 +82,7 @@ class ProviderOverride:
     to a completely different provider+key for a specific task.
     """
 
-    provider: str = ""
+    provider_type: str = ""
     api_base: str = ""
     api_key: str = ""
     model: str = ""
@@ -96,7 +96,7 @@ class AIConfig:
     ``ocr`` and ``text`` are optional per-task :class:`ProviderOverride` sections.
     """
 
-    provider: str
+    provider_type: str
     api_base: str
     api_key: str
     model: str
@@ -198,11 +198,11 @@ def load_config() -> AppConfig:
     """Load application configuration from config.yaml with documented defaults."""
 
     raw_config = _load_yaml_config()
-    ai_section = raw_config.get("ai") or raw_config.get("provider") or {}
+    ai_section = raw_config.get("ai") or raw_config.get("provider_type") or {}
     if not isinstance(ai_section, dict):
         raise RuntimeError("AI provider configuration must be a YAML mapping")
 
-    provider = str(ai_section.get("provider", "openai")).lower()
+    provider = str(ai_section.get("provider_type", "openai")).lower()
     api_base = str(ai_section.get("api_base", "https://api.openai.com")).rstrip("/")
     model = str(ai_section.get("model", "gpt-4.1-mini"))
 
@@ -216,12 +216,12 @@ def load_config() -> AppConfig:
         if not isinstance(section, dict):
             return None
         has_key = bool(section.get("api_key") or section.get("api_key_env"))
-        effective_provider = str(section.get("provider", "") or provider)
+        effective_provider = str(section.get("provider_type", "") or provider)
         api_key = (
             _read_api_key(section, effective_provider) if has_key else ""
         )
         return ProviderOverride(
-            provider=str(section.get("provider", "")).lower() or "",
+            provider_type=str(section.get("provider_type", "")).lower() or "",
             api_base=str(section.get("api_base", "")).rstrip("/") or "",
             api_key=api_key,
             model=str(section.get("model", "")) or "",
@@ -255,7 +255,7 @@ def load_config() -> AppConfig:
         max_text_chars=int(raw_config.get("max_text_chars", DEFAULT_MAX_TEXT_CHARS)),
         debug=bool(raw_config.get("debug", False)),
         ai=AIConfig(
-            provider=provider,
+            provider_type=provider,
             api_base=api_base,
             api_key=api_key,
             model=model,
@@ -276,7 +276,7 @@ def _resolve_ai_config(base: AIConfig, override: ProviderOverride | None) -> AIC
     if override is None:
         return base
 
-    provider = override.provider or base.provider
+    provider = override.provider_type or base.provider_type
     api_base = override.api_base or base.api_base
     model = override.model or base.model
 
@@ -285,7 +285,7 @@ def _resolve_ai_config(base: AIConfig, override: ProviderOverride | None) -> AIC
     api_key = override.api_key or base.api_key
 
     return AIConfig(
-        provider=provider,
+        provider_type=provider,
         api_base=api_base,
         api_key=api_key,
         model=model,
@@ -590,12 +590,12 @@ async def transcribe_image(config: AIConfig, data_url: str) -> OCRResponse:
 
     cfg = _resolve_ai_config(config, config.ocr)
 
-    if cfg.provider == "openai":
+    if cfg.provider_type == "openai":
         return await _call_openai(cfg, data_url)
-    if cfg.provider == "anthropic":
+    if cfg.provider_type == "anthropic":
         return await _call_anthropic(cfg, data_url)
 
-    raise HTTPException(status_code=400, detail=f"Unsupported AI provider: {cfg.provider}")
+    raise HTTPException(status_code=400, detail=f"Unsupported AI provider: {cfg.provider_type}")
 
 
 async def deduplicate_text(config: AIConfig, text: str) -> OCRResponse:
@@ -603,7 +603,7 @@ async def deduplicate_text(config: AIConfig, text: str) -> OCRResponse:
 
     cfg = _resolve_ai_config(config, config.text)
 
-    if cfg.provider == "openai":
+    if cfg.provider_type == "openai":
         return await _post_openai_chat_completion(
             cfg,
             [
@@ -611,7 +611,7 @@ async def deduplicate_text(config: AIConfig, text: str) -> OCRResponse:
                 {"role": "user", "content": text},
             ],
         )
-    if cfg.provider == "anthropic":
+    if cfg.provider_type == "anthropic":
         return await _post_anthropic_message(
             cfg,
             [
@@ -625,7 +625,7 @@ async def deduplicate_text(config: AIConfig, text: str) -> OCRResponse:
             ],
         )
 
-    raise HTTPException(status_code=400, detail=f"Unsupported AI provider: {cfg.provider}")
+    raise HTTPException(status_code=400, detail=f"Unsupported AI provider: {cfg.provider_type}")
 
 
 async def translate_text(config: AIConfig, text: str, language: str, prompt: str | None = None) -> OCRResponse:
@@ -634,7 +634,7 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
     system_prompt = prompt or f"Translate the following text to {language}. Return only the translation."
     cfg = _resolve_ai_config(config, config.text)
 
-    if cfg.provider == "openai":
+    if cfg.provider_type == "openai":
         return await _post_openai_chat_completion(
             cfg,
             [
@@ -642,7 +642,7 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
                 {"role": "user", "content": text},
             ],
         )
-    if cfg.provider == "anthropic":
+    if cfg.provider_type == "anthropic":
         return await _post_anthropic_message(
             cfg,
             [
@@ -656,7 +656,7 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
             ],
         )
 
-    raise HTTPException(status_code=400, detail=f"Unsupported AI provider: {cfg.provider}")
+    raise HTTPException(status_code=400, detail=f"Unsupported AI provider: {cfg.provider_type}")
 
 
 app = FastAPI(title="Qidian OCR Backend")
@@ -718,7 +718,7 @@ async def ocr(image: UploadFile | None = File(default=None)) -> OCRResponse:
     image_bytes = await _read_limited_upload(image, config.max_upload_bytes)
     _debug("ocr", f"request: {len(image_bytes)} bytes", enabled=config.debug)
     data_url = _image_to_data_url(image_bytes, image.content_type)
-    _debug("ocr", f"calling provider={config.ai.provider} model={config.ai.model} ocr_model={config.ai.ocr.model if config.ai.ocr else '-'}", enabled=config.debug)
+    _debug("ocr", f"calling provider={config.ai.provider_type} model={config.ai.model} ocr_model={config.ai.ocr.model if config.ai.ocr else '-'}", enabled=config.debug)
     result = await transcribe_image(config.ai, data_url)
     _debug("ocr", f"response: {len(result.text)} chars model={result.model}", enabled=config.debug)
     return result

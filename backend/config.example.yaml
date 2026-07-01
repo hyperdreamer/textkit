@@ -18,7 +18,7 @@ max_text_chars: 200000
 # debug: false
 
 # AI provider settings.
-# Defaults to "openai" when ``provider`` is omitted.
+# Defaults to "openai" when ``provider_type`` is omitted.
 # Supported values: "openai" or "anthropic".
 ai:
   # Base URL for the provider API, without a trailing slash.
@@ -43,11 +43,11 @@ ai:
   # provider + API base + key.
   #
   # ocr:                    # OCR-specific overrides
-  #   provider: "openai"    # inherit from parent if omitted
+  #   provider_type: "openai"    # inherit from parent if omitted
   #   model: "gpt-4.1"      # vision-capable model for OCR
   #
   # text:                   # text-processing overrides (dedup + translate)
-  #   provider: "anthropic" # switch to a different provider entirely!
+  #   provider_type: "anthropic" # switch to a different provider entirely!
   #   api_base: "https://api.anthropic.com"
   #   api_key: "$ANTHROPIC_API_KEY"
   #   model: "claude-sonnet-4-20250514"
