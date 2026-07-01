@@ -75,14 +75,12 @@ class TimeoutConfig:
 
 @dataclass(frozen=True)
 class ProviderOverride:
-    """Per-task provider/model override.  Empty fields inherit from the parent AIConfig.
+    """Per-task model/API override.  Empty fields inherit from the parent AIConfig.
 
     When a field is left empty (the default), the parent ``AIConfig`` value is used.
-    This lets you override just the model while keeping the same provider, or switch
-    to a completely different provider+key for a specific task.
+    This lets you override the model or API endpoint for a specific task.
     """
 
-    provider_type: str = ""
     api_base: str = ""
     api_key: str = ""
     model: str = ""
@@ -90,13 +88,12 @@ class ProviderOverride:
 
 @dataclass(frozen=True)
 class AIConfig:
-    """Settings needed to call a configured AI provider.
+    """Settings needed to call an OpenAI-compatible chat completions API.
 
     ``model`` is the fallback used when a per-task override does not specify one.
     ``ocr`` and ``text`` are optional per-task :class:`ProviderOverride` sections.
     """
 
-    provider_type: str
     api_base: str
     api_key: str
     model: str
@@ -143,7 +140,7 @@ def _load_yaml_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     return loaded
 
 
-def _read_api_key(ai_section: dict[str, Any], provider: str) -> str:
+def _read_api_key(ai_section: dict[str, Any]) -> str:
     """Resolve an API key from config.yaml — plaintext or environment variable.
 
     ``api_key_env`` names an environment variable to read the key from.
@@ -152,7 +149,7 @@ def _read_api_key(ai_section: dict[str, Any], provider: str) -> str:
     ``os.getenv("OCR_API_KEY")``).
 
     When neither ``api_key`` nor ``api_key_env`` is configured, the function
-    falls back to ``OCR_API_KEY`` and provider-specific environment variables.
+    falls back to ``OCR_API_KEY`` and ``OPENAI_API_KEY``.
     """
 
     # ``api_key_env`` is always an environment variable name.
@@ -179,11 +176,7 @@ def _read_api_key(ai_section: dict[str, Any], provider: str) -> str:
         return raw
 
     # Neither api_key nor api_key_env configured → fall back to env vars
-    candidates = ["OCR_API_KEY"]
-    if provider == "openai":
-        candidates.append("OPENAI_API_KEY")
-    elif provider == "anthropic":
-        candidates.append("ANTHROPIC_API_KEY")
+    candidates = ["OCR_API_KEY", "OPENAI_API_KEY"]
 
     for env_name in dict.fromkeys(candidates):
         api_key = os.getenv(env_name)
@@ -198,11 +191,10 @@ def load_config() -> AppConfig:
     """Load application configuration from config.yaml with documented defaults."""
 
     raw_config = _load_yaml_config()
-    ai_section = raw_config.get("ai") or raw_config.get("provider_type") or {}
+    ai_section = raw_config.get("ai") or {}
     if not isinstance(ai_section, dict):
         raise RuntimeError("AI provider configuration must be a YAML mapping")
 
-    provider = str(ai_section.get("provider_type", "openai")).lower()
     api_base = str(ai_section.get("api_base", "https://api.openai.com")).rstrip("/")
     model = str(ai_section.get("model", "gpt-4.1-mini"))
 
@@ -210,18 +202,16 @@ def load_config() -> AppConfig:
         """Parse an optional nested ``ocr`` / ``text`` config section.
 
         API keys are resolved eagerly here so that ``api_key_env``,
-        ``$ENV_VAR`` references, and provider-specific fallbacks all
+        ``$ENV_VAR`` references, and fallbacks all
         work correctly.  The resolved config stores the actual key.
         """
         if not isinstance(section, dict):
             return None
         has_key = bool(section.get("api_key") or section.get("api_key_env"))
-        effective_provider = str(section.get("provider_type", "") or provider)
         api_key = (
-            _read_api_key(section, effective_provider) if has_key else ""
+            _read_api_key(section) if has_key else ""
         )
         return ProviderOverride(
-            provider_type=str(section.get("provider_type", "")).lower() or "",
             api_base=str(section.get("api_base", "")).rstrip("/") or "",
             api_key=api_key,
             model=str(section.get("model", "")) or "",
@@ -240,10 +230,10 @@ def load_config() -> AppConfig:
         pool=float(timeout_section.get("pool", 10.0)),
     )
 
-    # Lazy: resolve API key now if available, otherwise store empty string.
-    # Actual key requirement is enforced at request time in _call_openai / _call_anthropic.
+    # Resolve API key now if available, otherwise store empty string.
+    # Actual key requirement is enforced at request time.
     try:
-        api_key = _read_api_key(ai_section, provider) if provider in {"openai", "anthropic"} else ""
+        api_key = _read_api_key(ai_section)
     except RuntimeError:
         api_key = ""
 
@@ -255,7 +245,6 @@ def load_config() -> AppConfig:
         max_text_chars=int(raw_config.get("max_text_chars", DEFAULT_MAX_TEXT_CHARS)),
         debug=bool(raw_config.get("debug", False)),
         ai=AIConfig(
-            provider_type=provider,
             api_base=api_base,
             api_key=api_key,
             model=model,
@@ -271,12 +260,11 @@ def _resolve_ai_config(base: AIConfig, override: ProviderOverride | None) -> AIC
 
     Every field that is empty in *override* falls back to *base*.
     API keys in *override* are resolved through ``_read_api_key`` so
-    ``$ENV_VAR`` references and provider-specific fallbacks work.
+    ``$ENV_VAR`` references and fallbacks work.
     """
     if override is None:
         return base
 
-    provider = override.provider_type or base.provider_type
     api_base = override.api_base or base.api_base
     model = override.model or base.model
 
@@ -285,7 +273,6 @@ def _resolve_ai_config(base: AIConfig, override: ProviderOverride | None) -> AIC
     api_key = override.api_key or base.api_key
 
     return AIConfig(
-        provider_type=provider,
         api_base=api_base,
         api_key=api_key,
         model=model,
@@ -361,17 +348,6 @@ def _extract_openai_text(payload: dict[str, Any]) -> str:
             if isinstance(part, dict) and part.get("type") == "text"
         ).strip()
     return ""
-
-
-def _extract_anthropic_text(payload: dict[str, Any]) -> str:
-    """Extract OCR text from an Anthropic messages response."""
-
-    content = payload.get("content") or []
-    return "\n".join(
-        block.get("text", "").strip()
-        for block in content
-        if isinstance(block, dict) and block.get("type") == "text"
-    ).strip()
 
 
 async def _call_with_retry(
@@ -487,69 +463,6 @@ async def _call_openai(config: AIConfig, data_url: str) -> OCRResponse:
     )
 
 
-def _anthropic_image_source(data_url: str) -> dict[str, str]:
-    """Convert a data URL into Anthropic's base64 image source shape."""
-
-    header, encoded = data_url.split(",", 1)
-    media_type = header.removeprefix("data:").removesuffix(";base64")
-    return {"type": "base64", "media_type": media_type, "data": encoded}
-
-
-async def _post_anthropic_message(
-    config: AIConfig,
-    messages: list[dict[str, Any]],
-) -> OCRResponse:
-    """Send messages to Anthropic's /v1/messages API."""
-
-    if not config.api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="No API key configured. Set ai.api_key in config.yaml or the OCR_API_KEY environment variable.",
-        )
-
-    request_body = {
-        "model": config.model,
-        "max_tokens": 4096,
-        "messages": messages,
-    }
-    headers = {
-        "x-api-key": config.api_key,
-        "anthropic-version": "2023-06-01",
-    }
-
-    async def _do_request() -> httpx.Response:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                connect=config.timeout.connect,
-                read=config.timeout.read,
-                write=config.timeout.write,
-                pool=config.timeout.pool,
-            )
-        ) as client:
-            return await client.post(
-                f"{config.api_base}/v1/messages",
-                headers=headers,
-                json=request_body,
-            )
-
-    response = await _call_with_retry(config, _do_request, "Anthropic")
-
-    if response.is_error:
-        detail = response.text
-        if len(detail) > 500:
-            detail = detail[:500] + "..."
-        raise HTTPException(status_code=502, detail=f"Anthropic API failed: {detail}")
-
-    payload = _decode_provider_json(response, "Anthropic")
-    usage = payload.get("usage") or {}
-    tokens_used = int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
-    return OCRResponse(
-        text=_extract_anthropic_text(payload),
-        model=str(payload.get("model") or config.model),
-        tokens_used=tokens_used,
-    )
-
-
 def _decode_provider_json(response: httpx.Response, provider_name: str) -> dict[str, Any]:
     """Decode provider JSON without leaking tracebacks to API clients."""
 
@@ -568,64 +481,24 @@ def _decode_provider_json(response: httpx.Response, provider_name: str) -> dict[
     return payload
 
 
-async def _call_anthropic(config: AIConfig, data_url: str) -> OCRResponse:
-    """Send the image to Anthropic's /v1/messages API."""
-
-    return await _post_anthropic_message(
-        config,
-        [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": OCR_PROMPT},
-                    {"type": "image", "source": _anthropic_image_source(data_url)},
-                ],
-            }
-        ],
-    )
-
-
 async def transcribe_image(config: AIConfig, data_url: str) -> OCRResponse:
     """Route an OCR request to the configured provider."""
 
     cfg = _resolve_ai_config(config, config.ocr)
-
-    if cfg.provider_type == "openai":
-        return await _call_openai(cfg, data_url)
-    if cfg.provider_type == "anthropic":
-        return await _call_anthropic(cfg, data_url)
-
-    raise HTTPException(status_code=400, detail=f"Unsupported AI provider: {cfg.provider_type}")
+    return await _call_openai(cfg, data_url)
 
 
 async def deduplicate_text(config: AIConfig, text: str) -> OCRResponse:
     """Route a deduplication request to the configured provider."""
 
     cfg = _resolve_ai_config(config, config.text)
-
-    if cfg.provider_type == "openai":
-        return await _post_openai_chat_completion(
-            cfg,
-            [
-                {"role": "system", "content": DEDUP_PROMPT},
-                {"role": "user", "content": text},
-            ],
-        )
-    if cfg.provider_type == "anthropic":
-        return await _post_anthropic_message(
-            cfg,
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": DEDUP_PROMPT},
-                        {"type": "text", "text": text},
-                    ],
-                }
-            ],
-        )
-
-    raise HTTPException(status_code=400, detail=f"Unsupported AI provider: {cfg.provider_type}")
+    return await _post_openai_chat_completion(
+        cfg,
+        [
+            {"role": "system", "content": DEDUP_PROMPT},
+            {"role": "user", "content": text},
+        ],
+    )
 
 
 async def translate_text(config: AIConfig, text: str, language: str, prompt: str | None = None) -> OCRResponse:
@@ -633,30 +506,13 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
 
     system_prompt = prompt or f"Translate the following text to {language}. Return only the translation."
     cfg = _resolve_ai_config(config, config.text)
-
-    if cfg.provider_type == "openai":
-        return await _post_openai_chat_completion(
-            cfg,
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text},
-            ],
-        )
-    if cfg.provider_type == "anthropic":
-        return await _post_anthropic_message(
-            cfg,
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": system_prompt},
-                        {"type": "text", "text": text},
-                    ],
-                }
-            ],
-        )
-
-    raise HTTPException(status_code=400, detail=f"Unsupported AI provider: {cfg.provider_type}")
+    return await _post_openai_chat_completion(
+        cfg,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+    )
 
 
 app = FastAPI(title="Qidian OCR Backend")
@@ -718,7 +574,7 @@ async def ocr(image: UploadFile | None = File(default=None)) -> OCRResponse:
     image_bytes = await _read_limited_upload(image, config.max_upload_bytes)
     _debug("ocr", f"request: {len(image_bytes)} bytes", enabled=config.debug)
     data_url = _image_to_data_url(image_bytes, image.content_type)
-    _debug("ocr", f"calling provider={config.ai.provider_type} model={config.ai.model} ocr_model={config.ai.ocr.model if config.ai.ocr else '-'}", enabled=config.debug)
+    _debug("ocr", f"calling model={config.ai.model} ocr_model={config.ai.ocr.model if config.ai.ocr else '-'}", enabled=config.debug)
     result = await transcribe_image(config.ai, data_url)
     _debug("ocr", f"response: {len(result.text)} chars model={result.model}", enabled=config.debug)
     return result

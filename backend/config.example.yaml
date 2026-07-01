@@ -17,9 +17,7 @@ max_text_chars: 200000
 # Enable debug logging to stderr for OCR / dedup / translate requests.
 # debug: false
 
-# AI provider settings.
-# Defaults to "openai" when ``provider_type`` is omitted.
-# Supported values: "openai" or "anthropic".
+# AI API settings — uses an OpenAI-compatible chat completions API.
 ai:
   # Base URL for the provider API, without a trailing slash.
   # OpenAI-compatible providers must expose /v1/chat/completions.
@@ -37,22 +35,19 @@ ai:
   # Vision-capable model name to use when no per-task override specifies one.
   model: "gpt-4.1-mini"
 
-  # Per-task provider overrides (optional).  Every field is optional — empty
-  # fields inherit from the parent ``ai`` section.  You can override just the
-  # model within the same provider, or switch to a completely different
-  # provider + API base + key.
+  # Per-task model/API overrides (optional).  Every field is optional — empty
+  # fields inherit from the parent ``ai`` section.  You can override the model
+  # or API endpoint for a specific task.
   #
   # ocr:                    # OCR-specific overrides
-  #   provider_type: "openai"    # inherit from parent if omitted
   #   model: "gpt-4.1"      # vision-capable model for OCR
   #
   # text:                   # text-processing overrides (dedup + translate)
-  #   provider_type: "anthropic" # switch to a different provider entirely!
-  #   api_base: "https://api.anthropic.com"
-  #   api_key: "$ANTHROPIC_API_KEY"
+  #   api_base: "https://other-proxy.example.com"
+  #   api_key: "$OTHER_PROXY_API_KEY"
   #   model: "claude-sonnet-4-20250514"
 
-  # Per-phase HTTP timeouts for AI provider calls (all in seconds).
+  # Per-phase HTTP timeouts for AI API calls (all in seconds).
   # Omit any key to use its default.  Increase ``read`` when translating
   # very long text that may take the model several minutes to process.
   # timeout:
