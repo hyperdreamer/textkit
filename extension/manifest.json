@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI OCR Capture",
-  "version": "1.2.1",
+  "version": "1.2.3",
   "description": "Select a page region, OCR repeated viewport captures, and download merged text.",
   "permissions": [
     "activeTab",
