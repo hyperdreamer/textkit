@@ -18,10 +18,9 @@ max_text_chars: 200000
 # debug: false
 
 # AI provider settings.
+# Defaults to "openai" when ``provider`` is omitted.
+# Supported values: "openai" or "anthropic".
 ai:
-  # Supported values: "openai" or "anthropic".
-  provider: "openai"
-
   # Base URL for the provider API, without a trailing slash.
   # OpenAI-compatible providers must expose /v1/chat/completions.
   # Anthropic-compatible providers must expose /v1/messages.
