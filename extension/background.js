@@ -434,6 +434,7 @@ async function runCaptureLoop(tab, region) {
 
     const fragments = [];
     let lastScrollY = -1;
+    let atBottom = false;
     const { ocrAutoscroll } = await chrome.storage.sync.get({ ocrAutoscroll: true });
 
     while (true) {
@@ -493,12 +494,14 @@ async function runCaptureLoop(tab, region) {
         break;
       }
 
+      if (atBottom) break;
+
       const scrollResult = await chrome.tabs.sendMessage(tab.id, {
         type: 'page:scroll-down',
         overlapPx: OVERLAP_PX
       });
 
-      if (scrollResult?.atBottom) break;
+      if (scrollResult?.atBottom) { atBottom = true; continue; }
       lastScrollY = scrollResult.scrollY;
     }
 
@@ -540,6 +543,7 @@ async function resumeCaptureLoop(rs) {
     chrome.tabs.sendMessage(tab.id, { type: 'page:lock-scroll' }).catch(() => {});
 
     let scrollY = lastScrollY;
+    let atBottom = false;
 
     while (true) {
       if (state.stopRequested) break;
@@ -603,12 +607,14 @@ async function resumeCaptureLoop(rs) {
         break;
       }
 
+      if (atBottom) break;
+
       const scrollResult = await chrome.tabs.sendMessage(tab.id, {
         type: 'page:scroll-down',
         overlapPx: OVERLAP_PX
       });
 
-      if (scrollResult?.atBottom) break;
+      if (scrollResult?.atBottom) { atBottom = true; continue; }
       scrollY = scrollResult.scrollY;
     }
 
