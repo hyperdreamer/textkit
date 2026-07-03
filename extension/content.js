@@ -322,7 +322,23 @@
 
   function waitForScrollSettle() {
     return new Promise((resolve) => {
-      requestAnimationFrame(() => requestAnimationFrame(resolve));
+      let lastY = window.scrollY;
+      let stableFrames = 0;
+      const check = () => {
+        const currentY = window.scrollY;
+        if (Math.abs(currentY - lastY) < 0.5) {
+          stableFrames++;
+          if (stableFrames >= 2) {
+            resolve();
+            return;
+          }
+        } else {
+          stableFrames = 0;
+          lastY = currentY;
+        }
+        requestAnimationFrame(check);
+      };
+      requestAnimationFrame(check);
     });
   }
 

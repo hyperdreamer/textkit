@@ -498,7 +498,7 @@ async function runCaptureLoop(tab, region) {
         overlapPx: OVERLAP_PX
       });
 
-      if (!scrollResult?.changed || scrollResult.scrollY === lastScrollY) break;
+      if (scrollResult?.atBottom) break;
       lastScrollY = scrollResult.scrollY;
     }
 
@@ -608,7 +608,7 @@ async function resumeCaptureLoop(rs) {
         overlapPx: OVERLAP_PX
       });
 
-      if (!scrollResult?.changed || scrollResult.scrollY === scrollY) break;
+      if (scrollResult?.atBottom) break;
       scrollY = scrollResult.scrollY;
     }
 
