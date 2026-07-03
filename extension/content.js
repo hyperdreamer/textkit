@@ -154,6 +154,14 @@
       dragStart = { ex, ey };
       region = { x: ex, y: ey, width: 0, height: 0 };
     }
+    // Map dragMode to cursor
+    const CURSOR_MAP = {
+      new: 'crosshair',
+      move: 'move',
+      nw: 'nw-resize', n: 'n-resize', ne: 'ne-resize', e: 'e-resize',
+      se: 'se-resize', s: 's-resize', sw: 'sw-resize', w: 'w-resize'
+    };
+    overlay.style.cursor = CURSOR_MAP[dragMode] || '';
     drawRegion();
   }
 
@@ -165,57 +173,58 @@
     const dy = ey - dragStart.ey;
 
     switch (dragMode) {
-      case 'new':
-        region.x = Math.min(dragStart.ex, ex);
-        region.y = Math.min(dragStart.ey, ey);
-        region.width = Math.abs(ex - dragStart.ex);
-        region.height = Math.abs(ey - dragStart.ey);
-        break;
-      case 'move':
-        region.x = clamp(dragStart.rx + dx, 0, window.innerWidth - region.width);
-        region.y = clamp(dragStart.ry + dy, 0, window.innerHeight - region.height);
-        break;
-      case 'nw':
-        region.x = clamp(dragStart.rx + dx, 0, dragStart.rx + dragStart.rw - MIN_SIZE);
-        region.y = clamp(dragStart.ry + dy, 0, dragStart.ry + dragStart.rh - MIN_SIZE);
-        region.width = dragStart.rx + dragStart.rw - region.x;
-        region.height = dragStart.ry + dragStart.rh - region.y;
-        break;
-      case 'n':
-        region.y = clamp(dragStart.ry + dy, 0, dragStart.ry + dragStart.rh - MIN_SIZE);
-        region.height = dragStart.ry + dragStart.rh - region.y;
-        break;
-      case 'ne':
-        region.y = clamp(dragStart.ry + dy, 0, dragStart.ry + dragStart.rh - MIN_SIZE);
-        region.width = clamp(dragStart.rw + dx, MIN_SIZE, window.innerWidth - dragStart.rx);
-        region.height = dragStart.ry + dragStart.rh - region.y;
-        break;
-      case 'e':
-        region.width = clamp(dragStart.rw + dx, MIN_SIZE, window.innerWidth - dragStart.rx);
-        break;
-      case 'se':
-        region.width = clamp(dragStart.rw + dx, MIN_SIZE, window.innerWidth - dragStart.rx);
-        region.height = clamp(dragStart.rh + dy, MIN_SIZE, window.innerHeight - dragStart.ry);
-        break;
-      case 's':
-        region.height = clamp(dragStart.rh + dy, MIN_SIZE, window.innerHeight - dragStart.ry);
-        break;
-      case 'sw':
-        region.x = clamp(dragStart.rx + dx, 0, dragStart.rx + dragStart.rw - MIN_SIZE);
-        region.width = dragStart.rx + dragStart.rw - region.x;
-        region.height = clamp(dragStart.rh + dy, MIN_SIZE, window.innerHeight - dragStart.ry);
-        break;
-      case 'w':
-        region.x = clamp(dragStart.rx + dx, 0, dragStart.rx + dragStart.rw - MIN_SIZE);
-        region.width = dragStart.rx + dragStart.rw - region.x;
-        break;
-    }
+        case 'new':
+          region.x = Math.min(dragStart.ex, ex);
+          region.y = Math.min(dragStart.ey, ey);
+          region.width = Math.abs(ex - dragStart.ex);
+          region.height = Math.abs(ey - dragStart.ey);
+          break;
+        case 'move':
+          region.x = clamp(dragStart.rx + dx, 0, window.innerWidth - region.width);
+          region.y = clamp(dragStart.ry + dy, 0, window.innerHeight - region.height);
+          break;
+        case 'nw':
+          region.x = clamp(dragStart.rx + dx, 0, dragStart.rx + dragStart.rw - MIN_SIZE);
+          region.y = clamp(dragStart.ry + dy, 0, dragStart.ry + dragStart.rh - MIN_SIZE);
+          region.width = dragStart.rx + dragStart.rw - region.x;
+          region.height = dragStart.ry + dragStart.rh - region.y;
+          break;
+        case 'n':
+          region.y = clamp(dragStart.ry + dy, 0, dragStart.ry + dragStart.rh - MIN_SIZE);
+          region.height = dragStart.ry + dragStart.rh - region.y;
+          break;
+        case 'ne':
+          region.y = clamp(dragStart.ry + dy, 0, dragStart.ry + dragStart.rh - MIN_SIZE);
+          region.width = clamp(dragStart.rw + dx, MIN_SIZE, window.innerWidth - dragStart.rx);
+          region.height = dragStart.ry + dragStart.rh - region.y;
+          break;
+        case 'e':
+          region.width = clamp(dragStart.rw + dx, MIN_SIZE, window.innerWidth - dragStart.rx);
+          break;
+        case 'se':
+          region.width = clamp(dragStart.rw + dx, MIN_SIZE, window.innerWidth - dragStart.rx);
+          region.height = clamp(dragStart.rh + dy, MIN_SIZE, window.innerHeight - dragStart.ry);
+          break;
+        case 's':
+          region.height = clamp(dragStart.rh + dy, MIN_SIZE, window.innerHeight - dragStart.ry);
+          break;
+        case 'sw':
+          region.x = clamp(dragStart.rx + dx, 0, dragStart.rx + dragStart.rw - MIN_SIZE);
+          region.width = dragStart.rx + dragStart.rw - region.x;
+          region.height = clamp(dragStart.rh + dy, MIN_SIZE, window.innerHeight - dragStart.ry);
+          break;
+        case 'w':
+          region.x = clamp(dragStart.rx + dx, 0, dragStart.rx + dragStart.rw - MIN_SIZE);
+          region.width = dragStart.rx + dragStart.rw - region.x;
+          break;
+      }
     drawRegion();
   }
 
   function onPointerUp() {
     dragMode = null;
     dragStart = null;
+    if (overlay) overlay.style.cursor = '';
   }
 
   function confirmSelection() {
@@ -275,7 +284,7 @@
       const [px, py] = positions[ids[i]];
       h.style.left = (px - HANDLE_SIZE) + 'px';
       h.style.top = (py - HANDLE_SIZE) + 'px';
-      h.style.display = r.width >= MIN_SIZE ? '' : 'none';
+      h.style.display = r.width >= MIN_SIZE ? 'block' : 'none';
     });
   }
 
