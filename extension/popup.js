@@ -507,25 +507,21 @@ async function saveTranslation() {
   }
 
   try {
-    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
-    const url = `http://${backend.host}:${backend.port}/save`;
-    const response = await fetchWithTimeout(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, path })
+    const response = await chrome.runtime.sendMessage({
+      type: 'save:translation',
+      text,
+      path
     });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok || payload.error) throw new Error(payload.error || `HTTP ${response.status}`);
+    if (!response?.ok) throw new Error(response?.error || 'Save failed');
 
-    const savedPath = payload.path || path;
     tl2Save.textContent = 'Saved!';
     setTimeout(() => tl2Save.textContent = 'Save', 1500);
-    setTl2Progress(`Saved to ${savedPath}.`);
+    setTl2Progress(`Saved to ${response.path || path}.`);
     chrome.notifications.create('tl2-manual-save', {
       type: 'basic',
       iconUrl: 'icons/icon128.png',
       title: 'AI OCR — Saved',
-      message: `Translation saved to ${savedPath}.`,
+      message: `Translation saved to ${response.path || path}.`,
       priority: 0
     });
   } catch (e) {

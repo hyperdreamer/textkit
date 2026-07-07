@@ -16,8 +16,7 @@
   "host_permissions": [
     "http://localhost:*/*",
     "http://127.0.0.1:*/*",
-    "http://[::1]:*/*",
-    "https://localhost:*/*"
+    "http://[::1]:*/*"
   ],
   "icons": {
     "16": "icons/icon16.png",
