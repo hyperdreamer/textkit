@@ -505,7 +505,10 @@ async function runCaptureLoop(tab, region) {
         overlapPx: OVERLAP_PX
       });
 
-      if (scrollResult?.atBottom) { atBottom = true; continue; }
+      if (scrollResult?.atBottom) {
+        if (!scrollResult.changed && fragments.length > 0) break;
+        atBottom = true; continue;
+      }
       lastScrollY = scrollResult.scrollY;
     }
 
@@ -619,7 +622,10 @@ async function resumeCaptureLoop(rs) {
         overlapPx: OVERLAP_PX
       });
 
-      if (scrollResult?.atBottom) { atBottom = true; continue; }
+      if (scrollResult?.atBottom) {
+        if (!scrollResult.changed && fragments.length > 0) break;
+        atBottom = true; continue;
+      }
       scrollY = scrollResult.scrollY;
     }
 
