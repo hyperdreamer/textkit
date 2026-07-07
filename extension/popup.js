@@ -308,6 +308,12 @@ async function refreshState() {
   const response = await chrome.runtime.sendMessage({ type: 'popup:get-state' });
   if (response?.ok) {
     currentTabId = response.tabId || currentTabId;
+    // Check storage for retry state that survived a SW restart
+    const rsKey = currentTabId ? `retryState:${currentTabId}` : null;
+    if (rsKey && response.state.status === 'Error' && !response.state.retryState && !response.state.retryStage) {
+      const stored = await chrome.storage.local.get(rsKey);
+      if (stored[rsKey]) response.state._hasStoredRetry = true;
+    }
     renderState(response.state);
   }
 }
@@ -361,7 +367,8 @@ function renderState(state) {
   const hasText = (mergedText || resultEl.value || '').trim().length > 0;
   const isActive = Boolean(latestState.active);
   const isError = latestState.status === 'Error';
-  const canRetry = (isError && latestState.active && latestState.retryState) || !!latestState.retryStage;
+  // Check for retry capability: in-memory retryState/stage OR persisted retryState in storage
+  const canRetry = (isError && latestState.active && (latestState.retryState || latestState.retryStage || latestState._hasStoredRetry)) || !!latestState.retryStage;
 
   statusEl.textContent = latestState.status === 'Idle' && lastStoredStatus
     ? lastStoredStatus

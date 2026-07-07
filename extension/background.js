@@ -248,6 +248,13 @@ async function handleRetry() {
     return { ok: true, result };
   }
 
+  if (state.retryStage === 'dedup') {
+    const pendingText = state.pendingText;
+    updateState(tab.id, { active: true, status: 'Deduplicating', progress: 'Retrying dedup...', error: '' });
+    await finalizePostCapture(tab.id, pendingText, state.fragments || []);
+    return { ok: true };
+  }
+
   const rs = state.retryState || await loadRetryState(tab.id);
   if (!rs) throw new Error('No retry state saved.');
   state.retryState = null;
@@ -284,64 +291,67 @@ async function handleTranslateStart(msg) {
   handleTranslateStop(tabId);
 
   const controller = new AbortController();
-  translateControllers.set(tabId, controller);
-
   let timedOut = false;
-  const timeoutId = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, BACKEND_TIMEOUT_MS);
-
-  // Persist state so popup reopen shows "Stop" button.
-  // Clear any stale result so init() doesn't mistake an old result
-  // for a just-completed translation.
-  await chrome.storage.local.set({
-    [`tl2Translating:${tabId}`]: true,
-    [`tl2Status:${tabId}`]: `Translating to ${language}...`
-  });
-  await chrome.storage.local.remove(`tl2Result:${tabId}`);
-  chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: true }).catch(() => {});
+  let timeoutId = null;
 
   try {
-    const key = `translatePrompt:${language}`;
-    const stored = await chrome.storage.local.get(key);
-    // "Original" with no custom prompt → pass through unchanged
-    if (language === 'original' && !stored[key]) {
-      const translated = text;
+    translateControllers.set(tabId, controller);
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, BACKEND_TIMEOUT_MS);
+
+    // Persist state so popup reopen shows "Stop" button.
+    // Clear any stale result so init() doesn't mistake an old result
+    // for a just-completed translation.
+    await chrome.storage.local.set({
+      [`tl2Translating:${tabId}`]: true,
+      [`tl2Status:${tabId}`]: `Translating to ${language}...`
+    });
+    await chrome.storage.local.remove(`tl2Result:${tabId}`);
+    chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: true }).catch(() => {});
+
+    try {
+      const key = `translatePrompt:${language}`;
+      const stored = await chrome.storage.local.get(key);
+      // "Original" with no custom prompt → pass through unchanged
+      if (language === 'original' && !stored[key]) {
+        const translated = text;
+        await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
+        chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
+        if (translated) autoCopyIfEnabled(translated);
+        if (translated) autoSaveIfEnabled(translated);
+        return { ok: true };
+      }
+      const url = buildBackendEndpoint(host || DEFAULT_HOST, port || DEFAULT_PORT, `/translate?_=${Date.now()}`);
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, language, prompt: stored[key] || undefined }),
+        signal: controller.signal
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      if (payload.error) throw new Error(payload.error);
+
+      const translated = payload.text || '';
       await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
       chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
+      // Auto-copy / auto-save translated text
       if (translated) autoCopyIfEnabled(translated);
       if (translated) autoSaveIfEnabled(translated);
-      return { ok: true };
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        const message = timedOut ? 'Translation timed out.' : 'Translation stopped.';
+        await chrome.storage.local.set({ [`tl2Status:${tabId}`]: message });
+        if (timedOut) chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: '', error: message }).catch(() => {});
+        return { ok: !timedOut, error: timedOut ? message : undefined };
+      }
+      const errorMessage = e.message || 'Translation failed.';
+      await chrome.storage.local.set({ [`tl2Status:${tabId}`]: errorMessage });
+      chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: '', error: errorMessage }).catch(() => {});
+      return { ok: false, error: errorMessage };
     }
-    const url = buildBackendEndpoint(host || DEFAULT_HOST, port || DEFAULT_PORT, `/translate?_=${Date.now()}`);
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, language, prompt: stored[key] || undefined }),
-      signal: controller.signal
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-    if (payload.error) throw new Error(payload.error);
-
-    const translated = payload.text || '';
-    await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
-    chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
-    // Auto-copy / auto-save translated text
-    if (translated) autoCopyIfEnabled(translated);
-    if (translated) autoSaveIfEnabled(translated);
-  } catch (e) {
-    if (e.name === 'AbortError') {
-      const message = timedOut ? 'Translation timed out.' : 'Translation stopped.';
-      await chrome.storage.local.set({ [`tl2Status:${tabId}`]: message });
-      if (timedOut) chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: '', error: message }).catch(() => {});
-      return { ok: !timedOut, error: timedOut ? message : undefined };
-    }
-    const errorMessage = e.message || 'Translation failed.';
-    await chrome.storage.local.set({ [`tl2Status:${tabId}`]: errorMessage });
-    chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: '', error: errorMessage }).catch(() => {});
-    return { ok: false, error: errorMessage };
   } finally {
     clearTimeout(timeoutId);
     if (translateControllers.get(tabId) === controller) {
@@ -407,7 +417,6 @@ async function runCaptureLoop(tab, region) {
 
   // Prevent concurrent captures on the same tab
   if (state.captureInFlight) throw new Error('Capture already in progress for this tab.');
-  state.captureInFlight = true;
 
   const normalizedRegion = normalizeRegion(region);
   if (normalizedRegion.width < 2 || normalizedRegion.height < 2) {
@@ -418,6 +427,7 @@ async function runCaptureLoop(tab, region) {
   const controller = new AbortController();
   captureControllers.set(tabId, controller);
   startKeepAlive();
+  state.captureInFlight = true;
 
   try {
     resetState(tabId);
@@ -531,6 +541,7 @@ async function resumeCaptureLoop(rs) {
 
   const controller = new AbortController();
   captureControllers.set(tabId, controller);
+  startKeepAlive();
 
   try {
     // Lock page scroll — user scrolling during autoscroll desyncs overlap tracking
@@ -622,6 +633,7 @@ async function resumeCaptureLoop(rs) {
   } finally {
     state.captureInFlight = false;
     captureControllers.delete(tabId);
+    if (captureControllers.size === 0 && translateControllers.size === 0) stopKeepAlive();
     // Unlock page scroll
     chrome.tabs.sendMessage(tab.id, { type: 'page:unlock-scroll' }).catch(() => {});
   }
@@ -651,6 +663,10 @@ async function finalizePostCapture(tabId, mergedText, fragments) {
     await finalizeCapture(tabId, mergedText, fragments);
     return;
   }
+
+  // Persist dedup-pending state so handleRetry can re-run dedup on failure
+  state.retryStage = 'dedup';
+  state.pendingText = mergedText;
 
   await finalizeCapture(tabId, finalText, fragments);
 }
