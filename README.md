@@ -2,7 +2,7 @@
 
 AI OCR is a local OCR capture tool for reading long web pages through a browser extension and an AI-backed FastAPI service. The Chromium Manifest V3 extension lets you select a fixed region of the current page, capture that region page-by-page while scrolling, merge overlapping OCR fragments, optionally translate the result, and copy or download the final text.
 
-The backend is provider-neutral: it can call OpenAI-compatible chat completion APIs or Anthropic's Messages API, depending on `backend/config.yaml`.
+The backend is provider-neutral: it calls OpenAI-compatible chat completion APIs, configured through `backend/config.yaml`.
 
 ## Architecture
 
@@ -15,7 +15,7 @@ Typical flow:
 
 1. Start the backend locally.
 2. Load the extension in Chrome or another Chromium browser.
-3. Press `Ctrl+Shift+C` or click `Select Region` in the popup.
+3. Press `Ctrl+Shift+S` or click `Select Region` in the popup.
 4. Draw or adjust the capture region and press `Ctrl+Space`.
 5. The extension captures the selected region, sends each page image to `POST /ocr`, merges fragments, sends merged text to `POST /dedup`, optionally sends the result to `POST /translate`, and stores the final text.
 
@@ -36,7 +36,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-By default, the server binds to `0.0.0.0:8765`.
+By default, the server binds to `127.0.0.1:8765`. Change `host` in `config.yaml` to `0.0.0.0` to listen on all interfaces.
 
 ### Extension
 
@@ -62,11 +62,10 @@ cp config.example.yaml config.yaml
 Example:
 
 ```yaml
-host: "0.0.0.0"
+host: "127.0.0.1"
 port: 8765
 
 ai:
-  provider: "openai"
   api_base: "https://api.openai.com"
   api_key: "$OCR_API_KEY"
   model: "gpt-4.1-mini"
@@ -75,28 +74,21 @@ ai:
   # ocr:
   #   model: "gpt-4.1"
   # text:
-  #   provider: "anthropic"
-  #   api_base: "https://api.anthropic.com"
-  #   api_key: "$ANTHROPIC_API_KEY"
-  #   model: "claude-sonnet-4-20250514"
+  #   model: "gpt-4.1-mini"
 ```
 
 Supported `ai` fields:
 
-- `provider`: `openai` or `anthropic`.
-- `api_base`: base provider URL without a trailing slash.
-  - OpenAI-compatible providers must expose `/v1/chat/completions`.
-  - Anthropic-compatible providers must expose `/v1/messages`.
+- `api_base`: base provider URL without a trailing slash. Must expose `/v1/chat/completions`.
 - `api_key`: the API key. Plaintext values are used directly. Prefix with `$` to treat the value as an environment variable name (e.g. `$OCR_API_KEY`). `api_key_env` is also accepted.
 - `model`: the model name to send to the provider. This is the fallback model used for all operations unless per-task overrides are set.
-- `ocr` (optional): nested section to override provider/model for vision (OCR) requests. Fields: `provider`, `api_base`, `api_key`, `model`. Empty fields inherit from the parent `ai` section.
-- `text` (optional): nested section to override provider/model for text processing (deduplication and translation). Same fields as `ocr`.
+- `ocr` (optional): nested section to override model/endpoint for vision (OCR) requests. Fields: `api_base`, `api_key`, `model`. Empty fields inherit from the parent `ai` section.
+- `text` (optional): nested section to override model/endpoint for text processing (deduplication and translation). Same fields as `ocr`.
 
 The backend also falls back to these environment variable names:
 
 - `OCR_API_KEY`
-- `OPENAI_API_KEY` when `provider: "openai"`
-- `ANTHROPIC_API_KEY` when `provider: "anthropic"`
+- `OPENAI_API_KEY`
 
 API key loading is lazy. The app can start without an API key in the environment; missing credentials are reported when an endpoint tries to call the configured provider.
 
@@ -200,7 +192,7 @@ Main files:
 
 ### Capture controls
 
-- Press `Ctrl+Shift+C` to open the region selection overlay. On macOS, the manifest suggests `Command+Shift+C`.
+- Press `Ctrl+Shift+S` to open the region selection overlay. On macOS, the manifest suggests `Command+Shift+S`.
 - Click `Select Region` in the popup to start the same selection flow.
 - Drag on the page to draw the region.
 - If a region was previously saved, it is pre-drawn when selection starts.

@@ -240,12 +240,6 @@ async function handleStop() {
 async function handleRetry() {
   const tab = await getActiveTab();
   const state = getState(tab.id);
-  if (state.retryStage === 'dedup') {
-    const pendingText = state.pendingText;
-    updateState(tab.id, { active: true, status: 'Deduplicating', progress: 'Retrying dedup...', error: '' });
-    await finalizePostCapture(tab.id, pendingText, state.fragments || []);
-    return { ok: true };
-  }
 
   if (state.retryStage === 'translate') {
     const pendingText = state.pendingText;
@@ -639,7 +633,7 @@ async function finalizePostCapture(tabId, mergedText, fragments) {
   chrome.storage.local.set({ [`preDedup:${tabId}`]: mergedText }).catch(() => {});
   const signal = captureControllers.get(tabId)?.signal;
   let finalText;
-  for (let attempt = 1; attempt <= 10; attempt++) {
+  for (let attempt = 1; ; attempt++) {
     try {
       finalText = await postTextForDedup(mergedText, signal);
       // Save post-dedup text for debugging
@@ -647,26 +641,8 @@ async function finalizePostCapture(tabId, mergedText, fragments) {
       break;
     } catch (e) {
       if (state.stopRequested) { finalText = null; break; }
-      if (attempt < 10) {
-        updateState(tabId, { progress: `Retrying dedup (${attempt + 1}/10)...` });
-        await sleep(2000);
-        continue;
-      }
-      // Exhausted retries — fall back to error state
-      console.error('Dedup failed after 10 retries:', e);
-      state.retryStage = 'dedup';
-      state.pendingText = mergedText;
-      chrome.storage.local.set({ [`lastResult:${tabId}`]: mergedText });
-      updateState(tabId, {
-        active: true,
-        status: 'Error',
-        error: 'Dedup failed. Click Retry.',
-        progress: 'Dedup failed. Click Retry.',
-        fragments,
-        mergedText,
-        fragmentsCollected: fragments.length
-      });
-      return;
+      updateState(tabId, { progress: `Retrying dedup (${attempt + 1})...` });
+      await sleep(2000);
     }
   }
 
@@ -990,6 +966,11 @@ async function copyToClipboard(text) {
     // Document may already exist — that's fine
   }
   chrome.runtime.sendMessage({ type: 'offscreen:copy', text }).catch(() => {});
+  // Close the offscreen document after the copy completes so it doesn't block
+  // future offscreen operations (MV3 allows only one at a time).
+  setTimeout(() => {
+    chrome.offscreen.closeDocument().catch(() => {});
+  }, 2000);
 }
 
 function updateState(tabId, partial) {
