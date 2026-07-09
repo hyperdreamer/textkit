@@ -1015,7 +1015,7 @@ async function autoCopyIfEnabled(text) {
   chrome.notifications.create('auto-copy', {
     type: 'basic',
     iconUrl: 'icons/icon128.png',
-    title: 'AI OCR — Copied',
+    title: 'TextKit — Copied',
     message: 'Translation copied to system clipboard.',
     priority: 0
   });
@@ -1032,7 +1032,7 @@ async function autoSaveIfEnabled(text) {
     chrome.notifications.create('auto-save', {
       type: 'basic',
       iconUrl: 'icons/icon128.png',
-      title: 'AI OCR — Saved',
+      title: 'TextKit — Saved',
       message: `Translation saved to ${result.path || tl2AutoSavePath}.`,
       priority: 0
     });
@@ -1041,7 +1041,7 @@ async function autoSaveIfEnabled(text) {
     chrome.notifications.create('auto-save-failed', {
       type: 'basic',
       iconUrl: 'icons/icon128.png',
-      title: 'AI OCR — Save failed',
+      title: 'TextKit — Save failed',
       message: e.message,
       priority: 1
     });

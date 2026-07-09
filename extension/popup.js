@@ -527,7 +527,7 @@ async function saveTranslation() {
     chrome.notifications.create('tl2-manual-save', {
       type: 'basic',
       iconUrl: 'icons/icon128.png',
-      title: 'AI OCR — Saved',
+      title: 'TextKit — Saved',
       message: `Translation saved to ${response.path || path}.`,
       priority: 0
     });
@@ -536,7 +536,7 @@ async function saveTranslation() {
     chrome.notifications.create('tl2-manual-save-failed', {
       type: 'basic',
       iconUrl: 'icons/icon128.png',
-      title: 'AI OCR — Save failed',
+      title: 'TextKit — Save failed',
       message: e.message,
       priority: 1
     });

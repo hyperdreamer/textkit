@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "AI OCR Capture",
+  "name": "TextKit",
   "version": "0.0.0",
   "description": "Select a page region, OCR repeated viewport captures, and download merged text.",
   "permissions": [
@@ -28,7 +28,7 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "AI OCR Capture"
+    "default_title": "TextKit"
   },
   "commands": {
     "start-region-capture": {
