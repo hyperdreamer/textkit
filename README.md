@@ -48,7 +48,7 @@ By default, the server binds to `127.0.0.1:8765`. Change `host` in `config.yaml`
 
 ## Backend
 
-The backend is implemented in `backend/main.py` and serves a FastAPI app named `TextCap Backend`.
+The backend is implemented in `backend/main.py` and serves a FastAPI app named `TextKit Backend`.
 
 ### Configuration
 
@@ -241,7 +241,7 @@ After capture finishes, the popup shows the final text.
 Available output actions:
 
 - Copy: copies the text to the clipboard.
-- Download: saves the text as a `.txt` file named like `textcap-YYYY-MM-DD...txt`.
+- Download: saves the text as a `.txt` file named like `textkit-YYYY-MM-DD...txt`.
 
 ### Settings and persistence
 

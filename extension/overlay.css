@@ -1,4 +1,4 @@
-.textcap-overlay {
+.textkit-overlay {
   position: fixed;
   inset: 0;
   z-index: 2147483647;
@@ -7,7 +7,7 @@
   user-select: none;
 }
 
-.textcap-selection {
+.textkit-selection {
   position: fixed;
   box-sizing: border-box;
   border: 2px solid #000;
@@ -16,7 +16,7 @@
   pointer-events: none;
 }
 
-.textcap-handle {
+.textkit-handle {
   position: fixed;
   width: 16px;
   height: 16px;
@@ -28,16 +28,16 @@
   display: none;
 }
 
-.textcap-handle.nw { cursor: nw-resize; }
-.textcap-handle.n  { cursor: n-resize; }
-.textcap-handle.ne { cursor: ne-resize; }
-.textcap-handle.e  { cursor: e-resize; }
-.textcap-handle.se { cursor: se-resize; }
-.textcap-handle.s  { cursor: s-resize; }
-.textcap-handle.sw { cursor: sw-resize; }
-.textcap-handle.w  { cursor: w-resize; }
+.textkit-handle.nw { cursor: nw-resize; }
+.textkit-handle.n  { cursor: n-resize; }
+.textkit-handle.ne { cursor: ne-resize; }
+.textkit-handle.e  { cursor: e-resize; }
+.textkit-handle.se { cursor: se-resize; }
+.textkit-handle.s  { cursor: s-resize; }
+.textkit-handle.sw { cursor: sw-resize; }
+.textkit-handle.w  { cursor: w-resize; }
 
-.textcap-hint {
+.textkit-hint {
   position: fixed;
   top: 16px;
   left: 50%;

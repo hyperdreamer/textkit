@@ -420,7 +420,7 @@ async function copyOcrText() {
 }
 function downloadOcrText() {
   const t = resultEl.value.trim(); if (!t) return;
-  downloadAsFile(t, 'textcap');
+  downloadAsFile(t, 'textkit');
 }
 
 // ── Translation panel actions ─────────────────────────────────

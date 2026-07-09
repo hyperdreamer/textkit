@@ -1,6 +1,6 @@
 (() => {
-  if (window.__textcapContentLoaded) return;
-  window.__textcapContentLoaded = true;
+  if (window.__textkitContentLoaded) return;
+  window.__textkitContentLoaded = true;
 
   let overlay = null;
   let selection = null;
@@ -74,22 +74,22 @@
     removeOverlay();
 
     overlay = document.createElement('div');
-    overlay.className = 'textcap-overlay';
-    overlay.innerHTML = '<div class="textcap-selection"></div>'
-      + '<div class="textcap-handle nw"></div>'
-      + '<div class="textcap-handle n"></div>'
-      + '<div class="textcap-handle ne"></div>'
-      + '<div class="textcap-handle e"></div>'
-      + '<div class="textcap-handle se"></div>'
-      + '<div class="textcap-handle s"></div>'
-      + '<div class="textcap-handle sw"></div>'
-      + '<div class="textcap-handle w"></div>'
-      + '<div class="textcap-hint"></div>';
+    overlay.className = 'textkit-overlay';
+    overlay.innerHTML = '<div class="textkit-selection"></div>'
+      + '<div class="textkit-handle nw"></div>'
+      + '<div class="textkit-handle n"></div>'
+      + '<div class="textkit-handle ne"></div>'
+      + '<div class="textkit-handle e"></div>'
+      + '<div class="textkit-handle se"></div>'
+      + '<div class="textkit-handle s"></div>'
+      + '<div class="textkit-handle sw"></div>'
+      + '<div class="textkit-handle w"></div>'
+      + '<div class="textkit-hint"></div>';
     document.documentElement.appendChild(overlay);
 
-    selection = overlay.querySelector('.textcap-selection');
-    handles = [...overlay.querySelectorAll('.textcap-handle')];
-    const hint = overlay.querySelector('.textcap-hint');
+    selection = overlay.querySelector('.textkit-selection');
+    handles = [...overlay.querySelectorAll('.textkit-handle')];
+    const hint = overlay.querySelector('.textkit-hint');
 
     // Pre-draw saved region if available
     if (saved && saved.width >= MIN_SIZE && saved.height >= MIN_SIZE) {
