@@ -420,7 +420,7 @@ async function copyOcrText() {
 }
 function downloadOcrText() {
   const t = resultEl.value.trim(); if (!t) return;
-  downloadAsFile(t, 'qidian-ocr');
+  downloadAsFile(t, 'qidian-capture');
 }
 
 // ── Translation panel actions ─────────────────────────────────

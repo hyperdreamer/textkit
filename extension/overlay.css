@@ -1,4 +1,4 @@
-.qidian-ocr-overlay {
+.qidian-capture-overlay {
   position: fixed;
   inset: 0;
   z-index: 2147483647;
@@ -7,7 +7,7 @@
   user-select: none;
 }
 
-.qidian-ocr-selection {
+.qidian-capture-selection {
   position: fixed;
   box-sizing: border-box;
   border: 2px solid #000;
@@ -16,7 +16,7 @@
   pointer-events: none;
 }
 
-.qidian-ocr-handle {
+.qidian-capture-handle {
   position: fixed;
   width: 16px;
   height: 16px;
@@ -28,16 +28,16 @@
   display: none;
 }
 
-.qidian-ocr-handle.nw { cursor: nw-resize; }
-.qidian-ocr-handle.n  { cursor: n-resize; }
-.qidian-ocr-handle.ne { cursor: ne-resize; }
-.qidian-ocr-handle.e  { cursor: e-resize; }
-.qidian-ocr-handle.se { cursor: se-resize; }
-.qidian-ocr-handle.s  { cursor: s-resize; }
-.qidian-ocr-handle.sw { cursor: sw-resize; }
-.qidian-ocr-handle.w  { cursor: w-resize; }
+.qidian-capture-handle.nw { cursor: nw-resize; }
+.qidian-capture-handle.n  { cursor: n-resize; }
+.qidian-capture-handle.ne { cursor: ne-resize; }
+.qidian-capture-handle.e  { cursor: e-resize; }
+.qidian-capture-handle.se { cursor: se-resize; }
+.qidian-capture-handle.s  { cursor: s-resize; }
+.qidian-capture-handle.sw { cursor: sw-resize; }
+.qidian-capture-handle.w  { cursor: w-resize; }
 
-.qidian-ocr-hint {
+.qidian-capture-hint {
   position: fixed;
   top: 16px;
   left: 50%;

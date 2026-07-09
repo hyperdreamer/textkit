@@ -74,22 +74,22 @@
     removeOverlay();
 
     overlay = document.createElement('div');
-    overlay.className = 'qidian-ocr-overlay';
-    overlay.innerHTML = '<div class="qidian-ocr-selection"></div>'
-      + '<div class="qidian-ocr-handle nw"></div>'
-      + '<div class="qidian-ocr-handle n"></div>'
-      + '<div class="qidian-ocr-handle ne"></div>'
-      + '<div class="qidian-ocr-handle e"></div>'
-      + '<div class="qidian-ocr-handle se"></div>'
-      + '<div class="qidian-ocr-handle s"></div>'
-      + '<div class="qidian-ocr-handle sw"></div>'
-      + '<div class="qidian-ocr-handle w"></div>'
-      + '<div class="qidian-ocr-hint"></div>';
+    overlay.className = 'qidian-capture-overlay';
+    overlay.innerHTML = '<div class="qidian-capture-selection"></div>'
+      + '<div class="qidian-capture-handle nw"></div>'
+      + '<div class="qidian-capture-handle n"></div>'
+      + '<div class="qidian-capture-handle ne"></div>'
+      + '<div class="qidian-capture-handle e"></div>'
+      + '<div class="qidian-capture-handle se"></div>'
+      + '<div class="qidian-capture-handle s"></div>'
+      + '<div class="qidian-capture-handle sw"></div>'
+      + '<div class="qidian-capture-handle w"></div>'
+      + '<div class="qidian-capture-hint"></div>';
     document.documentElement.appendChild(overlay);
 
-    selection = overlay.querySelector('.qidian-ocr-selection');
-    handles = [...overlay.querySelectorAll('.qidian-ocr-handle')];
-    const hint = overlay.querySelector('.qidian-ocr-hint');
+    selection = overlay.querySelector('.qidian-capture-selection');
+    handles = [...overlay.querySelectorAll('.qidian-capture-handle')];
+    const hint = overlay.querySelector('.qidian-capture-hint');
 
     // Pre-draw saved region if available
     if (saved && saved.width >= MIN_SIZE && saved.height >= MIN_SIZE) {

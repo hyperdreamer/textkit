@@ -546,7 +546,7 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
     )
 
 
-app = FastAPI(title="Qidian OCR Backend")
+app = FastAPI(title="Qidian Capture Backend")
 
 
 def _error_payload(error: str) -> dict[str, str | int | None]:
