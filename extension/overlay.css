@@ -1,4 +1,4 @@
-.qidian-capture-overlay {
+.textcap-overlay {
   position: fixed;
   inset: 0;
   z-index: 2147483647;
@@ -7,7 +7,7 @@
   user-select: none;
 }
 
-.qidian-capture-selection {
+.textcap-selection {
   position: fixed;
   box-sizing: border-box;
   border: 2px solid #000;
@@ -16,7 +16,7 @@
   pointer-events: none;
 }
 
-.qidian-capture-handle {
+.textcap-handle {
   position: fixed;
   width: 16px;
   height: 16px;
@@ -28,16 +28,16 @@
   display: none;
 }
 
-.qidian-capture-handle.nw { cursor: nw-resize; }
-.qidian-capture-handle.n  { cursor: n-resize; }
-.qidian-capture-handle.ne { cursor: ne-resize; }
-.qidian-capture-handle.e  { cursor: e-resize; }
-.qidian-capture-handle.se { cursor: se-resize; }
-.qidian-capture-handle.s  { cursor: s-resize; }
-.qidian-capture-handle.sw { cursor: sw-resize; }
-.qidian-capture-handle.w  { cursor: w-resize; }
+.textcap-handle.nw { cursor: nw-resize; }
+.textcap-handle.n  { cursor: n-resize; }
+.textcap-handle.ne { cursor: ne-resize; }
+.textcap-handle.e  { cursor: e-resize; }
+.textcap-handle.se { cursor: se-resize; }
+.textcap-handle.s  { cursor: s-resize; }
+.textcap-handle.sw { cursor: sw-resize; }
+.textcap-handle.w  { cursor: w-resize; }
 
-.qidian-capture-hint {
+.textcap-hint {
   position: fixed;
   top: 16px;
   left: 50%;

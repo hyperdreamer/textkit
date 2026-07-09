@@ -1,6 +1,6 @@
 (() => {
-  if (window.__qidianOcrContentLoaded) return;
-  window.__qidianOcrContentLoaded = true;
+  if (window.__textcapContentLoaded) return;
+  window.__textcapContentLoaded = true;
 
   let overlay = null;
   let selection = null;
@@ -74,22 +74,22 @@
     removeOverlay();
 
     overlay = document.createElement('div');
-    overlay.className = 'qidian-capture-overlay';
-    overlay.innerHTML = '<div class="qidian-capture-selection"></div>'
-      + '<div class="qidian-capture-handle nw"></div>'
-      + '<div class="qidian-capture-handle n"></div>'
-      + '<div class="qidian-capture-handle ne"></div>'
-      + '<div class="qidian-capture-handle e"></div>'
-      + '<div class="qidian-capture-handle se"></div>'
-      + '<div class="qidian-capture-handle s"></div>'
-      + '<div class="qidian-capture-handle sw"></div>'
-      + '<div class="qidian-capture-handle w"></div>'
-      + '<div class="qidian-capture-hint"></div>';
+    overlay.className = 'textcap-overlay';
+    overlay.innerHTML = '<div class="textcap-selection"></div>'
+      + '<div class="textcap-handle nw"></div>'
+      + '<div class="textcap-handle n"></div>'
+      + '<div class="textcap-handle ne"></div>'
+      + '<div class="textcap-handle e"></div>'
+      + '<div class="textcap-handle se"></div>'
+      + '<div class="textcap-handle s"></div>'
+      + '<div class="textcap-handle sw"></div>'
+      + '<div class="textcap-handle w"></div>'
+      + '<div class="textcap-hint"></div>';
     document.documentElement.appendChild(overlay);
 
-    selection = overlay.querySelector('.qidian-capture-selection');
-    handles = [...overlay.querySelectorAll('.qidian-capture-handle')];
-    const hint = overlay.querySelector('.qidian-capture-hint');
+    selection = overlay.querySelector('.textcap-selection');
+    handles = [...overlay.querySelectorAll('.textcap-handle')];
+    const hint = overlay.querySelector('.textcap-hint');
 
     // Pre-draw saved region if available
     if (saved && saved.width >= MIN_SIZE && saved.height >= MIN_SIZE) {
