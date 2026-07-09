@@ -97,10 +97,7 @@ tl2Download.addEventListener('click', () => downloadAsFile(tl2Result.value.trim(
 tl2Save.addEventListener('click', saveTranslation);
 tl2Language.addEventListener('change', () => { saveTl2Language(); syncLanguage('translation'); });
 tl2AutocopyCheckbox.addEventListener('change', saveTl2Settings);
-tl2AutosaveCheckbox.addEventListener('change', () => {
-  tl2AutosavePathRow.classList.toggle('hidden', !tl2AutosaveCheckbox.checked);
-  saveTl2Settings();
-});
+tl2AutosaveCheckbox.addEventListener('change', saveTl2Settings);
 tl2AutotranslateCheckbox.addEventListener('change', saveTl2Settings);
 tl2AutosavePath.addEventListener('input', () => {
   saveTl2Settings();
@@ -264,7 +261,6 @@ async function init() {
   tl2AutosaveCheckbox.checked = tl2Settings.tl2AutoSave;
   tl2AutotranslateCheckbox.checked = tl2Settings.ocrAutoTranslate;
   tl2AutosavePath.value = tl2Settings.tl2AutoSavePath || '';
-  tl2AutosavePathRow.classList.toggle('hidden', !tl2AutosaveCheckbox.checked);
   loadPathSuggestions();
 
   // Load Format tab prompt and last result (per-tab)
