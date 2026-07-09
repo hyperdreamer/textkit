@@ -26,11 +26,42 @@ DEFAULT_PORT = 8765
 DEFAULT_SAVE_ROOT = "~"
 DEFAULT_MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 DEFAULT_MAX_TEXT_CHARS = 200_000
-OCR_PROMPT = "Transcribe all text visible in this image. Return only the transcription."
-DEDUP_PROMPT = (
-    "Remove any duplicate or overlapping content. Return only the deduplicated text. "
-    "Do not reword or change any text -- only remove exact duplicates and overlapping passages."
-)
+
+
+PROMPTS_DIR = Path(__file__).with_name("prompts")
+_prompt_cache: dict[str, str] = {}
+
+_DEFAULT_PROMPTS: dict[str, str] = {
+    "ocr": "Transcribe all text visible in this image. Return only the transcription.",
+    "dedup": (
+        "Remove any duplicate or overlapping content. Return only the deduplicated text. "
+        "Do not reword or change any text -- only remove exact duplicates and overlapping passages."
+    ),
+    "translate": "Translate the following text to {language}. Return only the translation.",
+}
+
+
+def _load_prompt(name: str) -> str:
+    """Load a prompt from disk, falling back to the built-in default."""
+    if name not in _prompt_cache:
+        prompt_path = PROMPTS_DIR / f"{name}.txt"
+        if prompt_path.is_file():
+            _prompt_cache[name] = prompt_path.read_text(encoding="utf-8").strip()
+        else:
+            _prompt_cache[name] = _DEFAULT_PROMPTS.get(name, "")
+    return _prompt_cache[name]
+
+
+def _render_prompt(name: str, **kwargs: str) -> str:
+    """Load a prompt and substitute template variables."""
+    template = _load_prompt(name)
+    try:
+        return template.format(**kwargs)
+    except KeyError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Prompt '{name}' references unknown variable: {e}",
+        )
 
 
 class OCRResponse(BaseModel):
@@ -455,7 +486,7 @@ async def _call_openai(config: AIConfig, data_url: str) -> OCRResponse:
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": OCR_PROMPT},
+                    {"type": "text", "text": _render_prompt("ocr")},
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             }
@@ -495,7 +526,7 @@ async def deduplicate_text(config: AIConfig, text: str) -> OCRResponse:
     return await _post_openai_chat_completion(
         cfg,
         [
-            {"role": "system", "content": DEDUP_PROMPT},
+            {"role": "system", "content": _render_prompt("dedup")},
             {"role": "user", "content": text},
         ],
     )
@@ -504,7 +535,7 @@ async def deduplicate_text(config: AIConfig, text: str) -> OCRResponse:
 async def translate_text(config: AIConfig, text: str, language: str, prompt: str | None = None) -> OCRResponse:
     """Route a translation request to the configured provider."""
 
-    system_prompt = prompt or f"Translate the following text to {language}. Return only the translation."
+    system_prompt = prompt or _render_prompt("translate", language=language)
     cfg = _resolve_ai_config(config, config.text)
     return await _post_openai_chat_completion(
         cfg,
@@ -696,6 +727,32 @@ async def save_text(request: SaveRequest) -> dict[str, str | bool]:
         raise HTTPException(status_code=500, detail=f"Failed to save text: {exc.strerror or exc}") from exc
     return {"ok": True, "path": str(path)}
 
+
+@app.get("/prompts")
+async def list_prompts() -> dict[str, dict[str, str]]:
+    """Return all available prompt templates."""
+    prompts: dict[str, str] = {}
+    if PROMPTS_DIR.is_dir():
+        for entry in sorted(PROMPTS_DIR.iterdir()):
+            if entry.suffix == ".txt":
+                name = entry.stem
+                prompts[name] = _load_prompt(name)
+    for name, default in _DEFAULT_PROMPTS.items():
+        prompts.setdefault(name, default)
+    return {"prompts": prompts}
+
+
+@app.get("/prompts/{name}")
+async def get_prompt(name: str) -> dict[str, object]:
+    """Return a specific prompt template."""
+    if name not in _DEFAULT_PROMPTS:
+        raise HTTPException(status_code=404, detail=f"Unknown prompt: '{name}'")
+    template = _load_prompt(name)
+    return {
+        "name": name,
+        "template": template,
+        "has_language_param": "{language}" in template,
+    }
 
 if __name__ == "__main__":
     import uvicorn
