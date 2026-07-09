@@ -43,6 +43,9 @@ const fmtCopy = document.getElementById('fmt-copy');
 const fmtSave = document.getElementById('fmt-save');
 const fmtDownload = document.getElementById('fmt-download');
 const fmtSavePath = document.getElementById('fmt-save-path');
+const fmtAutocopy = document.getElementById('fmt-autocopy');
+const fmtAutosave = document.getElementById('fmt-autosave');
+const fmtAutoformat = document.getElementById('fmt-autoformat');
 
 // ── Tab state ─────────────────────────────────────────────────
 const tabs = document.querySelectorAll('.tab');
@@ -111,6 +114,9 @@ fmtDownload.addEventListener('click', () => downloadAsFile(fmtResult.value.trim(
 fmtSave.addEventListener('click', saveFormatResult);
 formatPrompt.addEventListener('input', saveFormatPrompt);
 fmtSavePath.addEventListener('input', saveFormatSettings);
+fmtAutocopy.addEventListener('change', saveFormatSettings);
+fmtAutosave.addEventListener('change', saveFormatSettings);
+fmtAutoformat.addEventListener('change', saveFormatSettings);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'state:update') {
@@ -132,6 +138,10 @@ chrome.runtime.onMessage.addListener((message) => {
     // Auto-copy / auto-save is handled by the background service worker
     // (autoCopyIfEnabled / autoSaveIfEnabled) — doing it here as well would
     // double-copy and double-save.
+    // Auto-format: if enabled and format prompt is set, auto-trigger formatting
+    if (message.text && fmtAutoformat.checked && formatPrompt.value.trim()) {
+      doFormat();
+    }
   }
   if (message?.type === 'tl2:translating') {
     if (message.tabId !== currentTabId) return;
@@ -158,6 +168,9 @@ chrome.runtime.onMessage.addListener((message) => {
     chrome.storage.local.remove(`fmtFormatting:${currentTabId}`);
     setFmtProgress(message.text ? 'Formatting complete.' : (message.error || 'Formatting failed.'));
     updateFormatButtons();
+    // Auto-copy / auto-save formatted text
+    if (message.text && fmtAutocopy.checked) copyResult(fmtResult, fmtCopy);
+    if (message.text && fmtAutosave.checked) autoSaveFmt(message.text);
   }
   if (message?.type === 'fmt:formatting') {
     if (message.tabId !== currentTabId) return;
@@ -264,8 +277,11 @@ async function init() {
   loadPathSuggestions();
 
   // Load Format tab prompt and last result (per-tab)
-  const fmtSaveSettings = await chrome.storage.sync.get({ fmtSavePath: '' });
+  const fmtSaveSettings = await chrome.storage.sync.get({ fmtSavePath: '', fmtAutoCopy: false, fmtAutoSave: false, fmtAutoFormat: false });
   if (fmtSaveSettings.fmtSavePath) fmtSavePath.value = fmtSaveSettings.fmtSavePath;
+  fmtAutocopy.checked = fmtSaveSettings.fmtAutoCopy;
+  fmtAutosave.checked = fmtSaveSettings.fmtAutoSave;
+  fmtAutoformat.checked = fmtSaveSettings.fmtAutoFormat;
   const fmtk = (k) => currentTabId ? `${k}:${currentTabId}` : k;
   const fmt = currentTabId ? await chrome.storage.local.get([
     `fmtResult:${currentTabId}`, `fmtStatus:${currentTabId}`, 'formatPrompt'
@@ -718,7 +734,20 @@ function saveFormatPrompt() {
 }
 
 function saveFormatSettings() {
-  chrome.storage.sync.set({ fmtSavePath: fmtSavePath.value.trim() });
+  chrome.storage.sync.set({
+    fmtSavePath: fmtSavePath.value.trim(),
+    fmtAutoCopy: fmtAutocopy.checked,
+    fmtAutoSave: fmtAutosave.checked,
+    fmtAutoFormat: fmtAutoformat.checked
+  });
+}
+
+async function autoSaveFmt(text) {
+  const path = fmtSavePath.value.trim();
+  if (!path) return;
+  try {
+    await chrome.runtime.sendMessage({ type: 'save:translation', text, path });
+  } catch { /* silent */ }
 }
 
 async function saveTranslation() {
