@@ -73,6 +73,7 @@ chrome.storage.local.get('lastRegion', (items) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   states.delete(tabId);
   handleTranslateStop(tabId);
+  handleFormatStop(tabId);
   captureControllers.get(tabId)?.abort();
   captureControllers.delete(tabId);
   chrome.storage.local.remove([
@@ -81,6 +82,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     `tl2Language:${tabId}`,
     `tl2Status:${tabId}`,
     `tl2Translating:${tabId}`,
+    `fmtResult:${tabId}`,
+    `fmtStatus:${tabId}`,
+    `fmtFormatting:${tabId}`,
     `retryState:${tabId}`,
     `preDedup:${tabId}`,
     `postDedup:${tabId}`
@@ -183,6 +187,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     handleSaveTranslation(message).then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
   }
+  if (message?.type === 'format:start') {
+    handleFormatStart(message).then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
+  if (message?.type === 'format:stop') {
+    handleFormatStop(message.tabId);
+    sendResponse({ ok: true });
+    return false;
+  }
   return false;
 });
 
@@ -267,6 +280,7 @@ async function handleRetry() {
 // ── manual translation (delegated to background so it survives popup close) ─
 
 const translateControllers = new Map();
+const formatControllers = new Map();
 const captureControllers = new Map();
 let keepAliveIntervalId = null;
 
@@ -385,6 +399,82 @@ async function handleSaveTranslation(msg) {
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || payload.error) return { ok: false, error: payload.error || `HTTP ${response.status}` };
   return { ok: true, path: payload.path || path };
+}
+
+// ── manual format (delegated to background so it survives popup close) ─
+
+async function handleFormatStart(msg) {
+  const { tabId, text, prompt, host, port } = msg;
+  if (!tabId || !text || !prompt) return { ok: false, error: 'Missing tabId, text, or prompt' };
+
+  // Abort any in-flight formatting for this tab
+  handleFormatStop(tabId);
+
+  const controller = new AbortController();
+  let timedOut = false;
+  let timeoutId = null;
+
+  try {
+    formatControllers.set(tabId, controller);
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, BACKEND_TIMEOUT_MS);
+
+    // Persist state so popup reopen shows "Stop" button.
+    await chrome.storage.local.set({
+      [`fmtFormatting:${tabId}`]: true,
+      [`fmtStatus:${tabId}`]: 'Formatting...'
+    });
+    await chrome.storage.local.remove(`fmtResult:${tabId}`);
+    chrome.runtime.sendMessage({ type: 'fmt:formatting', tabId, value: true }).catch(() => {});
+
+    try {
+      const url = buildBackendEndpoint(host || DEFAULT_HOST, port || DEFAULT_PORT, `/format?_=${Date.now()}`);
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, prompt }),
+        signal: controller.signal
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      if (payload.error) throw new Error(payload.error);
+
+      const formatted = payload.text || '';
+      await chrome.storage.local.set({ [`fmtResult:${tabId}`]: formatted });
+      chrome.runtime.sendMessage({ type: 'format:update', tabId, text: formatted }).catch(() => {});
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        const message = timedOut ? 'Formatting timed out.' : 'Formatting stopped.';
+        await chrome.storage.local.set({ [`fmtStatus:${tabId}`]: message });
+        if (timedOut) chrome.runtime.sendMessage({ type: 'format:update', tabId, text: '', error: message }).catch(() => {});
+        return { ok: !timedOut, error: timedOut ? message : undefined };
+      }
+      const errorMessage = e.message || 'Formatting failed.';
+      await chrome.storage.local.set({ [`fmtStatus:${tabId}`]: errorMessage });
+      chrome.runtime.sendMessage({ type: 'format:update', tabId, text: '', error: errorMessage }).catch(() => {});
+      return { ok: false, error: errorMessage };
+    }
+  } finally {
+    clearTimeout(timeoutId);
+    if (formatControllers.get(tabId) === controller) {
+      formatControllers.delete(tabId);
+      chrome.storage.local.remove(`fmtFormatting:${tabId}`);
+      chrome.runtime.sendMessage({ type: 'fmt:formatting', tabId, value: false }).catch(() => {});
+    }
+  }
+
+  return { ok: true };
+}
+
+function handleFormatStop(tabId) {
+  const controller = formatControllers.get(tabId);
+  if (controller) {
+    controller.abort();
+    formatControllers.delete(tabId);
+    chrome.storage.local.remove(`fmtFormatting:${tabId}`);
+  }
 }
 
 async function getActiveTab() {
@@ -526,7 +616,7 @@ async function runCaptureLoop(tab, region) {
   } finally {
     state.captureInFlight = false;
     captureControllers.delete(tabId);
-    if (captureControllers.size === 0 && translateControllers.size === 0) stopKeepAlive();
+    if (captureControllers.size === 0 && translateControllers.size === 0 && formatControllers.size === 0) stopKeepAlive();
     // Unlock page scroll
     chrome.tabs.sendMessage(tab.id, { type: 'page:unlock-scroll' }).catch(() => {});
   }
@@ -639,7 +729,7 @@ async function resumeCaptureLoop(rs) {
   } finally {
     state.captureInFlight = false;
     captureControllers.delete(tabId);
-    if (captureControllers.size === 0 && translateControllers.size === 0) stopKeepAlive();
+    if (captureControllers.size === 0 && translateControllers.size === 0 && formatControllers.size === 0) stopKeepAlive();
     // Unlock page scroll
     chrome.tabs.sendMessage(tab.id, { type: 'page:unlock-scroll' }).catch(() => {});
   }

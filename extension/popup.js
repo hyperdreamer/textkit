@@ -34,12 +34,22 @@ const tl2AutosavePath = document.getElementById('tl2-autosave-path');
 const tl2AutosavePathRow = document.getElementById('tl2-autosave-path-row');
 const tl2PathSuggestions = document.getElementById('tl2-path-suggestions');
 
+// ── Format panel elements ─────────────────────────────────────
+const formatPrompt = document.getElementById('format-prompt');
+const fmtStatusText = document.getElementById('fmt-status-text');
+const fmtResult = document.getElementById('fmt-result');
+const fmtFormat = document.getElementById('fmt-format');
+const fmtCopy = document.getElementById('fmt-copy');
+const fmtSave = document.getElementById('fmt-save');
+const fmtDownload = document.getElementById('fmt-download');
+
 // ── Tab state ─────────────────────────────────────────────────
 const tabs = document.querySelectorAll('.tab');
 const panels = {
   'ocr-panel': document.getElementById('ocr-panel'),
   'translate-panel': document.getElementById('translate-panel'),
-  'translation-panel': document.getElementById('translation-panel')
+  'translation-panel': document.getElementById('translation-panel'),
+  'format-panel': document.getElementById('format-panel')
 };
 
 let latestState = null;
@@ -96,6 +106,13 @@ tl2AutosavePath.addEventListener('input', () => {
   updatePathSuggestions(tl2AutosavePath.value);
 });
 
+// ── Format panel listeners ─────────────────────────────────────
+fmtFormat.addEventListener('click', doFormat);
+fmtCopy.addEventListener('click', () => copyResult(fmtResult, fmtCopy));
+fmtDownload.addEventListener('click', () => downloadAsFile(fmtResult.value.trim(), 'format'));
+fmtSave.addEventListener('click', saveFormatResult);
+formatPrompt.addEventListener('input', saveFormatPrompt);
+
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'state:update') {
     if (message.tabId !== currentTabId) return;
@@ -128,6 +145,32 @@ chrome.runtime.onMessage.addListener((message) => {
       tl2Translate.textContent = 'Translate';
       tl2Translate.classList.remove('danger');
       updateTranslationButtons();
+    }
+  }
+  if (message?.type === 'format:update') {
+    if (message.tabId !== currentTabId) return;
+    if (message.text) {
+      fmtResult.value = message.text;
+      chrome.storage.local.set({ [`fmtResult:${currentTabId}`]: message.text });
+    }
+    fmtCopy.disabled = fmtSave.disabled = fmtDownload.disabled = !message.text;
+    fmtFormat.textContent = 'Format';
+    fmtFormat.classList.remove('danger');
+    chrome.storage.local.remove(`fmtFormatting:${currentTabId}`);
+    setFmtProgress(message.text ? 'Formatting complete.' : (message.error || 'Formatting failed.'));
+    updateFormatButtons();
+  }
+  if (message?.type === 'fmt:formatting') {
+    if (message.tabId !== currentTabId) return;
+    if (message.value) {
+      fmtFormat.textContent = 'Stop';
+      fmtFormat.classList.add('danger');
+      fmtCopy.disabled = fmtSave.disabled = fmtDownload.disabled = true;
+      setFmtProgress('Formatting...');
+    } else {
+      fmtFormat.textContent = 'Format';
+      fmtFormat.classList.remove('danger');
+      updateFormatButtons();
     }
   }
 });
@@ -221,6 +264,47 @@ async function init() {
   tl2AutosavePath.value = tl2Settings.tl2AutoSavePath || '';
   tl2AutosavePathRow.classList.toggle('hidden', !tl2AutosaveCheckbox.checked);
   loadPathSuggestions();
+
+  // Load Format tab prompt and last result (per-tab)
+  const fmtk = (k) => currentTabId ? `${k}:${currentTabId}` : k;
+  const fmt = currentTabId ? await chrome.storage.local.get([
+    `fmtResult:${currentTabId}`, `fmtStatus:${currentTabId}`, 'formatPrompt'
+  ]) : {};
+  if (fmt['formatPrompt']) formatPrompt.value = fmt['formatPrompt'];
+  if (fmt[fmtk('fmtResult')]) { fmtResult.value = fmt[fmtk('fmtResult')]; fmtCopy.disabled = fmtSave.disabled = fmtDownload.disabled = false; }
+  if (fmt[fmtk('fmtStatus')]) {
+    const p = fmt[fmtk('fmtStatus')];
+    if (p === 'Formatting...') {
+      fmtStatusText.textContent = 'Ready';
+    } else {
+      fmtStatusText.textContent = p;
+    }
+  }
+  // Restore formatting state from storage (survives popup close/reopen)
+  const fmttransKey = currentTabId ? `fmtFormatting:${currentTabId}` : null;
+  const fmttrans = fmttransKey ? await chrome.storage.local.get(fmttransKey) : {};
+  const fmtresKey = currentTabId ? `fmtResult:${currentTabId}` : null;
+  const fmtres = fmtresKey ? await chrome.storage.local.get(fmtresKey) : {};
+
+  if (fmttrans[fmttransKey] && fmtres[fmtresKey]) {
+    // Formatting completed while popup was closed — show result
+    fmtFormat.textContent = 'Format';
+    fmtFormat.classList.remove('danger');
+    fmtResult.value = fmtres[fmtresKey];
+    fmtCopy.disabled = fmtSave.disabled = fmtDownload.disabled = false;
+    chrome.storage.local.remove(fmttransKey);
+    fmtStatusText.textContent = 'Completed while popup was closed';
+  } else if (fmttrans[fmttransKey]) {
+    fmtFormat.textContent = 'Stop';
+    fmtFormat.classList.add('danger');
+    fmtCopy.disabled = fmtSave.disabled = fmtDownload.disabled = true;
+    fmtStatusText.textContent = 'Formatting...';
+  } else {
+    fmtFormat.textContent = 'Format';
+    fmtFormat.classList.remove('danger');
+    fmtStatusText.textContent = 'Ready';
+  }
+  updateFormatButtons();
 
   chrome.storage.local.get('lastRegion', (r) => {
     lastRegionEl.textContent = r.lastRegion
@@ -326,6 +410,9 @@ async function startCapture() {
   tl2Result.value = '';
   tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = true;
   setTl2Progress('Ready');
+  fmtResult.value = '';
+  fmtCopy.disabled = fmtSave.disabled = fmtDownload.disabled = true;
+  setFmtProgress('Ready');
   startButton.disabled = true;
   progressEl.textContent = 'Starting region selection.';
   try {
@@ -387,9 +474,13 @@ function renderState(state) {
     tl2Result.value = '';
     tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = true;
     setTl2Progress('Ready');
+    // Also clear format result when OCR restarts
+    fmtResult.value = '';
+    fmtCopy.disabled = fmtSave.disabled = fmtDownload.disabled = true;
+    setFmtProgress('Ready');
     // Clear stale auto-translate data from storage
     if (currentTabId) {
-      chrome.storage.local.remove([`tl2Result:${currentTabId}`, `tl2Status:${currentTabId}`]).catch(() => {});
+      chrome.storage.local.remove([`tl2Result:${currentTabId}`, `tl2Status:${currentTabId}`, `fmtResult:${currentTabId}`, `fmtStatus:${currentTabId}`]).catch(() => {});
     }
   }
 
@@ -502,6 +593,128 @@ function updateTranslationButtons() {
   tl2Copy.disabled = !hasResult;
   tl2Save.disabled = !hasResult;
   tl2Download.disabled = !hasResult;
+  // Also update Format button state (depends on tl2Result)
+  updateFormatButtons();
+}
+
+// ── Format panel actions ───────────────────────────────────────
+
+async function doFormat() {
+  // Button shows "Stop" — abort the background formatting
+  if (fmtFormat.textContent === 'Stop') {
+    stopFormat();
+    return;
+  }
+
+  const text = tl2Result.value.trim();
+  if (!text || !currentTabId) return;
+  const prompt = formatPrompt.value.trim();
+  if (!prompt) {
+    setFmtProgress('Enter a formatting prompt first.');
+    return;
+  }
+  let backend;
+  try {
+    backend = normalizeBackendSettings(hostInput.value, portInput.value);
+  } catch (e) {
+    setFmtProgress(e.message);
+    return;
+  }
+
+  fmtFormat.textContent = 'Stop';
+  fmtFormat.classList.add('danger');
+  fmtResult.value = '';
+  fmtCopy.disabled = fmtSave.disabled = fmtDownload.disabled = true;
+  setFmtProgress('Formatting...');
+
+  // Fire-and-forget: the background service worker handles the fetch
+  chrome.runtime.sendMessage({
+    type: 'format:start',
+    tabId: currentTabId,
+    text,
+    prompt,
+    host: backend.host,
+    port: backend.port
+  }).then((response) => {
+    if (!response?.ok) {
+      fmtFormat.textContent = 'Format';
+      fmtFormat.classList.remove('danger');
+      updateFormatButtons();
+      setFmtProgress(response?.error || 'Formatting failed.');
+    }
+  }).catch((e) => {
+    fmtFormat.textContent = 'Format';
+    fmtFormat.classList.remove('danger');
+    updateFormatButtons();
+    setFmtProgress(e.message || 'Formatting failed.');
+  });
+}
+
+function stopFormat() {
+  if (!currentTabId) return;
+  chrome.runtime.sendMessage({ type: 'format:stop', tabId: currentTabId }).catch(() => {});
+  fmtFormat.textContent = 'Format';
+  fmtFormat.classList.remove('danger');
+  if (currentTabId) chrome.storage.local.remove(`fmtFormatting:${currentTabId}`);
+  updateFormatButtons();
+  setFmtProgress('Formatting stopped.');
+}
+
+function setFmtProgress(text) {
+  fmtStatusText.textContent = text;
+  if (currentTabId) chrome.storage.local.set({ [`fmtStatus:${currentTabId}`]: text });
+}
+
+function updateFormatButtons() {
+  const hasSource = tl2Result.value.trim().length > 0;
+  const hasResult = fmtResult.value.trim().length > 0;
+  fmtFormat.disabled = !hasSource;
+  fmtCopy.disabled = !hasResult;
+  fmtSave.disabled = !hasResult;
+  fmtDownload.disabled = !hasResult;
+}
+
+async function saveFormatResult() {
+  const text = fmtResult.value.trim();
+  if (!text) return;
+  const path = tl2AutosavePath.value.trim();
+  if (!path) {
+    setFmtProgress('Set a Save path first.');
+    return;
+  }
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: 'save:translation',
+      text,
+      path
+    });
+    if (!response?.ok) throw new Error(response?.error || 'Save failed');
+
+    fmtSave.textContent = 'Saved!';
+    setTimeout(() => fmtSave.textContent = 'Save', 1500);
+    setFmtProgress(`Saved to ${response.path || path}.`);
+    chrome.notifications.create('fmt-manual-save', {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'TextKit — Saved',
+      message: `Formatted text saved to ${response.path || path}.`,
+      priority: 0
+    });
+  } catch (e) {
+    setFmtProgress(`Save failed: ${e.message}`);
+    chrome.notifications.create('fmt-manual-save-failed', {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'TextKit — Save failed',
+      message: e.message,
+      priority: 1
+    });
+  }
+}
+
+function saveFormatPrompt() {
+  chrome.storage.local.set({ formatPrompt: formatPrompt.value });
 }
 
 async function saveTranslation() {

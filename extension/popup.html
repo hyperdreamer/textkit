@@ -187,6 +187,7 @@
       <button class="tab active" data-panel="ocr-panel">OCR</button>
       <button class="tab" data-panel="translation-panel">Translation</button>
       <button class="tab" data-panel="translate-panel">Prompt</button>
+      <button class="tab" data-panel="format-panel">Format</button>
     </div>
 
     <!-- OCR Panel -->
@@ -275,6 +276,23 @@
         <button id="tl2-copy" type="button" disabled>Copy</button>
         <button id="tl2-save" type="button" disabled>Save</button>
         <button id="tl2-download" type="button" disabled>Download</button>
+      </div>
+    </main>
+
+    <!-- Format Panel -->
+    <main id="format-panel" class="hidden">
+      <h1>Format</h1>
+      <div id="fmt-status" class="stat" style="margin-bottom:8px">
+        <span class="label">Status</span>
+        <span id="fmt-status-text" class="value">Ready</span>
+      </div>
+      <textarea id="format-prompt" placeholder="Custom formatting prompt. E.g.: Reformat this text as clean Markdown with headings and bullet points." style="min-height:100px;margin-bottom:8px"></textarea>
+      <textarea id="fmt-result" readonly placeholder="Formatted text will appear here."></textarea>
+      <div class="actions">
+        <button id="fmt-format" type="button" disabled>Format</button>
+        <button id="fmt-copy" type="button" disabled>Copy</button>
+        <button id="fmt-save" type="button" disabled>Save</button>
+        <button id="fmt-download" type="button" disabled>Download</button>
       </div>
     </main>
 

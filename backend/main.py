@@ -87,6 +87,13 @@ class TranslateRequest(BaseModel):
     prompt: str | None = None
 
 
+class FormatRequest(BaseModel):
+    """Request body accepted by the format endpoint."""
+
+    text: str
+    prompt: str
+
+
 class SaveRequest(BaseModel):
     """Request body accepted by the save endpoint."""
 
@@ -546,6 +553,22 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
     )
 
 
+async def format_text(config: AIConfig, text: str, prompt: str) -> OCRResponse:
+    """Route a format request to the configured provider.
+
+    Uses the user-provided *prompt* directly as the system prompt.
+    """
+
+    cfg = _resolve_ai_config(config, config.text)
+    return await _post_openai_chat_completion(
+        cfg,
+        [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": text},
+        ],
+    )
+
+
 app = FastAPI(title="TextKit Backend")
 
 
@@ -682,6 +705,33 @@ async def translate(request: TranslateRequest) -> Response:
     body = {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
     body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
     _debug("translate", f"sending {len(body_bytes)} byte response", enabled=config.debug)
+    return Response(
+        content=body_bytes,
+        media_type="application/json",
+        headers={"Connection": "close"},
+    )
+
+
+@app.post("/format", response_model=None)
+async def format_text_endpoint(request: FormatRequest) -> Response:
+    """Accept text and a custom prompt, return formatted text from the configured AI model."""
+
+    try:
+        config = load_config()
+    except RuntimeError as exc:
+        return JSONResponse(status_code=500, content=_error_payload(str(exc)))
+
+    if config.ai is None:
+        return JSONResponse(status_code=500, content=_error_payload("AI provider configuration is missing"))
+
+    _validate_text_size(request.text, config)
+    _debug("format", f"request: {len(request.text)} chars prompt_len={len(request.prompt)}", enabled=config.debug)
+    _debug("format", "calling provider...", enabled=config.debug)
+    result = await format_text(config.ai, request.text, request.prompt)
+    _debug("format", f"AI returned {len(result.text)} chars model={result.model}", enabled=config.debug)
+    body = {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    _debug("format", f"sending {len(body_bytes)} byte response", enabled=config.debug)
     return Response(
         content=body_bytes,
         media_type="application/json",
