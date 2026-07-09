@@ -42,6 +42,7 @@ const fmtFormat = document.getElementById('fmt-format');
 const fmtCopy = document.getElementById('fmt-copy');
 const fmtSave = document.getElementById('fmt-save');
 const fmtDownload = document.getElementById('fmt-download');
+const fmtSavePath = document.getElementById('fmt-save-path');
 
 // ── Tab state ─────────────────────────────────────────────────
 const tabs = document.querySelectorAll('.tab');
@@ -112,6 +113,7 @@ fmtCopy.addEventListener('click', () => copyResult(fmtResult, fmtCopy));
 fmtDownload.addEventListener('click', () => downloadAsFile(fmtResult.value.trim(), 'format'));
 fmtSave.addEventListener('click', saveFormatResult);
 formatPrompt.addEventListener('input', saveFormatPrompt);
+fmtSavePath.addEventListener('input', saveFormatSettings);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'state:update') {
@@ -266,6 +268,8 @@ async function init() {
   loadPathSuggestions();
 
   // Load Format tab prompt and last result (per-tab)
+  const fmtSaveSettings = await chrome.storage.sync.get({ fmtSavePath: '' });
+  if (fmtSaveSettings.fmtSavePath) fmtSavePath.value = fmtSaveSettings.fmtSavePath;
   const fmtk = (k) => currentTabId ? `${k}:${currentTabId}` : k;
   const fmt = currentTabId ? await chrome.storage.local.get([
     `fmtResult:${currentTabId}`, `fmtStatus:${currentTabId}`, 'formatPrompt'
@@ -677,7 +681,7 @@ function updateFormatButtons() {
 async function saveFormatResult() {
   const text = fmtResult.value.trim();
   if (!text) return;
-  const path = tl2AutosavePath.value.trim();
+  const path = fmtSavePath.value.trim();
   if (!path) {
     setFmtProgress('Set a Save path first.');
     return;
@@ -715,6 +719,10 @@ async function saveFormatResult() {
 
 function saveFormatPrompt() {
   chrome.storage.local.set({ formatPrompt: formatPrompt.value });
+}
+
+function saveFormatSettings() {
+  chrome.storage.sync.set({ fmtSavePath: fmtSavePath.value.trim() });
 }
 
 async function saveTranslation() {
