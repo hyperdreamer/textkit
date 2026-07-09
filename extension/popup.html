@@ -186,8 +186,8 @@
     <div class="tab-bar">
       <button class="tab active" data-panel="ocr-panel">OCR</button>
       <button class="tab" data-panel="translation-panel">Translation</button>
-      <button class="tab" data-panel="translate-panel">Prompt</button>
       <button class="tab" data-panel="format-panel">Format</button>
+      <button class="tab" data-panel="translate-panel">Prompt</button>
     </div>
 
     <!-- OCR Panel -->
@@ -236,6 +236,7 @@
         </label>
       </div>
       <textarea id="translate-prompt" placeholder="Custom AI prompt (per language). E.g.: Translate to formal academic Chinese." style="min-height:200px"></textarea>
+      <textarea id="format-prompt" placeholder="Custom formatting prompt. E.g.: Reformat this text as clean Markdown with headings and bullet points." style="min-height:100px;margin-top:8px"></textarea>
     </main>
 
     <!-- Translation Panel -->
@@ -286,7 +287,6 @@
         <span class="label">Status</span>
         <span id="fmt-status-text" class="value">Ready</span>
       </div>
-      <textarea id="format-prompt" placeholder="Custom formatting prompt. E.g.: Reformat this text as clean Markdown with headings and bullet points." style="min-height:100px;margin-bottom:8px"></textarea>
       <textarea id="fmt-result" readonly placeholder="Formatted text will appear here."></textarea>
       <div class="actions">
         <button id="fmt-format" type="button" disabled>Format</button>
