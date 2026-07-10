@@ -284,6 +284,14 @@
     <!-- Format Panel -->
     <main id="format-panel" class="hidden">
       <h1>Format</h1>
+      <div class="settings" style="margin-bottom:8px">
+        <label>Source
+          <select id="fmt-source">
+            <option value="translation">Translation</option>
+            <option value="ocr">OCR Result</option>
+          </select>
+        </label>
+      </div>
       <div id="fmt-status" class="stat" style="margin-bottom:8px">
         <span class="label">Status</span>
         <span id="fmt-status-text" class="value">Ready</span>

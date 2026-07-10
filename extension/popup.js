@@ -45,6 +45,7 @@ const fmtSavePath = document.getElementById('fmt-save-path');
 const fmtAutocopy = document.getElementById('fmt-autocopy');
 const fmtAutosave = document.getElementById('fmt-autosave');
 const fmtAutoformat = document.getElementById('fmt-autoformat');
+const fmtSource = document.getElementById('fmt-source');
 
 // ── Tab state ─────────────────────────────────────────────────
 const tabs = document.querySelectorAll('.tab');
@@ -119,6 +120,7 @@ fmtSavePath.addEventListener('input', () => {
 fmtAutocopy.addEventListener('change', saveFormatSettings);
 fmtAutosave.addEventListener('change', saveFormatSettings);
 fmtAutoformat.addEventListener('change', saveFormatSettings);
+fmtSource.addEventListener('change', () => { saveFormatSettings(); updateFormatButtons(); });
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'state:update') {
@@ -271,11 +273,12 @@ async function init() {
   loadPathSuggestions();
 
   // Load Format tab prompt and last result (per-tab) — single atomic load
-  const fmtSaveSettings = await chrome.storage.sync.get({ fmtSavePath: '', fmtAutoCopy: false, fmtAutoSave: false, fmtAutoFormat: false });
+  const fmtSaveSettings = await chrome.storage.sync.get({ fmtSavePath: '', fmtAutoCopy: false, fmtAutoSave: false, fmtAutoFormat: false, fmtSourceVal: 'translation' });
   if (fmtSaveSettings.fmtSavePath) fmtSavePath.value = fmtSaveSettings.fmtSavePath;
   fmtAutocopy.checked = fmtSaveSettings.fmtAutoCopy;
   fmtAutosave.checked = fmtSaveSettings.fmtAutoSave;
   fmtAutoformat.checked = fmtSaveSettings.fmtAutoFormat;
+  if (fmtSaveSettings.fmtSourceVal) fmtSource.value = fmtSaveSettings.fmtSourceVal;
   const fmtk = (k) => currentTabId ? `${k}:${currentTabId}` : k;
   const fmtKeys = currentTabId ? [fmtk('fmtResult'), fmtk('fmtStatus'), fmtk('fmtFormatting'), 'formatPrompt'] : ['formatPrompt'];
   const fmt = await chrome.storage.local.get(fmtKeys);
@@ -612,7 +615,7 @@ async function doFormat() {
     return;
   }
 
-  const text = tl2Result.value.trim();
+  const text = (fmtSource.value === 'ocr' ? resultEl : tl2Result).value.trim();
   if (!text || !currentTabId) return;
   const prompt = formatPrompt.value.trim();
   if (!prompt) {
@@ -672,7 +675,8 @@ function setFmtProgress(text) {
 }
 
 function updateFormatButtons() {
-  const hasSource = tl2Result.value.trim().length > 0;
+  const sourceEl = fmtSource.value === 'ocr' ? resultEl : tl2Result;
+  const hasSource = sourceEl.value.trim().length > 0;
   const hasResult = fmtResult.value.trim().length > 0;
   fmtFormat.disabled = !hasSource;
   fmtCopy.disabled = !hasResult;
@@ -728,7 +732,8 @@ function saveFormatSettings() {
     fmtSavePath: fmtSavePath.value.trim(),
     fmtAutoCopy: fmtAutocopy.checked,
     fmtAutoSave: fmtAutosave.checked,
-    fmtAutoFormat: fmtAutoformat.checked
+    fmtAutoFormat: fmtAutoformat.checked,
+    fmtSourceVal: fmtSource.value
   });
 }
 
