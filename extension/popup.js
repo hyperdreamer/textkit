@@ -485,7 +485,7 @@ function renderState(state) {
     setFmtProgress('Ready');
     // Clear stale auto-translate data from storage
     if (currentTabId) {
-      chrome.storage.local.remove([`tl2Result:${currentTabId}`, `tl2Status:${currentTabId}`, `fmtResult:${currentTabId}`, `fmtStatus:${currentTabId}`]).catch(() => {});
+      chrome.storage.local.remove([`tl2Result:${currentTabId}`, `tl2Status:${currentTabId}`, `tl2Translating:${currentTabId}`, `fmtResult:${currentTabId}`, `fmtStatus:${currentTabId}`, `fmtFormatting:${currentTabId}`]).catch(() => {});
     }
   }
 
@@ -719,7 +719,7 @@ async function saveFormatResult() {
 }
 
 function saveFormatPrompt() {
-  chrome.storage.local.set({ formatPrompt: formatPrompt.value });
+  chrome.storage.local.set({ formatPrompt: formatPrompt.value.trim() });
 }
 
 function saveFormatSettings() {
