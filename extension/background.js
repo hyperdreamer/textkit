@@ -354,6 +354,8 @@ async function handleTranslateStart(msg) {
       // Auto-copy / auto-save translated text
       if (translated) autoCopyIfEnabled(translated);
       if (translated) autoSaveIfEnabled(translated);
+      // Auto-format: trigger from background so it survives popup close
+      if (translated) autoFormatIfEnabled(tabId, translated, host, port);
     } catch (e) {
       if (e.name === 'AbortError') {
         const message = timedOut ? 'Translation timed out.' : 'Translation stopped.';
@@ -475,6 +477,15 @@ function handleFormatStop(tabId) {
     formatControllers.delete(tabId);
     chrome.storage.local.remove(`fmtFormatting:${tabId}`);
   }
+}
+
+async function autoFormatIfEnabled(tabId, text, host, port) {
+  const settings = await chrome.storage.sync.get({ fmtAutoFormat: false });
+  if (!settings.fmtAutoFormat) return;
+  const prompt = await chrome.storage.local.get('formatPrompt');
+  if (!prompt.formatPrompt) return;
+  handleFormatStart({ tabId, text, prompt: prompt.formatPrompt, host, port })
+    .catch(() => {});
 }
 
 async function getActiveTab() {

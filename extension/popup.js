@@ -138,10 +138,7 @@ chrome.runtime.onMessage.addListener((message) => {
     // Auto-copy / auto-save is handled by the background service worker
     // (autoCopyIfEnabled / autoSaveIfEnabled) — doing it here as well would
     // double-copy and double-save.
-    // Auto-format: if enabled and format prompt is set, auto-trigger formatting
-    if (message.text && fmtAutoformat.checked && formatPrompt.value.trim()) {
-      doFormat();
-    }
+    // Auto-format is also handled by the background (autoFormatIfEnabled).
   }
   if (message?.type === 'tl2:translating') {
     if (message.tabId !== currentTabId) return;
