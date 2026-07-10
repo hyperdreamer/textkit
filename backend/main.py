@@ -18,6 +18,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel
+try:
+    from langdetect import DetectorFactory, detect
+    from langdetect.lang_detect_exception import LangDetectException
+    DetectorFactory.seed = 0
+    _LANGDETECT_AVAILABLE = True
+except Exception:  # pragma: no cover - exercised only if langdetect is missing
+    detect = None  # type: ignore[assignment]
+    LangDetectException = Exception  # type: ignore[assignment, misc]
+    _LANGDETECT_AVAILABLE = False
 
 
 CONFIG_PATH = Path(__file__).with_name("config.yaml")
@@ -38,6 +47,18 @@ _DEFAULT_PROMPTS: dict[str, str] = {
         "Do not reword or change any text -- only remove exact duplicates and overlapping passages."
     ),
     "translate": "Translate the following text to {language}. Return only the translation.",
+}
+
+
+MIN_DETECT_CHARS = 20
+_LANGUAGE_TO_ISO: dict[str, str] = {
+    "chinese": "zh-cn",
+    "english": "en",
+    "japanese": "ja",
+    "korean": "ko",
+    "french": "fr",
+    "german": "de",
+    "spanish": "es",
 }
 
 
@@ -557,6 +578,70 @@ async def deduplicate_text(config: AIConfig, text: str) -> OCRResponse:
     )
 
 
+def _detect_language(text: str) -> str | None:
+    """Return the ISO 639-1 code for *text*, or None on failure.
+
+    Wrapped in a try/except because ``langdetect`` raises
+    ``LangDetectException`` for inputs it cannot classify
+    (whitespace-only, digits-only, very short strings, etc.).
+    """
+
+    if not _LANGDETECT_AVAILABLE:
+        return None
+    try:
+        return detect(text)
+    except LangDetectException:
+        return None
+    except Exception:
+        return None
+
+
+def _should_skip_translation(
+    text: str,
+    language: str,
+    prompt: str | None,
+    *,
+    debug: bool = False,
+) -> tuple[bool, str, str | None]:
+    """Decide whether the AI translation call can be short-circuited.
+
+    Returns ``(skip, reason, detected_iso)``:
+
+    - ``skip=True, reason="original_target"`` — user picked "Original".
+    - ``skip=True, reason="same_language"``  — detected language matches the
+      target ISO code, so the text is already in the target language.
+    - ``skip=False`` — fall through to the AI provider.
+    """
+
+    if prompt:
+        return False, "", None
+
+    lang_key = (language or "").strip().lower()
+    if lang_key == "original":
+        return True, "original_target", None
+
+    if len(text.strip()) < MIN_DETECT_CHARS:
+        return False, "", None
+
+    target_iso = _LANGUAGE_TO_ISO.get(lang_key)
+    if target_iso is None:
+        return False, "", None
+
+    detected = _detect_language(text)
+    if detected is None:
+        return False, "", None
+
+    if detected == target_iso:
+        _debug(
+            "translate",
+            f"skipped ({ 'same_language' }) detected={detected} target={target_iso}",
+            enabled=debug,
+        )
+        return True, "same_language", detected
+
+    return False, "", detected
+
+
 async def translate_text(config: AIConfig, text: str, language: str, prompt: str | None = None) -> OCRResponse:
     """Route a translation request to the configured provider."""
 
@@ -717,10 +802,28 @@ async def translate(request: TranslateRequest) -> Response:
 
     _validate_text_size(request.text, config)
     _debug("translate", f"request: {len(request.text)} chars lang={request.language}", enabled=config.debug)
-    _debug("translate", "calling provider...", enabled=config.debug)
-    result = await translate_text(config.ai, request.text, request.language, request.prompt)
-    _debug("translate", f"AI returned {len(result.text)} chars model={result.model}", enabled=config.debug)
-    body = {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
+
+    skip, reason, detected_iso = _should_skip_translation(
+        request.text,
+        request.language,
+        request.prompt,
+        debug=config.debug,
+    )
+    if skip:
+        body = {
+            "text": request.text,
+            "model": "",
+            "tokens_used": 0,
+            "skipped": True,
+            "detected_language": detected_iso,
+            "skip_reason": reason,
+        }
+    else:
+        _debug("translate", "calling provider...", enabled=config.debug)
+        result = await translate_text(config.ai, request.text, request.language, request.prompt)
+        _debug("translate", f"AI returned {len(result.text)} chars model={result.model}", enabled=config.debug)
+        body = {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
+
     body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
     _debug("translate", f"sending {len(body_bytes)} byte response", enabled=config.debug)
     return Response(

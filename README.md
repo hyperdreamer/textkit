@@ -114,6 +114,15 @@ curl -X POST "http://localhost:8765/translate" \
 
 ### `POST /format`
 
+To save tokens and latency, the endpoint short-circuits the AI call when the input is already in the target language. Detection uses the `langdetect` library with a 20-character minimum and a fixed seed; the gate is bypassed whenever a custom `prompt` is provided (custom transforms are always sent to the model). When the AI is skipped, the 200 response includes three extra fields:
+
+- `skipped` (boolean) — `true` when the AI was bypassed.
+- `detected_language` (string|null) — ISO 639-1 code reported by `langdetect` (only set on the `same_language` path).
+- `skip_reason` (string) — either `"original_target"` (target is `Original`) or `"same_language"` (detected language matches the target).
+
+The existing `text`, `model`, and `tokens_used` fields are always present; on the short-circuit path `model` is `""` and `tokens_used` is `0`. Older clients that read only `text` are unaffected.
+
+
 Formats text using a user-provided custom AI prompt. Designed to run on the *output* of translation (or any text).
 
 **Request:** JSON body with fields:
