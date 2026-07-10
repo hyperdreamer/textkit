@@ -811,8 +811,13 @@ async def list_paths(prefix: str = "") -> dict[str, list[str]]:
     if not search_dir.is_dir():
         return {"paths": []}
 
-    # Build the prefix stem for filtering
-    prefix_lower = Path(prefix).name.lower() if prefix else ""
+    # Build the prefix stem for filtering from the raw input (not expanded path)
+    prefix_lower = ""
+    if prefix:
+        raw_name = Path(prefix).name.lower()
+        # "~" or "~/" means "show all in that dir" — no filtering
+        if raw_name and raw_name != "~":
+            prefix_lower = raw_name
 
     paths: list[str] = []
     try:
