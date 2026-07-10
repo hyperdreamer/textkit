@@ -324,10 +324,11 @@ async function init() {
 
 // ── Per-language prompt persistence ───────────────────────────
 async function loadPromptForLanguage() {
+  const lang = tlLanguage.value;
   // Backend wins over local storage
   try {
     const backend = normalizeBackendSettings(hostInput.value, portInput.value);
-    const resp = await fetch(`http://${backend.host}:${backend.port}/prompts/translate`);
+    const resp = await fetch(`http://${backend.host}:${backend.port}/prompts/translate?language=${encodeURIComponent(lang)}`);
     if (resp.ok) {
       const data = await resp.json();
       translatePrompt.value = data.template || '';
@@ -335,7 +336,6 @@ async function loadPromptForLanguage() {
     }
   } catch {}
   // Fallback to local storage
-  const lang = tlLanguage.value;
   const key = `translatePrompt:${lang}`;
   const result = await chrome.storage.local.get(key);
   translatePrompt.value = result[key] || '';
@@ -350,7 +350,7 @@ async function saveTlState() {
   // Sync to backend (fire-and-forget)
   try {
     const backend = normalizeBackendSettings(hostInput.value, portInput.value);
-    fetch(`http://${backend.host}:${backend.port}/prompts/translate`, {
+    fetch(`http://${backend.host}:${backend.port}/prompts/translate?language=${encodeURIComponent(lang)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ template: translatePrompt.value })

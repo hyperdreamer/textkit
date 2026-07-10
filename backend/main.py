@@ -41,15 +41,27 @@ _DEFAULT_PROMPTS: dict[str, str] = {
 }
 
 
-def _load_prompt(name: str) -> str:
-    """Load a prompt from disk, falling back to the built-in default."""
-    if name not in _prompt_cache:
+def _load_prompt(name: str, language: str | None = None) -> str:
+    """Load a prompt from disk, falling back to the built-in default.
+
+    When *language* is provided, a language-specific file (e.g.
+    ``translate.French.txt``) is tried before the base file.
+    """
+    cache_key = f"{name}.{language}" if language else name
+    if cache_key not in _prompt_cache:
+        # Try language-specific file first
+        if language:
+            specific_path = PROMPTS_DIR / f"{name}.{language}.txt"
+            if specific_path.is_file():
+                _prompt_cache[cache_key] = specific_path.read_text(encoding="utf-8").strip()
+                return _prompt_cache[cache_key]
+        # Fall back to base file
         prompt_path = PROMPTS_DIR / f"{name}.txt"
         if prompt_path.is_file():
-            _prompt_cache[name] = prompt_path.read_text(encoding="utf-8").strip()
+            _prompt_cache[cache_key] = prompt_path.read_text(encoding="utf-8").strip()
         else:
-            _prompt_cache[name] = _DEFAULT_PROMPTS.get(name, "")
-    return _prompt_cache[name]
+            _prompt_cache[cache_key] = _DEFAULT_PROMPTS.get(name, "")
+    return _prompt_cache[cache_key]
 
 
 def _render_prompt(name: str, **kwargs: str) -> str:
@@ -858,13 +870,19 @@ async def list_prompts() -> dict[str, dict[str, str]]:
 
 @app.api_route("/prompts/{name}", methods=["GET", "PUT"])
 async def get_prompt(name: str, request: Request) -> dict[str, object]:
-    """Return a specific prompt template (GET) or update it (PUT)."""
+    """Return a specific prompt template (GET) or update it (PUT).
+
+    The optional ``?language=`` query parameter selects a language-specific
+    file (e.g. ``?language=French`` writes ``translate.French.txt``).
+    """
+    language: str | None = request.query_params.get("language")
     if name not in _DEFAULT_PROMPTS:
         raise HTTPException(status_code=404, detail=f"Unknown prompt: '{name}'")
     if request.method == "PUT":
         body = await request.json()
         update = PromptUpdate(**body)
-        prompt_path = PROMPTS_DIR / f"{name}.txt"
+        filename = f"{name}.{language}.txt" if language else f"{name}.txt"
+        prompt_path = PROMPTS_DIR / filename
         try:
             PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
             prompt_path.write_text(update.template, encoding="utf-8")
@@ -872,19 +890,26 @@ async def get_prompt(name: str, request: Request) -> dict[str, object]:
             raise HTTPException(
                 status_code=500, detail=f"Failed to save prompt: {exc.strerror or exc}"
             ) from exc
-        _prompt_cache.pop(name, None)
-        template = _load_prompt(name)
-        return {
+        cache_key = f"{name}.{language}" if language else name
+        _prompt_cache.pop(cache_key, None)
+        template = _load_prompt(name, language)
+        result: dict[str, object] = {
             "name": name,
             "template": template,
             "has_language_param": "{language}" in template,
         }
-    template = _load_prompt(name)
-    return {
+        if language:
+            result["language"] = language
+        return result
+    template = _load_prompt(name, language)
+    result = {
         "name": name,
         "template": template,
         "has_language_param": "{language}" in template,
     }
+    if language:
+        result["language"] = language
+    return result
 
 if __name__ == "__main__":
     import uvicorn
