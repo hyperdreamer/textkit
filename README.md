@@ -1,6 +1,6 @@
 # TextKit
 
-TextKit is a text capture and processing tool for reading long web pages through a browser extension and an AI-backed FastAPI service. The Chromium Manifest V3 extension lets you select a fixed region of the current page, capture that region page-by-page while scrolling, merge overlapping OCR fragments, optionally translate the result, and copy or download the final text.
+TextKit is a text capture and processing tool for reading long web pages through a browser extension and an AI-backed FastAPI service. The Chromium Manifest V3 extension lets you select a fixed region of the current page, capture that region page-by-page while scrolling, merge overlapping OCR fragments, optionally translate and format the result, and copy or download the final text.
 
 The backend is provider-neutral: it calls OpenAI-compatible chat completion APIs, configured through `backend/config.yaml`.
 
@@ -8,7 +8,7 @@ The backend is provider-neutral: it calls OpenAI-compatible chat completion APIs
 
 The project has two parts:
 
-- `backend/`: a Python FastAPI server that exposes OCR, deduplication, and translation endpoints. It validates uploaded images, sends requests to the configured AI provider, and returns a consistent JSON response.
+- `backend/`: a Python FastAPI server that exposes OCR, deduplication, translation, format, and save endpoints. It validates uploaded images, sends requests to the configured AI provider, and returns a consistent JSON response.
 - `extension/`: a Chromium Manifest V3 extension that runs a popup, background service worker, and page content script. The content script draws the capture overlay and scrolls the page. The background service worker captures screenshots, crops the selected region, calls the backend, merges fragments, retries failed work, and stores the last region/result.
 
 Typical flow:
@@ -17,7 +17,14 @@ Typical flow:
 2. Load the extension in Chrome or another Chromium browser.
 3. Press `Ctrl+Shift+S` or click `Select Region` in the popup.
 4. Draw or adjust the capture region and press `Ctrl+Space`.
-5. The extension captures the selected region, sends each page image to `POST /ocr`, merges fragments, sends merged text to `POST /dedup`, optionally sends the result to `POST /translate`, and stores the final text.
+5. The extension captures the selected region, sends each page image to `POST /ocr`, merges fragments, sends merged text to `POST /dedup`, optionally sends the result to `POST /translate`, optionally formats the translation via `POST /format`, and stores the final text.
+
+The popup has four tabs:
+
+- **OCR** — capture controls, progress, raw result, copy/download.
+- **Translation** — translate OCR result to a target language, with auto-copy/auto-save/auto-translate.
+- **Format** — format the translated text with a custom AI prompt, with auto-copy/auto-save/auto-format.
+- **Prompt** — configure the custom AI prompts used by Translation and Format.
 
 ## Quick Start
 
@@ -46,9 +53,110 @@ By default, the server binds to `127.0.0.1:8765`. Change `host` in `config.yaml`
 4. Select the `extension/` directory.
 5. Open the extension popup and confirm the backend host and port, usually `localhost` and `8765`.
 
-## Backend
+## Backend API
 
 The backend is implemented in `backend/main.py` and serves a FastAPI app named `TextKit Backend`.
+
+All endpoints return the same JSON response shape:
+
+```json
+{
+  "text": "result text",
+  "model": "provider-model-name",
+  "tokens_used": 123,
+  "error": null
+}
+```
+
+On errors, the response uses the same envelope with an empty `text`, empty `model`, `tokens_used: 0`, and an `error` message.
+
+The backend is fully usable as a standalone API — you can call any endpoint directly with `curl` or any HTTP client without the extension.
+
+### `POST /ocr`
+
+Transcribes text from an image using a vision-capable AI model.
+
+**Request:** multipart form data with field `image` (required image file).
+
+```sh
+curl -X POST "http://localhost:8765/ocr" \
+  -F "image=@page.png"
+```
+
+The backend validates the image with Pillow, encodes it as a data URL, and sends it to the configured AI model.
+
+### `POST /dedup`
+
+Removes duplicate or overlapping content from merged OCR text.
+
+**Request:** JSON body with field `text` (string).
+
+```sh
+curl -X POST "http://localhost:8765/dedup" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"first page\nfirst page\nsecond page"}'
+```
+
+### `POST /translate`
+
+Translates text to a target language.
+
+**Request:** JSON body with fields:
+- `text` (string, required) — the text to translate.
+- `language` (string, required) — target language, e.g. `"Chinese"`, `"English"`.
+- `prompt` (string, optional) — custom system prompt that overrides the default translation prompt. When provided, the prompt is used as-is (the `{language}` variable is ignored).
+
+```sh
+curl -X POST "http://localhost:8765/translate" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Hello world","language":"Chinese"}'
+```
+
+### `POST /format`
+
+Formats text using a user-provided custom AI prompt. Designed to run on the *output* of translation (or any text).
+
+**Request:** JSON body with fields:
+- `text` (string, required) — the text to format.
+- `prompt` (string, required) — the system prompt sent to the AI model. Describes how to transform the text. Examples: `"Convert to ALL CAPS"`, `"Reformat as clean Markdown with headings and bullet points"`, `"Summarise this text in 3 bullet points"`.
+
+```sh
+curl -X POST "http://localhost:8765/format" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Hello world this is a test","prompt":"Convert this text to ALL CAPS. Return only the converted text."}'
+```
+
+Uses the same AI text provider as `/translate` and `/dedup` (`config.text` override if configured).
+
+### `POST /save`
+
+Writes text to a local file on the backend machine.
+
+**Request:** JSON body with fields:
+- `text` (string, required) — the text to save.
+- `path` (string, required) — file path relative to the configured `save_root`.
+
+```sh
+curl -X POST "http://localhost:8765/save" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Hello world","path":"ocr/output.txt"}'
+```
+
+### `GET /prompts`
+
+Returns all available AI prompt templates (OCR, dedup, translate) as JSON.
+
+```sh
+curl "http://localhost:8765/prompts"
+```
+
+### `GET /prompts/{name}`
+
+Returns a single prompt template by name (`ocr`, `dedup`, or `translate`).
+
+```sh
+curl "http://localhost:8765/prompts/translate"
+```
 
 ### Configuration
 
@@ -81,11 +189,11 @@ Supported `ai` fields:
 
 - `api_base`: base provider URL without a trailing slash. Must expose `/v1/chat/completions`.
 - `api_key`: the API key. Plaintext values are used directly. Prefix with `$` to treat the value as an environment variable name (e.g. `$OCR_API_KEY`). `api_key_env` is also accepted.
-- `model`: the model name to send to the provider. This is the fallback model used for all operations unless per-task overrides are set.
+- `model`: the model name to send to the provider. Fallback model used for all operations unless per-task overrides are set.
 - `ocr` (optional): nested section to override model/endpoint for vision (OCR) requests. Fields: `api_base`, `api_key`, `model`. Empty fields inherit from the parent `ai` section.
-- `text` (optional): nested section to override model/endpoint for text processing (deduplication and translation). Same fields as `ocr`.
+- `text` (optional): nested section to override model/endpoint for text processing (dedup, translation, and format). Same fields as `ocr`.
 
-The backend also falls back to these environment variable names:
+The backend falls back to these environment variable names:
 
 - `OCR_API_KEY`
 - `OPENAI_API_KEY`
@@ -94,89 +202,12 @@ API key loading is lazy. The app can start without an API key in the environment
 
 ### Launching
 
-Run from the `backend/` directory:
-
 ```sh
 cd backend
 python main.py
 ```
 
 `main.py` reads `config.yaml` and starts Uvicorn with the configured `host` and `port`.
-
-### API
-
-All backend endpoints return the same response shape:
-
-```json
-{
-  "text": "result text",
-  "model": "provider-model-name",
-  "tokens_used": 123,
-  "error": null
-}
-```
-
-On errors, the response uses the same envelope with an empty `text`, empty `model`, `tokens_used: 0`, and an `error` message.
-
-#### `POST /ocr`
-
-Accepts a multipart image upload and returns transcribed text.
-
-Form field:
-
-- `image`: required image file.
-
-Example:
-
-```sh
-curl -X POST "http://localhost:8765/ocr" \
-  -F "image=@page.png"
-```
-
-The backend validates the image with Pillow, encodes it as a data URL, and sends it to the configured vision-capable model with an OCR prompt.
-
-#### `POST /dedup`
-
-Accepts merged OCR text and removes duplicate or overlapping content.
-
-Request body:
-
-```json
-{
-  "text": "..."
-}
-```
-
-Example:
-
-```sh
-curl -X POST "http://localhost:8765/dedup" \
-  -H "Content-Type: application/json" \
-  -d '{"text":"first page\nfirst page\nsecond page"}'
-```
-
-This endpoint is used after multi-page capture to clean up repeated lines or overlapping page content.
-
-#### `POST /translate`
-
-Accepts text and a target language, then returns only the translation.
-
-Request body:
-
-```json
-{
-  "text": "...",
-  "language": "Chinese"
-}
-```
-
-Example:
-
-```sh
-curl -X POST "http://localhost:8765/translate" \
-  -H "Content-Type: application/json" \
-  -d '{"text":"Hello world","language":"Chinese"}'
-```
 
 ## Extension
 
@@ -185,10 +216,19 @@ The extension lives in `extension/` and uses Manifest V3.
 Main files:
 
 - `manifest.json`: extension metadata, permissions, content script registration, and keyboard command.
-- `popup.html` and `popup.js`: popup UI for status, backend settings, language selection, copy/download, stop, and retry.
+- `popup.html` and `popup.js`: popup UI with four tabs (OCR, Translation, Format, Prompt) for status, backend settings, language selection, custom prompts, and output actions.
 - `background.js`: capture orchestration, backend calls, fragment merging, retry state, and persistence.
 - `content.js`: selection overlay, saved-region editing, viewport reporting, and page scrolling.
 - `overlay.css`: region selection overlay styling.
+
+### Popup tabs
+
+| Tab | Purpose |
+|-----|---------|
+| **OCR** | Start/stop capture, view status/progress, copy/download OCR result. |
+| **Translation** | Translate OCR result to a target language. Auto-copy, auto-save (with save path), and auto-translate checkboxes. |
+| **Format** | Format the translated text with a custom AI prompt. Auto-copy, auto-save (with dedicated save path), and auto-format checkboxes. Auto-format fires automatically when translation completes. |
+| **Prompt** | Configure the two custom AI prompts: **Translation Prompt** (per-language) and **Format Prompt** (global). |
 
 ### Capture controls
 
@@ -203,14 +243,12 @@ Main files:
 
 ### Auto-scroll and page capture
 
-The popup includes an Auto-scroll checkbox:
+- **Auto-scroll enabled:** the extension captures the selected region, scrolls down by about one viewport with overlap, captures again, and repeats until the page stops scrolling.
+- **Auto-scroll disabled:** the extension captures only the current viewport region once.
 
-- Enabled: the extension captures the selected region, scrolls down by about one viewport with overlap, captures again, and repeats until the page stops scrolling.
-- Disabled: the extension captures only the current viewport region once.
+During capture, the popup shows status, current page, fragment count, and progress. The Stop button requests capture to stop and preserves fragments already collected.
 
-During capture, the popup shows status, current page, fragment count, and progress. The Stop button requests capture to stop and preserves fragments already collected. When stopped, the extension still finalizes the collected text through deduplication when possible.
-
-### OCR, deduplication, and translation
+### OCR, deduplication, translation, and formatting
 
 For each captured page region, the extension:
 
@@ -221,10 +259,9 @@ For each captured page region, the extension:
 5. Merges fragments locally using line-overlap detection.
 6. Sends the merged text to `POST /dedup`.
 7. If a language other than `Original` is selected, sends the deduplicated text to `POST /translate`.
+8. If auto-format is enabled and a format prompt is set, sends the translated text to `POST /format`.
 
 The popup language dropdown supports `Original`, `Chinese`, `English`, `Japanese`, `Korean`, `French`, `German`, and `Spanish`. Choosing `Original` skips translation.
-
-The popup also includes a `Translate` button that can translate the current OCR result after capture if a target language is selected.
 
 ### Retry behavior
 
@@ -234,30 +271,31 @@ The Retry button appears when OCR, deduplication, or translation fails.
 - Dedup failure: retry runs deduplication again on the pending merged text.
 - Translation failure: retry runs translation again on the pending deduplicated text.
 
-### Output
+### Output actions
 
-After capture finishes, the popup shows the final text.
+Every result panel (OCR, Translation, Format) supports:
 
-Available output actions:
-
-- Copy: copies the text to the clipboard.
-- Download: saves the text as a `.txt` file named like `textkit-YYYY-MM-DD...txt`.
+- **Copy** — copies the text to the clipboard.
+- **Download** — saves the text as a `.txt` file (named `textkit-*.txt`, `translate-*.txt`, or `format-*.txt`).
+- **Save** — writes the text to a local file on the backend machine via `POST /save`, using the tab's save path.
 
 ### Settings and persistence
 
-The popup lets you configure:
+Settings persisted to Chrome sync storage:
 
-- Backend host.
-- Backend port.
+- Backend host and port.
+- Auto-scroll on/off.
 - Target language.
-- Auto-scroll on or off.
+- Translation auto-copy, auto-save, auto-translate toggles and save path.
+- Format auto-copy, auto-save, auto-format toggles and save path.
 
-The extension remembers:
+Settings persisted to Chrome local storage:
 
-- Last backend host and port in Chrome sync storage.
-- Last selected language and auto-scroll setting in Chrome sync storage.
-- Last region size and position in local storage.
-- Last OCR result in local storage, so it is restored across browser or extension restarts.
+- Last region size and position.
+- Per-tab: OCR result, translation result, format result, status messages.
+- Format prompt (user-defined).
+- Translation prompts (per-language, user-defined).
+- Save path history for autocomplete.
 
 ## Development Notes
 
@@ -285,8 +323,6 @@ The extension does not require a build step. Load the `extension/` folder direct
 
 Confirm that `backend/config.yaml` points to the correct API key or environment variable name and that the variable is exported in the shell running `python main.py`.
 
-Example:
-
 ```sh
 export OCR_API_KEY="your-api-key"
 ```
@@ -310,4 +346,8 @@ Make sure Auto-scroll is enabled if you want full-page capture. With Auto-scroll
 
 ### Translation does not run automatically
 
-Select a language other than `Original` before starting capture. You can also use the popup `Translate` button after OCR completes.
+Select a language other than `Original` before starting capture. You can also use the `Translate` button after OCR completes.
+
+### Format does not run automatically
+
+Make sure **Auto-format** is checked on the Format tab and a **Format Prompt** is configured on the Prompt tab. Auto-format triggers when translation completes.
