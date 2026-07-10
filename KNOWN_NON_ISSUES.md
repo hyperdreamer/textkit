@@ -55,14 +55,10 @@ The function is stable and won't drift.
 
 ---
 
-## 5. `fetchWithTimeout` in popup.js is unused dead code
+## 5. ~~`fetchWithTimeout` in popup.js is unused dead code~~ → FIXED
 **File:** `extension/popup.js:941-949`
 
-Defined but never called — save/translate operations route through the background
-service worker.
-
-**Decision:** NOT fixing. Harmless dead code. The background's `fetchWithTimeout`
-(line 1063) is the actively used version. Removing dead code is low priority.
+Was dead code — removed in commit `7d78b25` (10 audit fixes).
 
 ---
 
