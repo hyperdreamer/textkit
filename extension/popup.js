@@ -729,14 +729,6 @@ function saveFormatSettings() {
   });
 }
 
-async function autoSaveFmt(text) {
-  const path = fmtSavePath.value.trim();
-  if (!path) return;
-  try {
-    await chrome.runtime.sendMessage({ type: 'save:translation', text, path });
-  } catch { /* silent */ }
-}
-
 async function saveTranslation() {
   const text = tl2Result.value.trim();
   if (!text) return;
