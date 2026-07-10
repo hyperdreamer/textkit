@@ -807,13 +807,13 @@ async function fetchPathSuggestions(prefix) {
     const resp = await fetch(`http://${hostInput.value || 'localhost'}:${portInput.value || 8765}/paths?prefix=${encodeURIComponent(prefix)}`);
     const data = await resp.json().catch(() => ({}));
     const paths = data.paths || [];
-    // If user typed a directory prefix (e.g. ~/ or ocr/), prepend it so the
-    // browser's <datalist> filtering matches what the user sees
-    const lastSlash = prefix.lastIndexOf('/');
-    const dirPrefix = lastSlash >= 0 ? prefix.slice(0, lastSlash + 1) : '';
+    // If user typed a ~ prefix, prepend ~/ so the browser's <datalist>
+    // filtering matches. The backend returns paths relative to save_root;
+    // we only need to restore the tilde the user typed.
+    const tildePrefix = prefix.startsWith('~/') ? '~/' : (prefix === '~' ? '~/' : '');
     tl2PathSuggestions.replaceChildren(...paths.map((path) => {
       const option = document.createElement('option');
-      option.value = dirPrefix + path;
+      option.value = tildePrefix + path;
       return option;
     }));
   } catch {
