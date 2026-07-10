@@ -220,11 +220,10 @@ async function init() {
   if (tl.tlLanguage) tlLanguage.value = tl.tlLanguage;
   await loadPromptForLanguage();
 
-  // Load Translation tab language and last result (per-tab)
+  // Load Translation tab language and last result (per-tab) -- single atomic load
   const tl2k = (k) => currentTabId ? `${k}:${currentTabId}` : k;
-  const tl2 = currentTabId ? await chrome.storage.local.get([
-    `tl2Language:${currentTabId}`, `tl2Result:${currentTabId}`, `tl2Status:${currentTabId}`
-  ]) : {};
+  const tl2Keys = currentTabId ? [tl2k('tl2Language'), tl2k('tl2Result'), tl2k('tl2Status'), tl2k('tl2Translating')] : [];
+  const tl2 = await chrome.storage.local.get(tl2Keys);
   if (tl2[tl2k('tl2Language')]) tl2Language.value = tl2[tl2k('tl2Language')];
   if (tl2[tl2k('tl2Result')]) { tl2Result.value = tl2[tl2k('tl2Result')]; tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = false; }
   if (tl2[tl2k('tl2Status')]) {
@@ -236,21 +235,18 @@ async function init() {
       tl2StatusText.textContent = p;
     }
   }
-  // Restore translating state from storage (survives popup close/reopen)
-  const tl2transKey = currentTabId ? `tl2Translating:${currentTabId}` : null;
-  const tl2trans = tl2transKey ? await chrome.storage.local.get(tl2transKey) : {};
-  const tl2resKey = currentTabId ? `tl2Result:${currentTabId}` : null;
-  const tl2res = tl2resKey ? await chrome.storage.local.get(tl2resKey) : {};
+  // Restore translating state from the same atomic load
+  const wasTranslating = !!tl2[tl2k('tl2Translating')];
+  const hasTl2Result = !!tl2[tl2k('tl2Result')];
 
-  if (tl2trans[tl2transKey] && tl2res[tl2resKey]) {
+  if (wasTranslating && hasTl2Result) {
     // Translation completed while popup was closed — show result
     tl2Translate.textContent = 'Translate';
     tl2Translate.classList.remove('danger');
-    tl2Result.value = tl2res[tl2resKey];
     tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = false;
-    chrome.storage.local.remove(tl2transKey);
+    chrome.storage.local.remove(tl2k('tl2Translating'));
     tl2StatusText.textContent = 'Completed while popup was closed';
-  } else if (tl2trans[tl2transKey]) {
+  } else if (wasTranslating) {
     tl2Translate.textContent = 'Stop';
     tl2Translate.classList.add('danger');
     tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = true;
@@ -273,16 +269,15 @@ async function init() {
   tl2AutosavePath.value = tl2Settings.tl2AutoSavePath || '';
   loadPathSuggestions();
 
-  // Load Format tab prompt and last result (per-tab)
+  // Load Format tab prompt and last result (per-tab) — single atomic load
   const fmtSaveSettings = await chrome.storage.sync.get({ fmtSavePath: '', fmtAutoCopy: false, fmtAutoSave: false, fmtAutoFormat: false });
   if (fmtSaveSettings.fmtSavePath) fmtSavePath.value = fmtSaveSettings.fmtSavePath;
   fmtAutocopy.checked = fmtSaveSettings.fmtAutoCopy;
   fmtAutosave.checked = fmtSaveSettings.fmtAutoSave;
   fmtAutoformat.checked = fmtSaveSettings.fmtAutoFormat;
   const fmtk = (k) => currentTabId ? `${k}:${currentTabId}` : k;
-  const fmt = currentTabId ? await chrome.storage.local.get([
-    `fmtResult:${currentTabId}`, `fmtStatus:${currentTabId}`, 'formatPrompt'
-  ]) : {};
+  const fmtKeys = currentTabId ? [fmtk('fmtResult'), fmtk('fmtStatus'), fmtk('fmtFormatting'), 'formatPrompt'] : ['formatPrompt'];
+  const fmt = await chrome.storage.local.get(fmtKeys);
   if (fmt['formatPrompt']) formatPrompt.value = fmt['formatPrompt'];
   if (fmt[fmtk('fmtResult')]) { fmtResult.value = fmt[fmtk('fmtResult')]; fmtCopy.disabled = fmtSave.disabled = fmtDownload.disabled = false; }
   if (fmt[fmtk('fmtStatus')]) {
@@ -293,21 +288,18 @@ async function init() {
       fmtStatusText.textContent = p;
     }
   }
-  // Restore formatting state from storage (survives popup close/reopen)
-  const fmttransKey = currentTabId ? `fmtFormatting:${currentTabId}` : null;
-  const fmttrans = fmttransKey ? await chrome.storage.local.get(fmttransKey) : {};
-  const fmtresKey = currentTabId ? `fmtResult:${currentTabId}` : null;
-  const fmtres = fmtresKey ? await chrome.storage.local.get(fmtresKey) : {};
+  // Restore formatting state from the same atomic load
+  const wasFormatting = !!fmt[fmtk('fmtFormatting')];
+  const hasFmtResult = !!fmt[fmtk('fmtResult')];
 
-  if (fmttrans[fmttransKey] && fmtres[fmtresKey]) {
+  if (wasFormatting && hasFmtResult) {
     // Formatting completed while popup was closed — show result
     fmtFormat.textContent = 'Format';
     fmtFormat.classList.remove('danger');
-    fmtResult.value = fmtres[fmtresKey];
     fmtCopy.disabled = fmtSave.disabled = fmtDownload.disabled = false;
-    chrome.storage.local.remove(fmttransKey);
+    chrome.storage.local.remove(fmtk('fmtFormatting'));
     fmtStatusText.textContent = 'Completed while popup was closed';
-  } else if (fmttrans[fmttransKey]) {
+  } else if (wasFormatting) {
     fmtFormat.textContent = 'Stop';
     fmtFormat.classList.add('danger');
     fmtCopy.disabled = fmtSave.disabled = fmtDownload.disabled = true;
