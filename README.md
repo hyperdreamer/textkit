@@ -142,6 +142,26 @@ curl -X POST "http://localhost:8765/save" \
   -d '{"text":"Hello world","path":"ocr/output.txt"}'
 ```
 
+### `GET /paths`
+
+Returns filesystem paths under `save_root` matching a prefix, for autocomplete in the extension's save path fields.
+
+**Query parameters:**
+- `prefix` (string, optional) — path prefix to filter by. Supports `~` for home directory expansion.
+
+```sh
+# List everything under save_root
+curl "http://localhost:8765/paths"
+
+# Filter by prefix
+curl "http://localhost:8765/paths?prefix=ocr/"
+
+# Use ~ to browse the home directory
+curl "http://localhost:8765/paths?prefix=~/Documents"
+```
+
+Returns `{"paths": ["ocr/output.txt", "ocr/notes.md", ...]}`. Directories have a trailing `/`. Results are capped at 30 entries.
+
 ### `GET /prompts`
 
 Returns all available AI prompt templates (OCR, dedup, translate) as JSON.
@@ -227,7 +247,7 @@ Main files:
 |-----|---------|
 | **OCR** | Start/stop capture, view status/progress, copy/download OCR result. |
 | **Translation** | Translate OCR result to a target language. Auto-copy, auto-save (with save path), and auto-translate checkboxes. |
-| **Format** | Format the translated text with a custom AI prompt. Auto-copy, auto-save (with dedicated save path), and auto-format checkboxes. Auto-format fires automatically when translation completes. |
+| **Format** | Format text with a custom AI prompt. Choose source (OCR or Translation), auto-copy, auto-save (with dedicated save path), and auto-format checkboxes. Auto-format fires automatically when translation completes. |
 | **Prompt** | Configure the two custom AI prompts: **Translation Prompt** (per-language) and **Format Prompt** (global). |
 
 ### Capture controls
@@ -287,7 +307,7 @@ Settings persisted to Chrome sync storage:
 - Auto-scroll on/off.
 - Target language.
 - Translation auto-copy, auto-save, auto-translate toggles and save path.
-- Format auto-copy, auto-save, auto-format toggles and save path.
+- Format auto-copy, auto-save, auto-format toggles, save path, and source selector (Translation or OCR Result).
 
 Settings persisted to Chrome local storage:
 
@@ -295,7 +315,7 @@ Settings persisted to Chrome local storage:
 - Per-tab: OCR result, translation result, format result, status messages.
 - Format prompt (user-defined).
 - Translation prompts (per-language, user-defined).
-- Save path history for autocomplete.
+- Save path autocomplete — queried in real time from the backend's `GET /paths` endpoint (with local history fallback).
 
 ## Development Notes
 
