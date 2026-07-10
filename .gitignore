@@ -23,6 +23,7 @@ pip-wheel-metadata/
 .env
 .env.*
 config.yaml
+backend/prompts/*.txt
 venv/
 .venv/
 ENV/

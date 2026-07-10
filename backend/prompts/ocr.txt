@@ -1,1 +1,0 @@
-Transcribe all text visible in this image. Return only the transcription.
