@@ -112,7 +112,10 @@ fmtCopy.addEventListener('click', () => copyResult(fmtResult, fmtCopy));
 fmtDownload.addEventListener('click', () => downloadAsFile(fmtResult.value.trim(), 'format'));
 fmtSave.addEventListener('click', saveFormatResult);
 formatPrompt.addEventListener('input', saveFormatPrompt);
-fmtSavePath.addEventListener('input', saveFormatSettings);
+fmtSavePath.addEventListener('input', () => {
+  saveFormatSettings();
+  updatePathSuggestions(fmtSavePath.value);
+});
 fmtAutocopy.addEventListener('change', saveFormatSettings);
 fmtAutosave.addEventListener('change', saveFormatSettings);
 fmtAutoformat.addEventListener('change', saveFormatSettings);
