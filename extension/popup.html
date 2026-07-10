@@ -187,7 +187,7 @@
       <button class="tab active" data-panel="ocr-panel">OCR</button>
       <button class="tab" data-panel="translation-panel">Translation</button>
       <button class="tab" data-panel="format-panel">Format</button>
-      <button class="tab" data-panel="translate-panel">Prompt</button>
+      <button class="tab" data-panel="translate-panel">Prompts</button>
     </div>
 
     <!-- OCR Panel -->
@@ -218,8 +218,12 @@
       <div id="last-region"></div>
     </main>
 
-    <!-- Translate Panel -->
+    <!-- Translate Panel → "Prompts" -->
     <main id="translate-panel" class="hidden">
+      <h1>OCR Prompt</h1>
+      <textarea id="ocr-prompt" placeholder="Custom OCR prompt. E.g.: Transcribe all visible Japanese text." style="min-height:80px"></textarea>
+      <h1>Dedup Prompt</h1>
+      <textarea id="dedup-prompt" placeholder="Custom dedup prompt. E.g.: Remove duplicates and fix OCR errors." style="min-height:80px;margin-top:8px"></textarea>
       <h1>Translation Prompt</h1>
       <div class="settings">
         <label>Language

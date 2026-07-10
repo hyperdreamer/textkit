@@ -927,6 +927,14 @@ async function postImageForOcr(blob, pageNumber, signal) {
   const formData = new FormData();
   formData.append('image', blob, `page-${String(pageNumber).padStart(4, '0')}.png`);
 
+  // Include custom OCR prompt if set
+  try {
+    const stored = await chrome.storage.local.get('ocrPrompt');
+    if (stored.ocrPrompt) {
+      formData.append('prompt', stored.ocrPrompt);
+    }
+  } catch {}
+
   const url = await getBackendEndpoint('/ocr');
   const response = await fetchWithTimeout(url, { method: 'POST', body: formData }, signal);
 
@@ -948,10 +956,20 @@ async function postImageForOcr(blob, pageNumber, signal) {
 
 async function postTextForDedup(text, signal) {
   const url = await getBackendEndpoint('/dedup');
+
+  // Include custom dedup prompt if set
+  const body = { text };
+  try {
+    const stored = await chrome.storage.local.get('dedupPrompt');
+    if (stored.dedupPrompt) {
+      body.prompt = stored.dedupPrompt;
+    }
+  } catch {}
+
   const response = await fetchWithTimeout(url + '?_=' + Date.now(), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text })
+    body: JSON.stringify(body)
   }, signal);
 
   if (!response.ok) {

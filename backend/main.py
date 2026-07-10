@@ -13,7 +13,7 @@ from typing import Any
 
 import httpx
 import yaml
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from PIL import Image, UnidentifiedImageError
@@ -47,6 +47,7 @@ _DEFAULT_PROMPTS: dict[str, str] = {
         "Do not reword or change any text -- only remove exact duplicates and overlapping passages."
     ),
     "translate": "Translate the following text to {language}. Return only the translation.",
+    "format": "",
 }
 
 
@@ -110,6 +111,7 @@ class DedupRequest(BaseModel):
     """Request body accepted by the dedup endpoint."""
 
     text: str
+    prompt: str | None = None
 
 
 class TranslateRequest(BaseModel):
@@ -523,16 +525,17 @@ async def _post_openai_chat_completion(
     )
 
 
-async def _call_openai(config: AIConfig, data_url: str) -> OCRResponse:
+async def _call_openai(config: AIConfig, data_url: str, prompt: str | None = None) -> OCRResponse:
     """Send the image to an OpenAI-compatible /v1/chat/completions API."""
 
+    ocr_prompt = prompt if prompt else _render_prompt("ocr")
     return await _post_openai_chat_completion(
         config,
         [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": _render_prompt("ocr")},
+                    {"type": "text", "text": ocr_prompt},
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             }
@@ -558,21 +561,22 @@ def _decode_provider_json(response: httpx.Response, provider_name: str) -> dict[
     return payload
 
 
-async def transcribe_image(config: AIConfig, data_url: str) -> OCRResponse:
+async def transcribe_image(config: AIConfig, data_url: str, prompt: str | None = None) -> OCRResponse:
     """Route an OCR request to the configured provider."""
 
     cfg = _resolve_ai_config(config, config.ocr)
-    return await _call_openai(cfg, data_url)
+    return await _call_openai(cfg, data_url, prompt)
 
 
-async def deduplicate_text(config: AIConfig, text: str) -> OCRResponse:
+async def deduplicate_text(config: AIConfig, text: str, prompt: str | None = None) -> OCRResponse:
     """Route a deduplication request to the configured provider."""
 
+    dedup_prompt = prompt if prompt else _render_prompt("dedup")
     cfg = _resolve_ai_config(config, config.text)
     return await _post_openai_chat_completion(
         cfg,
         [
-            {"role": "system", "content": _render_prompt("dedup")},
+            {"role": "system", "content": dedup_prompt},
             {"role": "user", "content": text},
         ],
     )
@@ -714,7 +718,10 @@ async def catch_all_handler(_request: Request, exc: Exception) -> JSONResponse:
 
 
 @app.post("/ocr", response_model=OCRResponse)
-async def ocr(image: UploadFile | None = File(default=None)) -> OCRResponse:
+async def ocr(
+    image: UploadFile | None = File(default=None),
+    prompt: str = Form(None),
+) -> OCRResponse:
     """Accept an image upload and return text transcribed by the configured AI model."""
 
     if image is None:
@@ -739,7 +746,7 @@ async def ocr(image: UploadFile | None = File(default=None)) -> OCRResponse:
 
     data_url = _image_to_data_url(image_bytes, image.content_type)
     _debug("ocr", f"calling model={config.ai.model} ocr_model={config.ai.ocr.model if config.ai.ocr else '-'}", enabled=config.debug)
-    result = await transcribe_image(config.ai, data_url)
+    result = await transcribe_image(config.ai, data_url, prompt)
     _debug("ocr", f"response: {len(result.text)} chars model={result.model}", enabled=config.debug)
 
     # Debug: save last OCR text (before dedup) for manual inspection
@@ -771,7 +778,7 @@ async def dedup(request: DedupRequest) -> Response:
     except OSError:
         pass
     _debug("dedup", "calling provider...", enabled=config.debug)
-    result = await deduplicate_text(config.ai, request.text)
+    result = await deduplicate_text(config.ai, request.text, request.prompt)
     _debug("dedup", f"AI returned {len(result.text)} chars model={result.model}", enabled=config.debug)
     # Debug: save post-dedup text for quick comparison
     try:

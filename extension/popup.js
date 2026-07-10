@@ -19,6 +19,10 @@ const lastRegionEl = document.getElementById('last-region');
 const tlLanguage = document.getElementById('tl-language');
 const translatePrompt = document.getElementById('translate-prompt');
 
+// ── OCR/Dedup prompt elements ─────────────────────────────────
+const ocrPromptEl = document.getElementById('ocr-prompt');
+const dedupPromptEl = document.getElementById('dedup-prompt');
+
 // ── Translation panel elements ────────────────────────────────
 const tl2Language = document.getElementById('tl2-language');
 const tl2StatusText = document.getElementById('tl2-status-text');
@@ -113,6 +117,8 @@ fmtCopy.addEventListener('click', () => copyResult(fmtResult, fmtCopy));
 fmtDownload.addEventListener('click', () => downloadAsFile(fmtResult.value.trim(), 'format'));
 fmtSave.addEventListener('click', saveFormatResult);
 formatPrompt.addEventListener('input', saveFormatPrompt);
+ocrPromptEl.addEventListener('input', saveOcrPrompt);
+dedupPromptEl.addEventListener('input', saveDedupPrompt);
 fmtSavePath.addEventListener('input', () => {
   saveFormatSettings();
   updatePathSuggestions(fmtSavePath.value);
@@ -222,6 +228,10 @@ async function init() {
   const tl = await chrome.storage.local.get('tlLanguage');
   if (tl.tlLanguage) tlLanguage.value = tl.tlLanguage;
   await loadPromptForLanguage();
+
+  // Load OCR and dedup prompts
+  await loadOcrPrompt();
+  await loadDedupPrompt();
 
   // Load Translation tab language and last result (per-tab) -- single atomic load
   const tl2k = (k) => currentTabId ? `${k}:${currentTabId}` : k;
@@ -743,8 +753,75 @@ async function saveFormatResult() {
   }
 }
 
+// ── OCR/Dedup prompt load/save ────────────────────────────────
+async function loadOcrPrompt() {
+  // Backend wins over local storage
+  try {
+    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
+    const resp = await fetch(`http://${backend.host}:${backend.port}/prompts/ocr`);
+    if (resp.ok) {
+      const data = await resp.json();
+      ocrPromptEl.value = data.template || '';
+      return;
+    }
+  } catch {}
+  const result = await chrome.storage.local.get('ocrPrompt');
+  ocrPromptEl.value = result.ocrPrompt || '';
+}
+
+async function saveOcrPrompt() {
+  const value = ocrPromptEl.value;
+  await chrome.storage.local.set({ ocrPrompt: value });
+  try {
+    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
+    fetch(`http://${backend.host}:${backend.port}/prompts/ocr`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ template: value })
+    });
+  } catch {}
+}
+
+async function loadDedupPrompt() {
+  // Backend wins over local storage
+  try {
+    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
+    const resp = await fetch(`http://${backend.host}:${backend.port}/prompts/dedup`);
+    if (resp.ok) {
+      const data = await resp.json();
+      dedupPromptEl.value = data.template || '';
+      return;
+    }
+  } catch {}
+  const result = await chrome.storage.local.get('dedupPrompt');
+  dedupPromptEl.value = result.dedupPrompt || '';
+}
+
+async function saveDedupPrompt() {
+  const value = dedupPromptEl.value;
+  await chrome.storage.local.set({ dedupPrompt: value });
+  try {
+    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
+    fetch(`http://${backend.host}:${backend.port}/prompts/dedup`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ template: value })
+    });
+  } catch {}
+}
+
 function saveFormatPrompt() {
-  chrome.storage.local.set({ formatPrompt: formatPrompt.value.trim() });
+  const value = formatPrompt.value.trim();
+  chrome.storage.local.set({ formatPrompt: value });
+  // Sync to backend (fire-and-forget)
+  try {
+    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
+    fetch(`http://${backend.host}:${backend.port}/prompts/format`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ template: value })
+    });
+  } catch {}
 }
 
 function saveFormatSettings() {
