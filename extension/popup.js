@@ -324,6 +324,17 @@ async function init() {
 
 // ── Per-language prompt persistence ───────────────────────────
 async function loadPromptForLanguage() {
+  // Backend wins over local storage
+  try {
+    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
+    const resp = await fetch(`http://${backend.host}:${backend.port}/prompts/translate`);
+    if (resp.ok) {
+      const data = await resp.json();
+      translatePrompt.value = data.template || '';
+      return;
+    }
+  } catch {}
+  // Fallback to local storage
   const lang = tlLanguage.value;
   const key = `translatePrompt:${lang}`;
   const result = await chrome.storage.local.get(key);
@@ -336,6 +347,15 @@ async function saveTlState() {
     tlLanguage: lang,
     [`translatePrompt:${lang}`]: translatePrompt.value
   });
+  // Sync to backend (fire-and-forget)
+  try {
+    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
+    fetch(`http://${backend.host}:${backend.port}/prompts/translate`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ template: translatePrompt.value })
+    });
+  } catch {}
 }
 
 async function saveTl2Language() {

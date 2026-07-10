@@ -87,6 +87,12 @@ class TranslateRequest(BaseModel):
     prompt: str | None = None
 
 
+class PromptUpdate(BaseModel):
+    """Request body accepted by the PUT /prompts/{name} endpoint."""
+
+    template: str
+
+
 class FormatRequest(BaseModel):
     """Request body accepted by the format endpoint."""
 
@@ -850,11 +856,29 @@ async def list_prompts() -> dict[str, dict[str, str]]:
     return {"prompts": prompts}
 
 
-@app.get("/prompts/{name}")
-async def get_prompt(name: str) -> dict[str, object]:
-    """Return a specific prompt template."""
+@app.api_route("/prompts/{name}", methods=["GET", "PUT"])
+async def get_prompt(name: str, request: Request) -> dict[str, object]:
+    """Return a specific prompt template (GET) or update it (PUT)."""
     if name not in _DEFAULT_PROMPTS:
         raise HTTPException(status_code=404, detail=f"Unknown prompt: '{name}'")
+    if request.method == "PUT":
+        body = await request.json()
+        update = PromptUpdate(**body)
+        prompt_path = PROMPTS_DIR / f"{name}.txt"
+        try:
+            PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
+            prompt_path.write_text(update.template, encoding="utf-8")
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to save prompt: {exc.strerror or exc}"
+            ) from exc
+        _prompt_cache.pop(name, None)
+        template = _load_prompt(name)
+        return {
+            "name": name,
+            "template": template,
+            "has_language_param": "{language}" in template,
+        }
     template = _load_prompt(name)
     return {
         "name": name,
