@@ -31,7 +31,6 @@ const tl2AutocopyCheckbox = document.getElementById('tl2-autocopy');
 const tl2AutosaveCheckbox = document.getElementById('tl2-autosave');
 const tl2AutotranslateCheckbox = document.getElementById('tl2-autotranslate');
 const tl2AutosavePath = document.getElementById('tl2-autosave-path');
-const tl2AutosavePathRow = document.getElementById('tl2-autosave-path-row');
 const tl2PathSuggestions = document.getElementById('tl2-path-suggestions');
 
 // ── Format panel elements ─────────────────────────────────────
