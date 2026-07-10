@@ -24,7 +24,7 @@ The popup has four tabs:
 - **OCR** — capture controls, progress, raw result, copy/download.
 - **Translation** — translate OCR result to a target language, with auto-copy/auto-save/auto-translate.
 - **Format** — format the translated text with a custom AI prompt, with auto-copy/auto-save/auto-format.
-- **Prompt** — configure the custom AI prompts used by Translation and Format.
+- **Prompts** — configure the custom AI prompts used by OCR, Dedup, Translation, and Format.
 
 ## Quick Start
 
@@ -76,11 +76,18 @@ The backend is fully usable as a standalone API — you can call any endpoint di
 
 Transcribes text from an image using a vision-capable AI model.
 
-**Request:** multipart form data with field `image` (required image file).
+**Request:** multipart form data with fields:
+- `image` (file, required) — the image to transcribe.
+- `prompt` (string, optional) — custom system prompt that overrides the default OCR prompt.
 
 ```sh
 curl -X POST "http://localhost:8765/ocr" \
   -F "image=@page.png"
+
+# With custom prompt
+curl -X POST "http://localhost:8765/ocr" \
+  -F "image=@page.png" \
+  -F "prompt=Transcribe all visible Japanese text"
 ```
 
 The backend validates the image with Pillow, encodes it as a data URL, and sends it to the configured AI model.
@@ -89,12 +96,19 @@ The backend validates the image with Pillow, encodes it as a data URL, and sends
 
 Removes duplicate or overlapping content from merged OCR text.
 
-**Request:** JSON body with field `text` (string).
+**Request:** JSON body with fields:
+- `text` (string, required) — the text to deduplicate.
+- `prompt` (string, optional) — custom system prompt that overrides the default dedup prompt.
 
 ```sh
 curl -X POST "http://localhost:8765/dedup" \
   -H "Content-Type: application/json" \
   -d '{"text":"first page\nfirst page\nsecond page"}'
+
+# With custom prompt
+curl -X POST "http://localhost:8765/dedup" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"...","prompt":"Remove duplicates and fix OCR errors"}'
 ```
 
 ### `POST /translate`
@@ -104,7 +118,7 @@ Translates text to a target language.
 **Request:** JSON body with fields:
 - `text` (string, required) — the text to translate.
 - `language` (string, required) — target language, e.g. `"Chinese"`, `"English"`.
-- `prompt` (string, optional) — custom system prompt that overrides the default translation prompt. When provided, the prompt is used as-is (the `{language}` variable is ignored).
+- `prompt` (string, optional) — custom system prompt that overrides the default translation prompt. When provided, the `{language}` template variable is ignored.
 
 ```sh
 curl -X POST "http://localhost:8765/translate" \
@@ -112,16 +126,13 @@ curl -X POST "http://localhost:8765/translate" \
   -d '{"text":"Hello world","language":"Chinese"}'
 ```
 
-### `POST /format`
-
-To save tokens and latency, the endpoint short-circuits the AI call when the input is already in the target language. Detection uses the `langdetect` library with a 20-character minimum and a fixed seed; the gate is bypassed whenever a custom `prompt` is provided (custom transforms are always sent to the model). When the AI is skipped, the 200 response includes three extra fields:
+To save tokens and latency, the endpoint short-circuits the AI call when the input is already in the target language. Detection uses `langdetect` with a 20-character minimum and a fixed seed; the gate is bypassed whenever a custom `prompt` is provided. When the AI is skipped, the response includes:
 
 - `skipped` (boolean) — `true` when the AI was bypassed.
-- `detected_language` (string|null) — ISO 639-1 code reported by `langdetect` (only set on the `same_language` path).
-- `skip_reason` (string) — either `"original_target"` (target is `Original`) or `"same_language"` (detected language matches the target).
+- `detected_language` (string|null) — ISO 639-1 code.
+- `skip_reason` (string) — `"original_target"` or `"same_language"`.
 
-The existing `text`, `model`, and `tokens_used` fields are always present; on the short-circuit path `model` is `""` and `tokens_used` is `0`. Older clients that read only `text` are unaffected.
-
+### `POST /format`
 
 Formats text using a user-provided custom AI prompt. Designed to run on the *output* of translation (or any text).
 
@@ -173,19 +184,32 @@ Returns `{"paths": ["ocr/output.txt", "ocr/notes.md", ...]}`. Directories have a
 
 ### `GET /prompts`
 
-Returns all available AI prompt templates (OCR, dedup, translate) as JSON.
+Returns all available AI prompt templates (ocr, dedup, translate, format) as JSON.
 
 ```sh
 curl "http://localhost:8765/prompts"
 ```
 
-### `GET /prompts/{name}`
+### `GET /prompts/{name}` · `PUT /prompts/{name}`
 
-Returns a single prompt template by name (`ocr`, `dedup`, or `translate`).
+Read or update a prompt template by name (`ocr`, `dedup`, `translate`, or `format`).
+
+The `translate` prompt supports per-language variants via the `?language=` query parameter (e.g. `?language=French` writes `translate.French.txt`). Other prompts ignore the parameter.
 
 ```sh
+# Read
 curl "http://localhost:8765/prompts/translate"
+
+# Read per-language
+curl "http://localhost:8765/prompts/translate?language=French"
+
+# Write (extension syncs on every keystroke)
+curl -X PUT "http://localhost:8765/prompts/ocr" \
+  -H "Content-Type: application/json" \
+  -d '{"template": "Transcribe all visible text in Japanese"}'
 ```
+
+Prompts are persisted to `backend/prompts/*.txt` on disk and survive backend restarts. Other apps or scripts can read and write them through the same API.
 
 ### Configuration
 
@@ -245,7 +269,7 @@ The extension lives in `extension/` and uses Manifest V3.
 Main files:
 
 - `manifest.json`: extension metadata, permissions, content script registration, and keyboard command.
-- `popup.html` and `popup.js`: popup UI with four tabs (OCR, Translation, Format, Prompt) for status, backend settings, language selection, custom prompts, and output actions.
+- `popup.html` and `popup.js`: popup UI with four tabs (OCR, Translation, Format, Prompts) for status, backend settings, language selection, custom prompts, and output actions.
 - `background.js`: capture orchestration, backend calls, fragment merging, retry state, and persistence.
 - `content.js`: selection overlay, saved-region editing, viewport reporting, and page scrolling.
 - `overlay.css`: region selection overlay styling.
@@ -257,7 +281,7 @@ Main files:
 | **OCR** | Start/stop capture, view status/progress, copy/download OCR result. |
 | **Translation** | Translate OCR result to a target language. Auto-copy, auto-save (with save path), and auto-translate checkboxes. |
 | **Format** | Format text with a custom AI prompt. Choose source (OCR or Translation), auto-copy, auto-save (with dedicated save path), and auto-format checkboxes. Auto-format fires automatically when translation completes. |
-| **Prompt** | Configure the two custom AI prompts: **Translation Prompt** (per-language) and **Format Prompt** (global). |
+| **Prompts** | Configure the four AI prompts: **OCR Prompt**, **Dedup Prompt**, **Translation Prompt** (per-language), and **Format Prompt**. All prompts sync to the backend so they can be used by other apps.
 
 ### Capture controls
 
@@ -322,8 +346,9 @@ Settings persisted to Chrome local storage:
 
 - Last region size and position.
 - Per-tab: OCR result, translation result, format result, status messages.
-- Format prompt (user-defined).
-- Translation prompts (per-language, user-defined).
+- OCR prompt, dedup prompt (user-defined, synced to backend).
+- Format prompt (user-defined, synced to backend).
+- Translation prompts (per-language, user-defined, synced to backend).
 - Save path autocomplete — queried in real time from the backend's `GET /paths` endpoint (with local history fallback).
 
 ## Development Notes
