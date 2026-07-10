@@ -778,6 +778,59 @@ async def save_text(request: SaveRequest) -> dict[str, str | bool]:
     return {"ok": True, "path": str(path)}
 
 
+@app.get("/paths")
+async def list_paths(prefix: str = "") -> dict[str, list[str]]:
+    """Return filesystem paths under save_root matching a prefix for autocomplete."""
+    try:
+        config = load_config()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    save_root_expanded = config.save_root.expanduser()
+    prefix = prefix.strip()
+
+    # Determine the directory to search
+    if prefix:
+        candidate = Path(prefix).expanduser()
+        search_dir = candidate if candidate.is_absolute() else save_root_expanded / candidate
+        # If prefix ends with a path separator or matches an existing directory, search inside it
+        if prefix.endswith("/") or prefix.endswith("\\") or (search_dir.is_dir() and search_dir != save_root_expanded / candidate.parent):
+            search_dir = search_dir if search_dir.is_dir() else search_dir.parent
+        else:
+            search_dir = search_dir.parent
+    else:
+        search_dir = save_root_expanded
+
+    # Guard against traversal
+    clean = Path(os.path.normpath(str(search_dir)))
+    try:
+        clean.relative_to(save_root_expanded)
+    except ValueError:
+        return {"paths": []}
+
+    if not search_dir.is_dir():
+        return {"paths": []}
+
+    # Build the prefix stem for filtering
+    prefix_lower = Path(prefix).name.lower() if prefix else ""
+
+    paths: list[str] = []
+    try:
+        for entry in sorted(search_dir.iterdir()):
+            if prefix_lower and not entry.name.lower().startswith(prefix_lower):
+                continue
+            rel = str(entry.relative_to(save_root_expanded))
+            if entry.is_dir():
+                rel += "/"
+            paths.append(rel)
+            if len(paths) >= 30:
+                break
+    except OSError:
+        pass
+
+    return {"paths": paths}
+
+
 @app.get("/prompts")
 async def list_prompts() -> dict[str, dict[str, str]]:
     """Return all available prompt templates."""

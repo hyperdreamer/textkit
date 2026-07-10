@@ -795,28 +795,41 @@ async function saveTl2Settings() {
 
 const PATH_HISTORY_KEY = 'tl2PathHistory';
 const MAX_PATH_HISTORY = 20;
+let _pathDebounceTimer = null;
 
 function loadPathSuggestions() {
-  chrome.storage.local.get(PATH_HISTORY_KEY, (r) => {
-    const history = r[PATH_HISTORY_KEY] || [];
-    tl2PathSuggestions.replaceChildren(...history.map((path) => {
+  // Initial load: fetch root-level paths from backend
+  fetchPathSuggestions('');
+}
+
+async function fetchPathSuggestions(prefix) {
+  try {
+    const resp = await fetch(`http://${hostInput.value || 'localhost'}:${portInput.value || 8765}/paths?prefix=${encodeURIComponent(prefix)}`);
+    const data = await resp.json().catch(() => ({}));
+    const paths = data.paths || [];
+    tl2PathSuggestions.replaceChildren(...paths.map((path) => {
       const option = document.createElement('option');
       option.value = path;
       return option;
     }));
-  });
+  } catch {
+    // Backend unreachable — keep existing suggestions
+  }
 }
 
 function updatePathSuggestions(current) {
   if (!current) return;
+  // Save to history for offline fallback
   chrome.storage.local.get(PATH_HISTORY_KEY, (r) => {
     let history = r[PATH_HISTORY_KEY] || [];
     history = history.filter(p => p !== current);
     history.unshift(current);
     if (history.length > MAX_PATH_HISTORY) history = history.slice(0, MAX_PATH_HISTORY);
     chrome.storage.local.set({ [PATH_HISTORY_KEY]: history });
-    loadPathSuggestions();
   });
+  // Debounce: fetch real filesystem paths after typing stops
+  clearTimeout(_pathDebounceTimer);
+  _pathDebounceTimer = setTimeout(() => fetchPathSuggestions(current), 300);
 }
 
 async function fetchWithTimeout(url, options = {}) {
