@@ -164,9 +164,8 @@ chrome.runtime.onMessage.addListener((message) => {
     chrome.storage.local.remove(`fmtFormatting:${currentTabId}`);
     setFmtProgress(message.text ? 'Formatting complete.' : (message.error || 'Formatting failed.'));
     updateFormatButtons();
-    // Auto-copy / auto-save formatted text
-    if (message.text && fmtAutocopy.checked) copyResult(fmtResult, fmtCopy);
-    if (message.text && fmtAutosave.checked) autoSaveFmt(message.text);
+    // Auto-copy / auto-save is handled by the background service worker
+    // (fmtAutoCopyIfEnabled / fmtAutoSaveIfEnabled).
   }
   if (message?.type === 'fmt:formatting') {
     if (message.tabId !== currentTabId) return;

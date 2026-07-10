@@ -242,6 +242,7 @@ async function handleStop() {
   captureControllers.get(tab.id)?.abort();
   handleTranslateStop(tab.id);
   handleFormatStop(tab.id);
+  // If in error state
   // If in error state (waiting for retry), finalize collected fragments now
   if (state.status === 'Error' && state.fragments?.length > 0) {
     await finalizePostCapture(tab.id, mergeFragments(state.fragments), state.fragments);
@@ -311,6 +312,7 @@ async function handleTranslateStart(msg) {
 
   try {
     translateControllers.set(tabId, controller);
+    startKeepAlive();
     timeoutId = setTimeout(() => {
       timedOut = true;
       controller.abort();
@@ -335,11 +337,12 @@ async function handleTranslateStart(msg) {
         await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
         chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
         if (translated) autoCopyIfEnabled(translated);
+        if (translated) autoCopyIfEnabled(translated);
         if (translated) autoSaveIfEnabled(translated);
         if (translated) autoFormatIfEnabled(tabId, translated, host, port);
         return { ok: true };
       }
-      const url = buildBackendEndpoint(host || DEFAULT_HOST, port || DEFAULT_PORT, `/translate?_=${Date.now()}`);
+      const url = buildBackendEndpoint
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -377,6 +380,7 @@ async function handleTranslateStart(msg) {
       chrome.storage.local.remove(`tl2Translating:${tabId}`);
       chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: false }).catch(() => {});
     }
+    if (captureControllers.size === 0 && translateControllers.size === 0 && formatControllers.size === 0) stopKeepAlive();
   }
 
   return { ok: true };
@@ -491,6 +495,12 @@ async function autoFormatIfEnabled(tabId, text, host, port) {
   if (!settings.fmtAutoFormat) return;
   const prompt = await chrome.storage.local.get('formatPrompt');
   if (!prompt.formatPrompt || !prompt.formatPrompt.trim()) return;
+  // Fall back to sync storage if caller didn't provide host/port (e.g. auto-translate path)
+  if (!host || port === undefined) {
+    const backend = await chrome.storage.sync.get({ ocrHost: 'localhost', ocrPort: 8765 });
+    host = backend.ocrHost;
+    port = backend.ocrPort;
+  }
   handleFormatStart({ tabId, text, prompt: prompt.formatPrompt.trim(), host, port })
     .catch(() => {});
 }
@@ -1151,6 +1161,48 @@ async function autoSaveIfEnabled(text) {
   } catch (e) {
     console.error('Auto-save failed:', e);
     chrome.notifications.create('auto-save-failed', {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'TextKit — Save failed',
+      message: e.message,
+      priority: 1
+    });
+  }
+}
+
+// ── Auto-copy / auto-save helpers (for auto-format) ──────────
+
+async function fmtAutoCopyIfEnabled(text) {
+  const { fmtAutoCopy } = await chrome.storage.sync.get({ fmtAutoCopy: false });
+  if (!fmtAutoCopy || !text) return;
+  copyToClipboard(text);
+  chrome.notifications.create('fmt-auto-copy', {
+    type: 'basic',
+    iconUrl: 'icons/icon128.png',
+    title: 'TextKit — Copied',
+    message: 'Formatted text copied to system clipboard.',
+    priority: 0
+  });
+}
+
+async function fmtAutoSaveIfEnabled(text) {
+  const { fmtAutoSave, fmtSavePath } = await chrome.storage.sync.get({
+    fmtAutoSave: false, fmtSavePath: ''
+  });
+  if (!fmtAutoSave || !fmtSavePath || !text) return;
+  try {
+    const result = await handleSaveTranslation({ text, path: fmtSavePath });
+    if (!result.ok) throw new Error(result.error || 'Save failed');
+    chrome.notifications.create('fmt-auto-save', {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'TextKit — Saved',
+      message: `Formatted text saved to ${result.path || fmtSavePath}.`,
+      priority: 0
+    });
+  } catch (e) {
+    console.error('Auto-save format failed:', e);
+    chrome.notifications.create('fmt-auto-save-failed', {
       type: 'basic',
       iconUrl: 'icons/icon128.png',
       title: 'TextKit — Save failed',
