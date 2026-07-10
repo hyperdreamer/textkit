@@ -87,7 +87,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     `fmtFormatting:${tabId}`,
     `retryState:${tabId}`,
     `preDedup:${tabId}`,
-    `postDedup:${tabId}`
+    `postDedup:${tabId}`,
+    `lastStatus:${tabId}`
   ]).catch(() => {});
 });
 // ── keyboard shortcut ──────────────────────────────────────────
@@ -337,12 +338,11 @@ async function handleTranslateStart(msg) {
         await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
         chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
         if (translated) autoCopyIfEnabled(translated);
-        if (translated) autoCopyIfEnabled(translated);
         if (translated) autoSaveIfEnabled(translated);
         if (translated) autoFormatIfEnabled(tabId, translated, host, port);
         return { ok: true };
       }
-      const url = buildBackendEndpoint
+      const url = buildBackendEndpoint(host || DEFAULT_HOST, port || DEFAULT_PORT, `/translate?_=${Date.now()}`);
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1179,48 +1179,6 @@ async function autoSaveIfEnabled(text) {
   } catch (e) {
     console.error('Auto-save failed:', e);
     chrome.notifications.create('auto-save-failed', {
-      type: 'basic',
-      iconUrl: 'icons/icon128.png',
-      title: 'TextKit — Save failed',
-      message: e.message,
-      priority: 1
-    });
-  }
-}
-
-// ── Auto-copy / auto-save helpers (for auto-format) ──────────
-
-async function fmtAutoCopyIfEnabled(text) {
-  const { fmtAutoCopy } = await chrome.storage.sync.get({ fmtAutoCopy: false });
-  if (!fmtAutoCopy || !text) return;
-  copyToClipboard(text);
-  chrome.notifications.create('fmt-auto-copy', {
-    type: 'basic',
-    iconUrl: 'icons/icon128.png',
-    title: 'TextKit — Copied',
-    message: 'Formatted text copied to system clipboard.',
-    priority: 0
-  });
-}
-
-async function fmtAutoSaveIfEnabled(text) {
-  const { fmtAutoSave, fmtSavePath } = await chrome.storage.sync.get({
-    fmtAutoSave: false, fmtSavePath: ''
-  });
-  if (!fmtAutoSave || !fmtSavePath || !text) return;
-  try {
-    const result = await handleSaveTranslation({ text, path: fmtSavePath });
-    if (!result.ok) throw new Error(result.error || 'Save failed');
-    chrome.notifications.create('fmt-auto-save', {
-      type: 'basic',
-      iconUrl: 'icons/icon128.png',
-      title: 'TextKit — Saved',
-      message: `Formatted text saved to ${result.path || fmtSavePath}.`,
-      priority: 0
-    });
-  } catch (e) {
-    console.error('Auto-save format failed:', e);
-    chrome.notifications.create('fmt-auto-save-failed', {
       type: 'basic',
       iconUrl: 'icons/icon128.png',
       title: 'TextKit — Save failed',

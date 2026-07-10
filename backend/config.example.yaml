@@ -21,7 +21,6 @@ max_text_chars: 200000
 ai:
   # Base URL for the provider API, without a trailing slash.
   # OpenAI-compatible providers must expose /v1/chat/completions.
-  # Anthropic-compatible providers must expose /v1/messages.
   api_base: "https://api.openai.com"
 
   # API key for the provider. Plaintext values are used directly.
@@ -29,7 +28,7 @@ ai:
   # (e.g. ``$OCR_API_KEY`` resolves ``os.getenv("OCR_API_KEY")``).
   # Alternatively set ``api_key_env`` to the name of an environment variable.
   # The backend also falls back to OCR_API_KEY and provider-specific defaults.
-  # Examples: $OCR_API_KEY, $OPENAI_API_KEY, $ANTHROPIC_API_KEY.
+  # Examples: $OCR_API_KEY, $OPENAI_API_KEY.
   api_key: "$OCR_API_KEY"
 
   # Vision-capable model name to use when no per-task override specifies one.

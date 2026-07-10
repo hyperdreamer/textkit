@@ -88,7 +88,8 @@ def _load_prompt(name: str, language: str | None = None) -> str:
 
 def _render_prompt(name: str, **kwargs: str) -> str:
     """Load a prompt and substitute template variables."""
-    template = _load_prompt(name)
+    language: str | None = kwargs.get("language")  # type: ignore[assignment]
+    template = _load_prompt(name, language)
     try:
         return template.format(**kwargs)
     except KeyError as e:
@@ -986,6 +987,8 @@ async def get_prompt(name: str, request: Request) -> dict[str, object]:
     file (e.g. ``?language=French`` writes ``translate.French.txt``).
     """
     language: str | None = request.query_params.get("language")
+    if language and any(c in language for c in ("/", "\\", "..")):
+        raise HTTPException(status_code=400, detail="Invalid language parameter")
     if name not in _DEFAULT_PROMPTS:
         raise HTTPException(status_code=404, detail=f"Unknown prompt: '{name}'")
     if request.method == "PUT":

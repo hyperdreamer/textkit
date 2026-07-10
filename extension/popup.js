@@ -938,16 +938,6 @@ function updatePathSuggestions(current) {
   _pathDebounceTimer = setTimeout(() => fetchPathSuggestions(current), 300);
 }
 
-async function fetchWithTimeout(url, options = {}) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 12 * 60 * 1000);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
 function normalizeBackendSettings(host, port) {
   let normalizedHost = String(host || 'localhost').trim();
   if (/^https?:\/\//i.test(normalizedHost)) {

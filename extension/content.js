@@ -221,7 +221,8 @@
     drawRegion();
   }
 
-  function onPointerUp() {
+  function onPointerUp(event) {
+    if (overlay) overlay.releasePointerCapture(event.pointerId);
     dragMode = null;
     dragStart = null;
     if (overlay) overlay.style.cursor = '';
@@ -324,7 +325,10 @@
     return new Promise((resolve) => {
       let lastY = window.scrollY;
       let stableFrames = 0;
+      const MAX_WAIT_MS = 5000;
+      const startTime = performance.now();
       const check = () => {
+        if (performance.now() - startTime > MAX_WAIT_MS) { resolve(); return; }
         const currentY = window.scrollY;
         if (Math.abs(currentY - lastY) < 0.5) {
           stableFrames++;
