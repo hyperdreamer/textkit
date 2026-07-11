@@ -375,7 +375,7 @@ async function handleTranslateStart(msg) {
     }
   } finally {
     clearTimeout(timeoutId);
-    if (translateControllers.get(tabId) === controller) {
+    if (controller && translateControllers.get(tabId) === controller) {
       translateControllers.delete(tabId);
       chrome.storage.local.remove(`tl2Translating:${tabId}`);
       chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: false }).catch(() => {});
@@ -874,22 +874,25 @@ async function autoTranslateIfEnabled(tabId, originalText) {
   // Abort any in-flight translation for this tab
   handleTranslateStop(tabId);
 
-  const controller = new AbortController();
-  translateControllers.set(tabId, controller);
+  let controller = null;
   let timedOut = false;
-  const timeoutId = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, BACKEND_TIMEOUT_MS);
+  let timeoutId = null;
 
-  updateState(tabId, { tl2Translating: true });
-  await chrome.storage.local.set({
-    [`tl2Translating:${tabId}`]: true,
-    [`tl2Status:${tabId}`]: `Translating to ${language}...`
-  });
-  await chrome.storage.local.remove(`tl2Result:${tabId}`);
-  chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: true }).catch(() => {});
   try {
+    controller = new AbortController();
+    translateControllers.set(tabId, controller);
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, BACKEND_TIMEOUT_MS);
+
+    updateState(tabId, { tl2Translating: true });
+    await chrome.storage.local.set({
+      [`tl2Translating:${tabId}`]: true,
+      [`tl2Status:${tabId}`]: `Translating to ${language}...`
+    });
+    await chrome.storage.local.remove(`tl2Result:${tabId}`);
+    chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: true }).catch(() => {});
     const key = `translatePrompt:${language}`;
     const stored = await chrome.storage.local.get(key);
     const url = await getBackendEndpoint('/translate');
@@ -921,7 +924,7 @@ async function autoTranslateIfEnabled(tabId, originalText) {
     chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: '', error: errorMessage }).catch(() => {});
   } finally {
     clearTimeout(timeoutId);
-    if (translateControllers.get(tabId) === controller) {
+    if (controller && translateControllers.get(tabId) === controller) {
       translateControllers.delete(tabId);
       chrome.storage.local.remove(`tl2Translating:${tabId}`);
       chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: false }).catch(() => {});
