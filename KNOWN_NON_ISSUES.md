@@ -112,4 +112,22 @@ keepalive would add complexity with no benefit.
 
 ---
 
-*Last updated: 2026-07-11 — post-Claude Code audit of dev-textkit branch*
+## 10. Debounce timers fire after popup close
+**File:** `extension/popup.js:30-32, 860, 877, 898, 1004`
+
+The debounced backend PUT timers (`_ocrSaveTimer`, `_dedupSaveTimer`, `_tlSaveTimer`, `_pathDebounceTimer`) fire their callbacks even after the popup closes. Phase 2 SWR on next open would overwrite unsynced localStorage changes with stale backend data if these timers were cleared on close.
+
+**Decision:** NOT fixing. The timers firing after close is required to guarantee backend sync completes. All callbacks have silent error handling — at most 3 tiny fire-and-forget PUTs. Clearing them on `pagehide` was attempted but caused a regression.
+
+---
+
+## 11. Format save path shares datalist ID with Translation save path
+**File:** `extension/popup.html:387`
+
+Both the Format save path input (`#fmt-save-path`) and Translation save path input (`#tl2-autosave-path`) reference `list="tl2-path-suggestions"` — the same `<datalist>`. 
+
+**Decision:** NOT fixing — correct by design. Both inputs share a single datalist because `updatePathSuggestions()` regenerates suggestions based on whichever input the user is currently typing in. Separate datalists would duplicate fetch logic with no benefit.
+
+---
+
+*Last updated: 2026-07-11 — post-Hermes audit of dev-textkit branch (343e599)*

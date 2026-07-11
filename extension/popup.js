@@ -973,7 +973,8 @@ function loadPathSuggestions() {
 
 async function fetchPathSuggestions(prefix) {
   try {
-    const resp = await fetch(`http://${hostInput.value || 'localhost'}:${portInput.value || 8765}/paths?prefix=${encodeURIComponent(prefix)}`);
+    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
+    const resp = await fetch(`http://${backend.host}:${backend.port}/paths?prefix=${encodeURIComponent(prefix)}`);
     const data = await resp.json().catch(() => ({}));
     const paths = data.paths || [];
     // If user typed a ~ prefix, prepend ~/ so the browser's <datalist>
