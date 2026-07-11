@@ -10,7 +10,7 @@
 | OCR prompt load/save | ✅ Exists | `popup.js:773-799` |
 | Dedup prompt load/save | ✅ Exists | `popup.js:801-827` |
 | Translate prompt per-language sync | ⚠️ Partial | Has gaps (see §3) |
-| Format prompt backend sync | ❌ Remove | Should be local-only (see §3.4) |
+| Format prompt backend sync | ✅ Synced | Init Phase 2 + debounced PUT |
 | Prompt initialization ordering | ⚠️ Sequential | Should be parallelized (see §5) |
 
 ---

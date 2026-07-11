@@ -138,7 +138,7 @@ Formats text using a user-provided custom AI prompt. Designed to run on the *out
 
 **Request:** JSON body with fields:
 - `text` (string, required) — the text to format.
-- `prompt` (string, required) — the system prompt sent to the AI model. Describes how to transform the text. Examples: `"Convert to ALL CAPS"`, `"Reformat as clean Markdown with headings and bullet points"`, `"Summarise this text in 3 bullet points"`.
+- `prompt` (string, optional) — custom system prompt that overrides the default format prompt. When omitted, the backend falls back to `backend/prompts/format.txt`. Examples: `"Convert to ALL CAPS"`, `"Reformat as clean Markdown with headings and bullet points"`, `"Summarise this text in 3 bullet points"`.
 
 ```sh
 curl -X POST "http://localhost:8765/format" \
@@ -189,8 +189,6 @@ Every AI endpoint (`/ocr`, `/dedup`, `/translate`) accepts an **optional** `prom
 **Shared prompt (omit `prompt`):** The backend uses the default template from `backend/prompts/{name}.txt`. All apps and the extension share the same prompt. Edit it once via the Prompts tab, `PUT /prompts/{name}`, or by editing the file directly.
 
 **Per-app override (include `prompt`):** Send your own prompt in the request body. The backend uses it *instead* of the disk file — no other app is affected. Your app can use whatever prompt logic it wants.
-
-Format (`/format`) is the exception: it always requires a prompt in the request (no disk default).
 
 ### `GET /prompts`
 
@@ -291,7 +289,7 @@ Main files:
 | **OCR** | Start/stop capture, view status/progress, copy/download OCR result. |
 | **Translation** | Translate OCR result to a target language. Auto-copy, auto-save (with save path), and auto-translate checkboxes. |
 | **Format** | Format text with a custom AI prompt. Choose source (OCR or Translation), auto-copy, auto-save (with dedicated save path), and auto-format checkboxes. Auto-format fires automatically when translation completes. |
-| **Prompts** | Configure the four AI prompts: **OCR Prompt**, **Dedup Prompt**, **Translation Prompt** (per-language), and **Format Prompt**. OCR, Dedup, and Translation prompts sync to the backend so they can be used by other apps. Format prompts are local-only (user-supplied per request). |
+| **Prompts** | Configure the four AI prompts: **OCR Prompt**, **Dedup Prompt**, **Translation Prompt** (per-language), and **Format Prompt**. All prompts sync to the backend so they can be used by other apps. |
 
 ### Capture controls
 
@@ -357,7 +355,7 @@ Settings persisted to Chrome local storage:
 - Last region size and position.
 - Per-tab: OCR result, translation result, format result, status messages.
 - OCR prompt, dedup prompt (user-defined, synced to backend after a short delay).
-- Format prompt (user-defined, local-only — not synced to backend).
+- Format prompt (user-defined, synced to backend after a short delay).
 - Translation prompts (per-language, user-defined, synced to backend after a short delay).
 - Save path autocomplete — queried in real time from the backend's `GET /paths` endpoint (with local history fallback).
 

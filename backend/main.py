@@ -141,7 +141,7 @@ class FormatRequest(BaseModel):
     """Request body accepted by the format endpoint."""
 
     text: str
-    prompt: str
+    prompt: str | None = None
 
 
 class SaveRequest(BaseModel):
@@ -669,17 +669,19 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
     )
 
 
-async def format_text(config: AIConfig, text: str, prompt: str) -> OCRResponse:
+async def format_text(config: AIConfig, text: str, prompt: str | None = None) -> OCRResponse:
     """Route a format request to the configured provider.
 
-    Uses the user-provided *prompt* directly as the system prompt.
+    Uses the user-provided *prompt* as the system prompt, falling back
+    to the template in ``backend/prompts/format.txt``.
     """
 
+    system_prompt = prompt if prompt else _render_prompt("format")
     cfg = _resolve_ai_config(config, config.text)
     return await _post_openai_chat_completion(
         cfg,
         [
-            {"role": "system", "content": prompt},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": text},
         ],
     )
@@ -862,7 +864,7 @@ async def format_text_endpoint(request: FormatRequest) -> Response:
         return JSONResponse(status_code=500, content=_error_payload("AI provider configuration is missing"))
 
     _validate_text_size(request.text, config)
-    _debug("format", f"request: {len(request.text)} chars prompt_len={len(request.prompt)}", enabled=config.debug)
+    _debug("format", f"request: {len(request.text)} chars custom_prompt={request.prompt is not None}", enabled=config.debug)
     _debug("format", "calling provider...", enabled=config.debug)
     result = await format_text(config.ai, request.text, request.prompt)
     _debug("format", f"AI returned {len(result.text)} chars model={result.model}", enabled=config.debug)

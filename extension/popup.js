@@ -30,6 +30,7 @@ const dedupPromptEl = document.getElementById('dedup-prompt');
 let _ocrSaveTimer = null;
 let _dedupSaveTimer = null;
 let _tlSaveTimer = null;
+let _fmtSaveTimer = null;
 
 // ── Translation panel elements ────────────────────────────────
 const tl2Language = document.getElementById('tl2-language');
@@ -274,10 +275,11 @@ async function init() {
   (async () => {
     let backend;
     try { backend = normalizeBackendSettings(hostInput.value, portInput.value); } catch { return; }
-    const [ocrRes, dedupRes, tlRes] = await Promise.allSettled([
+    const [ocrRes, dedupRes, tlRes, fmtRes] = await Promise.allSettled([
       _fetchWithTimeout(`http://${backend.host}:${backend.port}/prompts/ocr`, 3000).then(r => r.ok ? r.json() : null).catch(() => null),
       _fetchWithTimeout(`http://${backend.host}:${backend.port}/prompts/dedup`, 3000).then(r => r.ok ? r.json() : null).catch(() => null),
-      _fetchWithTimeout(`http://${backend.host}:${backend.port}/prompts/translate?language=${encodeURIComponent(tlLanguage.value)}`, 3000).then(r => r.ok ? r.json() : null).catch(() => null)
+      _fetchWithTimeout(`http://${backend.host}:${backend.port}/prompts/translate?language=${encodeURIComponent(tlLanguage.value)}`, 3000).then(r => r.ok ? r.json() : null).catch(() => null),
+      _fetchWithTimeout(`http://${backend.host}:${backend.port}/prompts/format`, 3000).then(r => r.ok ? r.json() : null).catch(() => null)
     ]);
     if (ocrRes.status === 'fulfilled' && ocrRes.value) {
       _applyIfDifferent(ocrPromptEl, ocrRes.value.template || '');
@@ -288,6 +290,9 @@ async function init() {
     if (tlRes.status === 'fulfilled' && tlRes.value) {
       _applyIfDifferent(translatePrompt, tlRes.value.template || '');
       updateTranslateHintFromBackend(tlRes.value);
+    }
+    if (fmtRes.status === 'fulfilled' && fmtRes.value) {
+      _applyIfDifferent(formatPrompt, fmtRes.value.template || '');
     }
   })();
 
@@ -887,9 +892,20 @@ async function saveDedupPrompt() {
 }
 
 function saveFormatPrompt() {
-  // Format prompt is per-request and is NOT synced to the backend.
   const value = formatPrompt.value.trim();
   chrome.storage.local.set({ formatPrompt: value });
+  // Debounced backend PUT (fire-and-forget)
+  clearTimeout(_fmtSaveTimer);
+  _fmtSaveTimer = setTimeout(() => {
+    try {
+      const backend = normalizeBackendSettings(hostInput.value, portInput.value);
+      fetch(`http://${backend.host}:${backend.port}/prompts/format`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ template: value })
+      });
+    } catch {}
+  }, 500);
 }
 
 function saveFormatSettings() {
