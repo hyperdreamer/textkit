@@ -627,6 +627,7 @@ async function runCaptureLoop(tab, region) {
         if (recheck?.changed) {
           atBottom = false;
           lastScrollY = recheck.scrollY;
+          await sleep(100);
           continue;
         }
         break;
@@ -639,9 +640,12 @@ async function runCaptureLoop(tab, region) {
 
       if (scrollResult?.atBottom) {
         if (!scrollResult.changed && fragments.length > 0) break;
-        atBottom = true; continue;
+        atBottom = true;
+        await sleep(100);
+        continue;
       }
       lastScrollY = scrollResult.scrollY;
+      await sleep(100);
     }
 
     const mergedText = mergeFragments(fragments);
@@ -756,6 +760,7 @@ async function resumeCaptureLoop(rs) {
         if (recheck?.changed) {
           atBottom = false;
           scrollY = recheck.scrollY;
+          await sleep(100);
           continue;
         }
         break;
@@ -768,9 +773,12 @@ async function resumeCaptureLoop(rs) {
 
       if (scrollResult?.atBottom) {
         if (!scrollResult.changed && fragments.length > 0) break;
-        atBottom = true; continue;
+        atBottom = true;
+        await sleep(100);
+        continue;
       }
       scrollY = scrollResult.scrollY;
+      await sleep(100);
     }
 
     const mergedText = mergeFragments(fragments);
