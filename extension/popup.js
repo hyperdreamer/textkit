@@ -12,6 +12,8 @@ const copyButton = document.getElementById('copy');
 const downloadButton = document.getElementById('download');
 const hostInput = document.getElementById('backend-host');
 const portInput = document.getElementById('backend-port');
+const settingsGear = document.getElementById('settings-gear');
+const settingsPanel = document.getElementById('backend-settings-panel');
 const autoscrollCheckbox = document.getElementById('ocr-autoscroll');
 const lastRegionEl = document.getElementById('last-region');
 
@@ -57,8 +59,7 @@ const panels = {
   'ocr-panel': document.getElementById('ocr-panel'),
   'translate-panel': document.getElementById('translate-panel'),
   'translation-panel': document.getElementById('translation-panel'),
-  'format-panel': document.getElementById('format-panel'),
-  'settings-panel': document.getElementById('settings-panel')
+  'format-panel': document.getElementById('format-panel')
 };
 
 let latestState = null;
@@ -92,6 +93,11 @@ downloadButton.addEventListener('click', downloadOcrText);
 resultEl.addEventListener('input', saveOcrText);
 hostInput.addEventListener('change', saveSettings);
 portInput.addEventListener('change', saveSettings);
+settingsGear.addEventListener('click', () => {
+  const isOpen = !settingsPanel.classList.contains('hidden');
+  settingsPanel.classList.toggle('hidden', isOpen);
+  settingsGear.classList.toggle('active', !isOpen);
+});
 autoscrollCheckbox.addEventListener('change', saveSettings);
 
 // ── Translate panel listeners ─────────────────────────────────

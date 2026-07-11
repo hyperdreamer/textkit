@@ -180,20 +180,101 @@
         cursor: pointer;
         white-space: nowrap;
       }
+    
+      .header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 14px 0;
+        background: #fff;
+      }
+      .header h1 {
+        margin: 0;
+        color: #111827;
+        font-size: 16px;
+        font-weight: 650;
+      }
+      .header .version {
+        color: #94a3b8;
+        font-size: 11px;
+      }
+      .gear-btn {
+        margin-left: auto;
+        padding: 2px 5px;
+        border: 1px solid transparent;
+        border-radius: 4px;
+        background: none;
+        color: #64748b;
+        font-size: 15px;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .gear-btn:hover {
+        background: #e2e8f0;
+        color: #334155;
+      }
+      .gear-btn.active {
+        background: #e2e8f0;
+        color: #2563eb;
+      }
+
+      .settings-panel {
+        margin: 10px 14px 0;
+        padding: 8px 10px;
+        border: 1px solid #cbd5e1;
+        border-radius: 6px;
+        background: #f1f5f9;
+      }
+      .backend-row {
+        display: flex;
+        gap: 8px;
+      }
+      .backend-row label {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        color: #334155;
+        font-size: 12px;
+      }
+      .backend-row input {
+        box-sizing: border-box;
+        width: 120px;
+        padding: 4px 6px;
+        border: 1px solid #cbd5e1;
+        border-radius: 4px;
+        background: #fff;
+        color: #111827;
+        font-size: 12px;
+      }
+      .backend-row input:focus {
+        border-color: #2563eb;
+        outline: none;
+      }
     </style>
   </head>
   <body>
+    <div class="header">
+      <h1>TextKit</h1>
+      <span class="version">v0.0.0</span>
+      <button id="settings-gear" class="gear-btn" title="Backend Settings">⚙</button>
+    </div>
+
+    <div id="backend-settings-panel" class="settings-panel hidden">
+      <div class="backend-row">
+        <label>Host <input id="backend-host" type="text" placeholder="localhost"></label>
+        <label>Port <input id="backend-port" type="number" placeholder="8765"></label>
+      </div>
+    </div>
+
     <div class="tab-bar">
       <button class="tab active" data-panel="ocr-panel">OCR</button>
       <button class="tab" data-panel="translation-panel">Translation</button>
       <button class="tab" data-panel="format-panel">Format</button>
       <button class="tab" data-panel="translate-panel">Prompts</button>
-      <button class="tab" data-panel="settings-panel">Settings</button>
     </div>
 
     <!-- OCR Panel -->
     <main id="ocr-panel">
-      <h1>TextKit</h1>
       <section class="stats" aria-label="Capture status">
         <div class="stat"><span class="label">Status</span><span id="status" class="value">Idle</span></div>
         <div class="stat"><span class="label">Current page</span><span id="current-page" class="value">0</span></div>
@@ -316,14 +397,6 @@
       </div>
     </main>
 
-    <!-- Settings Panel -->
-    <main id="settings-panel" class="hidden">
-      <h1>Backend</h1>
-      <div class="settings">
-        <label>Host <input id="backend-host" type="text" placeholder="localhost"></label>
-        <label>Port <input id="backend-port" type="number" placeholder="8765"></label>
-      </div>
-    </main>
 
     <script src="popup.js"></script>
   </body>
