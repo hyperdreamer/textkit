@@ -182,6 +182,16 @@ curl "http://localhost:8765/paths?prefix=~/Documents"
 
 Returns `{"paths": ["ocr/output.txt", "ocr/notes.md", ...]}`. Directories have a trailing `/`. Results are capped at 30 entries.
 
+### Prompts: shared defaults vs per-request overrides
+
+Every AI endpoint (`/ocr`, `/dedup`, `/translate`) accepts an **optional** `prompt` field. This gives you two usage patterns that coexist without conflict:
+
+**Shared prompt (omit `prompt`):** The backend uses the default template from `backend/prompts/{name}.txt`. All apps and the extension share the same prompt. Edit it once via the Prompts tab, `PUT /prompts/{name}`, or by editing the file directly.
+
+**Per-app override (include `prompt`):** Send your own prompt in the request body. The backend uses it *instead* of the disk file — no other app is affected. Your app can use whatever prompt logic it wants.
+
+Format (`/format`) is the exception: it always requires a prompt in the request (no disk default).
+
 ### `GET /prompts`
 
 Returns all available AI prompt templates (ocr, dedup, translate, format) as JSON.
