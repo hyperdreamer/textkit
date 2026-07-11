@@ -41,12 +41,20 @@ PROMPTS_DIR = Path(__file__).with_name("prompts")
 _prompt_cache: dict[str, str] = {}
 
 _DEFAULT_PROMPTS: dict[str, str] = {
-    "ocr": "Transcribe all text visible in this image. Return only the transcription.",
-    "dedup": (
-        "Remove any duplicate or overlapping content. Return only the deduplicated text. "
-        "Do not reword or change any text -- only remove exact duplicates and overlapping passages."
+    "ocr": (
+        "Transcribe all visible text from this image. Return only the transcription, "
+        "verbatim \u2014 preserve exact wording, punctuation, and line breaks. "
+        "Do not add commentary, interpret, or guess illegible text."
     ),
-    "translate": "Translate the following text to {language}. Return only the translation.",
+    "dedup": (
+        "Remove duplicate and overlapping passages from the text below. "
+        "Return only the deduplicated result. Do not reword, paraphrase, or add "
+        "anything \u2014 only strip repeated or overlapping content."
+    ),
+    "translate": (
+        "Translate the following text to {language}. Return only the translation. "
+        "Preserve paragraph structure and line breaks."
+    ),
     "format": "",
 }
 

@@ -1,1 +1,1 @@
-Translate the following text to {language}. Return only the translation.
+Translate the following text to {language}. Return only the translation. Preserve paragraph structure and line breaks.

@@ -1,1 +1,1 @@
-Remove any duplicate or overlapping content. Return only the deduplicated text. Do not reword or change any text -- only remove exact duplicates and overlapping passages.
+Remove duplicate and overlapping passages from the text below. Return only the deduplicated result. Do not reword, paraphrase, or add anything — only strip repeated or overlapping content.

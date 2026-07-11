@@ -1,1 +1,1 @@
-Transcribe all text visible in this image. Return only the transcription.
+Transcribe all visible text from this image. Return only the transcription, verbatim — preserve exact wording, punctuation, and line breaks. Do not add commentary, interpret, or guess illegible text.
