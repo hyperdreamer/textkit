@@ -20,10 +20,16 @@ const lastRegionEl = document.getElementById('last-region');
 // ── Translate panel elements ──────────────────────────────────
 const tlLanguage = document.getElementById('tl-language');
 const translatePrompt = document.getElementById('translate-prompt');
+const translatePromptHint = document.getElementById('translate-prompt-hint');
 
 // ── OCR/Dedup prompt elements ─────────────────────────────────
 const ocrPromptEl = document.getElementById('ocr-prompt');
 const dedupPromptEl = document.getElementById('dedup-prompt');
+
+// ── Debounce timers for backend PUTs ──────────────────────────
+let _ocrSaveTimer = null;
+let _dedupSaveTimer = null;
+let _tlSaveTimer = null;
 
 // ── Translation panel elements ────────────────────────────────
 const tl2Language = document.getElementById('tl2-language');
@@ -240,14 +246,50 @@ async function init() {
     if (storedStatus) lastStoredStatus = storedStatus;
   }
 
-  // Load translate language and prompt
+  // Load translate language (set value so translatePrompt key is correct)
   const tl = await chrome.storage.local.get('tlLanguage');
   if (tl.tlLanguage) tlLanguage.value = tl.tlLanguage;
-  await loadPromptForLanguage();
 
-  // Load OCR and dedup prompts
-  await loadOcrPrompt();
-  await loadDedupPrompt();
+  // ── Phase 1: populate ALL prompt textareas from localStorage (instant) ──
+  const ocrStored = await chrome.storage.local.get('ocrPrompt');
+  ocrPromptEl.value = ocrStored.ocrPrompt || '';
+  const dedupStored = await chrome.storage.local.get('dedupPrompt');
+  dedupPromptEl.value = dedupStored.dedupPrompt || '';
+  const tlLangKey = `translatePrompt:${tlLanguage.value}`;
+  const tlStored = await chrome.storage.local.get(tlLangKey);
+  translatePrompt.value = tlStored[tlLangKey] || '';
+  const fmtStored = await chrome.storage.local.get('formatPrompt');
+  formatPrompt.value = fmtStored.formatPrompt || '';
+  updateTranslateHintFromValue();
+
+  // ── Phase 2: non-blocking backend refresh in parallel (SWR) ──
+  const _fetchWithTimeout = (url, ms) => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), ms);
+    return fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(t));
+  };
+  const _applyIfDifferent = (el, newValue) => {
+    if (newValue != null && el.value !== newValue) el.value = newValue;
+  };
+  (async () => {
+    let backend;
+    try { backend = normalizeBackendSettings(hostInput.value, portInput.value); } catch { return; }
+    const [ocrRes, dedupRes, tlRes] = await Promise.allSettled([
+      _fetchWithTimeout(`http://${backend.host}:${backend.port}/prompts/ocr`, 3000).then(r => r.ok ? r.json() : null).catch(() => null),
+      _fetchWithTimeout(`http://${backend.host}:${backend.port}/prompts/dedup`, 3000).then(r => r.ok ? r.json() : null).catch(() => null),
+      _fetchWithTimeout(`http://${backend.host}:${backend.port}/prompts/translate?language=${encodeURIComponent(tlLanguage.value)}`, 3000).then(r => r.ok ? r.json() : null).catch(() => null)
+    ]);
+    if (ocrRes.status === 'fulfilled' && ocrRes.value) {
+      _applyIfDifferent(ocrPromptEl, ocrRes.value.template || '');
+    }
+    if (dedupRes.status === 'fulfilled' && dedupRes.value) {
+      _applyIfDifferent(dedupPromptEl, dedupRes.value.template || '');
+    }
+    if (tlRes.status === 'fulfilled' && tlRes.value) {
+      _applyIfDifferent(translatePrompt, tlRes.value.template || '');
+      updateTranslateHintFromBackend(tlRes.value);
+    }
+  })();
 
   // Load Translation tab language and last result (per-tab) -- single atomic load
   const tl2k = (k) => currentTabId ? `${k}:${currentTabId}` : k;
@@ -349,39 +391,79 @@ async function init() {
 }
 
 // ── Per-language prompt persistence ───────────────────────────
+function updateTranslateHintFromValue() {
+  // Used when only the textarea value is known (e.g. on input, after
+  // localStorage seed, or after explicit edits). Without backend metadata
+  // we infer the flag from the literal text.
+  if (!translatePromptHint) return;
+  const hasVar = translatePrompt.value.includes('{language}');
+  if (hasVar) {
+    translatePromptHint.textContent = `{language} will be replaced with "${tlLanguage.value}"`;
+    translatePromptHint.classList.remove('hidden');
+  } else {
+    translatePromptHint.classList.add('hidden');
+  }
+}
+
+function updateTranslateHintFromBackend(data) {
+  if (!translatePromptHint) return;
+  if (data && data.has_language_param === true) {
+    translatePromptHint.textContent = `{language} will be replaced with "${tlLanguage.value}"`;
+    translatePromptHint.classList.remove('hidden');
+  } else {
+    translatePromptHint.classList.add('hidden');
+  }
+}
+
 async function loadPromptForLanguage() {
   const lang = tlLanguage.value;
-  // Backend wins over local storage
-  try {
-    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
-    const resp = await fetch(`http://${backend.host}:${backend.port}/prompts/translate?language=${encodeURIComponent(lang)}`);
-    if (resp.ok) {
-      const data = await resp.json();
-      translatePrompt.value = data.template || '';
-      return;
-    }
-  } catch {}
-  // Fallback to local storage
   const key = `translatePrompt:${lang}`;
-  const result = await chrome.storage.local.get(key);
-  translatePrompt.value = result[key] || '';
+  // Phase 1: seed from localStorage (instant)
+  const stored = await chrome.storage.local.get(key);
+  translatePrompt.value = stored[key] || '';
+  updateTranslateHintFromValue();
+  // Phase 2: backend refresh (SWR) — applied only if different
+  (async () => {
+    try {
+      const backend = normalizeBackendSettings(hostInput.value, portInput.value);
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 3000);
+      const resp = await fetch(`http://${backend.host}:${backend.port}/prompts/translate?language=${encodeURIComponent(lang)}`, { signal: ctrl.signal }).catch(() => null);
+      clearTimeout(t);
+      if (resp && resp.ok) {
+        const data = await resp.json();
+        if (data.template != null && translatePrompt.value !== data.template) {
+          translatePrompt.value = data.template;
+        }
+        updateTranslateHintFromBackend(data);
+      }
+    } catch {}
+  })();
 }
 
 async function saveTlState() {
   const lang = tlLanguage.value;
+  const value = translatePrompt.value;
   await chrome.storage.local.set({
     tlLanguage: lang,
-    [`translatePrompt:${lang}`]: translatePrompt.value
+    [`translatePrompt:${lang}`]: value
   });
-  // Sync to backend (fire-and-forget)
-  try {
-    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
-    fetch(`http://${backend.host}:${backend.port}/prompts/translate?language=${encodeURIComponent(lang)}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ template: translatePrompt.value })
-    });
-  } catch {}
+  updateTranslateHintFromValue();
+  // Debounced backend PUT (fire-and-forget)
+  clearTimeout(_tlSaveTimer);
+  _tlSaveTimer = setTimeout(() => {
+    try {
+      const backend = normalizeBackendSettings(hostInput.value, portInput.value);
+      const url = value.includes('{language}')
+        ? `http://${backend.host}:${backend.port}/prompts/translate`
+        : `http://${backend.host}:${backend.port}/prompts/translate?language=${encodeURIComponent(lang)}`;
+      fetch(url, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ template: value })
+      });
+    } catch {}
+  }, 500);
 }
 
 async function saveTl2Language() {
@@ -770,74 +852,44 @@ async function saveFormatResult() {
 }
 
 // ── OCR/Dedup prompt load/save ────────────────────────────────
-async function loadOcrPrompt() {
-  // Backend wins over local storage
-  try {
-    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
-    const resp = await fetch(`http://${backend.host}:${backend.port}/prompts/ocr`);
-    if (resp.ok) {
-      const data = await resp.json();
-      ocrPromptEl.value = data.template || '';
-      return;
-    }
-  } catch {}
-  const result = await chrome.storage.local.get('ocrPrompt');
-  ocrPromptEl.value = result.ocrPrompt || '';
-}
-
 async function saveOcrPrompt() {
   const value = ocrPromptEl.value;
   await chrome.storage.local.set({ ocrPrompt: value });
-  try {
-    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
-    fetch(`http://${backend.host}:${backend.port}/prompts/ocr`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ template: value })
-    });
-  } catch {}
-}
-
-async function loadDedupPrompt() {
-  // Backend wins over local storage
-  try {
-    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
-    const resp = await fetch(`http://${backend.host}:${backend.port}/prompts/dedup`);
-    if (resp.ok) {
-      const data = await resp.json();
-      dedupPromptEl.value = data.template || '';
-      return;
-    }
-  } catch {}
-  const result = await chrome.storage.local.get('dedupPrompt');
-  dedupPromptEl.value = result.dedupPrompt || '';
+  // Debounced backend PUT (fire-and-forget)
+  clearTimeout(_ocrSaveTimer);
+  _ocrSaveTimer = setTimeout(() => {
+    try {
+      const backend = normalizeBackendSettings(hostInput.value, portInput.value);
+      fetch(`http://${backend.host}:${backend.port}/prompts/ocr`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ template: value })
+      });
+    } catch {}
+  }, 500);
 }
 
 async function saveDedupPrompt() {
   const value = dedupPromptEl.value;
   await chrome.storage.local.set({ dedupPrompt: value });
-  try {
-    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
-    fetch(`http://${backend.host}:${backend.port}/prompts/dedup`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ template: value })
-    });
-  } catch {}
+  // Debounced backend PUT (fire-and-forget)
+  clearTimeout(_dedupSaveTimer);
+  _dedupSaveTimer = setTimeout(() => {
+    try {
+      const backend = normalizeBackendSettings(hostInput.value, portInput.value);
+      fetch(`http://${backend.host}:${backend.port}/prompts/dedup`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ template: value })
+      });
+    } catch {}
+  }, 500);
 }
 
 function saveFormatPrompt() {
+  // Format prompt is per-request and is NOT synced to the backend.
   const value = formatPrompt.value.trim();
   chrome.storage.local.set({ formatPrompt: value });
-  // Sync to backend (fire-and-forget)
-  try {
-    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
-    fetch(`http://${backend.host}:${backend.port}/prompts/format`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ template: value })
-    });
-  } catch {}
 }
 
 function saveFormatSettings() {

@@ -250,6 +250,8 @@
         border-color: #2563eb;
         outline: none;
       }
+      .hint { display: block; font-size: 11px; color: #888; margin-top: 4px; }
+      .hidden { display: none; }
     </style>
   </head>
   <body>
@@ -318,6 +320,7 @@
         </label>
       </div>
       <textarea id="translate-prompt" placeholder="Custom AI prompt (per language). E.g.: Translate to formal academic Chinese." style="min-height:200px"></textarea>
+      <span id="translate-prompt-hint" class="hint hidden"></span>
       <h1>Format Prompt</h1>
       <textarea id="format-prompt" placeholder="Custom formatting prompt. E.g.: Reformat this text as clean Markdown with headings and bullet points." style="min-height:100px;margin-top:8px"></textarea>
     </main>
