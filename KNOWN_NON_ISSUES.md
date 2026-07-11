@@ -112,4 +112,4 @@ keepalive would add complexity with no benefit.
 
 ---
 
-*Last updated: 2026-07-11 — post-Claude Code audit of dev-prompts-api branch*
+*Last updated: 2026-07-11 — post-Claude Code audit of dev-textkit branch*

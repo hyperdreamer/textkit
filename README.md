@@ -184,7 +184,7 @@ Returns `{"paths": ["ocr/output.txt", "ocr/notes.md", ...]}`. Directories have a
 
 ### Prompts: shared defaults vs per-request overrides
 
-Every AI endpoint (`/ocr`, `/dedup`, `/translate`) accepts an **optional** `prompt` field. This gives you two usage patterns that coexist without conflict:
+Every AI endpoint (`/ocr`, `/dedup`, `/translate`, `/format`) accepts an **optional** `prompt` field. This gives you two usage patterns that coexist without conflict:
 
 **Shared prompt (omit `prompt`):** The backend uses the default template from `backend/prompts/{name}.txt`. All apps and the extension share the same prompt. Edit it once via the Prompts tab, `PUT /prompts/{name}`, or by editing the file directly.
 

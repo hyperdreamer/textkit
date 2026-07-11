@@ -171,26 +171,17 @@ if (data.has_language_param) {
 }
 ```
 
-### 3.4 Format Prompt: Local-Only
+### 3.4 Format Prompt: Synced (Reconsidered)
 
-**Design decision**: Format prompt should NOT sync with the backend.
+**Original design**: Format prompt should NOT sync with the backend — always user-supplied per-request.
 
-**Current issue**: `saveFormatPrompt()` (`popup.js:829-841`) fires `PUT /prompts/format`, which saves to `backend/prompts/format.txt`. This violates the constraint that format is always user-supplied.
+**Reconsidered** (commit `93c2237`): The backend already had `format.txt` on disk and `format` in `_DEFAULT_PROMPTS`. Making `FormatRequest.prompt` optional (`str | None = None`) and falling back to the disk default is consistent with the other three endpoints. The extension syncs format like the others — Phase 2 init fetch + debounced PUT.
 
-**Fix**:
-- Remove the `PUT /prompts/format` call from `saveFormatPrompt()`
-- Keep `localStorage.formatPrompt` as the sole storage
-- Remove `"format": ""` from `_DEFAULT_PROMPTS` and the `format.txt` file (or keep as a documentation example only, not loaded by the API)
-- Backend `/prompts/format` endpoint should be removed or return 404 — it's conceptually not a backend-managed template
-
-**Revised `saveFormatPrompt()`**:
-```javascript
-function saveFormatPrompt() {
-    const value = formatPrompt.value.trim();
-    chrome.storage.local.set({ formatPrompt: value });
-    // No backend sync — format prompt is user-supplied per-request
-}
-```
+**Final state**:
+- `POST /format` without `prompt` → uses `backend/prompts/format.txt`
+- `POST /format` with `prompt` → overrides the disk file
+- Extension `saveFormatPrompt()` → debounced PUT to `/prompts/format`
+- Extension init Phase 2 → fetches from `/prompts/format`
 
 ### 3.5 Translate Prompt Save Logic
 
