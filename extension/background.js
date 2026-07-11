@@ -12,8 +12,8 @@ let _backendBaseUrlExpiry = 0;
 
 async function getBackendEndpoint(path) {
   if (!_backendBaseUrl || Date.now() > _backendBaseUrlExpiry) {
-    const items = await chrome.storage.sync.get({ ocrHost: DEFAULT_HOST, ocrPort: DEFAULT_PORT });
-    _backendBaseUrl = buildBackendEndpoint(items.ocrHost, items.ocrPort, '');
+    const items = await chrome.storage.sync.get({ backendHost: DEFAULT_HOST, backendPort: DEFAULT_PORT });
+    _backendBaseUrl = buildBackendEndpoint(items.backendHost, items.backendPort, '');
     _backendBaseUrlExpiry = Date.now() + 60_000;  // cache 1 minute
   }
   return _backendBaseUrl + path;
@@ -497,9 +497,9 @@ async function autoFormatIfEnabled(tabId, text, host, port) {
   if (!prompt.formatPrompt || !prompt.formatPrompt.trim()) return;
   // Fall back to sync storage if caller didn't provide host/port (e.g. auto-translate path)
   if (!host || port === undefined) {
-    const backend = await chrome.storage.sync.get({ ocrHost: 'localhost', ocrPort: 8765 });
-    host = backend.ocrHost;
-    port = backend.ocrPort;
+    const backend = await chrome.storage.sync.get({ backendHost: 'localhost', backendPort: 8765 });
+    host = backend.backendHost;
+    port = backend.backendPort;
   }
   handleFormatStart({ tabId, text, prompt: prompt.formatPrompt.trim(), host, port })
     .catch(() => {});

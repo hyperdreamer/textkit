@@ -188,6 +188,7 @@
       <button class="tab" data-panel="translation-panel">Translation</button>
       <button class="tab" data-panel="format-panel">Format</button>
       <button class="tab" data-panel="translate-panel">Prompts</button>
+      <button class="tab" data-panel="settings-panel">Settings</button>
     </div>
 
     <!-- OCR Panel -->
@@ -200,10 +201,6 @@
         <div class="stat"><span class="label">Progress</span><span id="short-progress" class="value">Ready</span></div>
       </section>
       <div id="progress">Ready</div>
-      <div class="settings">
-        <label>Host <input id="ocr-host" type="text" placeholder="localhost"></label>
-        <label>Port <input id="ocr-port" type="number" placeholder="8765"></label>
-      </div>
       <div class="option-row">
         <label><input id="ocr-autoscroll" type="checkbox" checked> Auto-scroll</label>
       </div>
@@ -316,6 +313,15 @@
         <button id="fmt-copy" type="button" disabled>Copy</button>
         <button id="fmt-save" type="button" disabled>Save</button>
         <button id="fmt-download" type="button" disabled>Download</button>
+      </div>
+    </main>
+
+    <!-- Settings Panel -->
+    <main id="settings-panel" class="hidden">
+      <h1>Backend</h1>
+      <div class="settings">
+        <label>Host <input id="backend-host" type="text" placeholder="localhost"></label>
+        <label>Port <input id="backend-port" type="number" placeholder="8765"></label>
       </div>
     </main>
 

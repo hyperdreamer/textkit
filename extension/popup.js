@@ -10,8 +10,8 @@ const stopButton = document.getElementById('stop');
 const retryButton = document.getElementById('retry');
 const copyButton = document.getElementById('copy');
 const downloadButton = document.getElementById('download');
-const hostInput = document.getElementById('ocr-host');
-const portInput = document.getElementById('ocr-port');
+const hostInput = document.getElementById('backend-host');
+const portInput = document.getElementById('backend-port');
 const autoscrollCheckbox = document.getElementById('ocr-autoscroll');
 const lastRegionEl = document.getElementById('last-region');
 
@@ -57,7 +57,8 @@ const panels = {
   'ocr-panel': document.getElementById('ocr-panel'),
   'translate-panel': document.getElementById('translate-panel'),
   'translation-panel': document.getElementById('translation-panel'),
-  'format-panel': document.getElementById('format-panel')
+  'format-panel': document.getElementById('format-panel'),
+  'settings-panel': document.getElementById('settings-panel')
 };
 
 let latestState = null;
@@ -199,11 +200,20 @@ async function init() {
   currentTabId = tab?.id || null;
 
   const items = await chrome.storage.sync.get({
-    ocrHost: 'localhost', ocrPort: 8765,
-    ocrAutoscroll: true
+    backendHost: 'localhost', backendPort: 8765,
+    ocrAutoscroll: true,
+    ocrHost: null, ocrPort: null
   });
-  hostInput.value = items.ocrHost;
-  portInput.value = items.ocrPort;
+  // Migrate old storage keys
+  if (items.ocrHost !== null && items.backendHost === 'localhost') {
+    await chrome.storage.sync.set({ backendHost: items.ocrHost, backendPort: items.ocrPort || 8765 });
+    await chrome.storage.sync.remove(['ocrHost', 'ocrPort']);
+    hostInput.value = items.ocrHost;
+    portInput.value = items.ocrPort || 8765;
+  } else {
+    hostInput.value = items.backendHost;
+    portInput.value = items.backendPort;
+  }
   tlLanguage.value = tlLanguage.value || 'original';
   tl2Language.value = tl2Language.value || 'original';
   autoscrollCheckbox.checked = items.ocrAutoscroll;
@@ -407,8 +417,8 @@ async function saveSettings() {
     return;
   }
   await chrome.storage.sync.set({
-    ocrHost: backend.host,
-    ocrPort: backend.port,
+    backendHost: backend.host,
+    backendPort: backend.port,
     ocrAutoscroll: autoscrollCheckbox.checked
   });
   hostInput.value = backend.host;
