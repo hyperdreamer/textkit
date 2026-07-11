@@ -545,26 +545,28 @@ This is already implemented in `main.py:97-107`. The error message tells the use
 ## 7. Implementation Checklist
 
 ### Backend Changes
-- [ ] Remove `"format"` from `_DEFAULT_PROMPTS` dict (or keep as empty string but document it's not managed)
-- [ ] Consider removing `format.txt` from `backend/prompts/` (or rename to `format.txt.example`)
+- [x] Remove `"format"` from `_DEFAULT_PROMPTS` dict (or keep as empty string but document it's not managed)
+- [x] Consider removing `format.txt` from `backend/prompts/` (or rename to `format.txt.example`)
 
 ### Extension Changes (popup.js)
-- [ ] **Phase 1**: Populate textareas from localStorage before any network calls (instant render)
-- [ ] **Phase 2**: Parallelize `loadOcrPrompt()`, `loadDedupPrompt()`, `loadPromptForLanguage()` via `Promise.allSettled()`
-- [ ] **Timeout**: Add 3-second timeout to backend GET requests during load
-- [ ] **saveFormatPrompt()**: Remove `PUT /prompts/format` backend sync
-- [ ] **saveTlState()**: Use `has_language_param` check to decide whether to save as base template (no `?language=`) or per-language override (`?language=<lang>`)
-- [ ] **{language} hint UI**: Add a small label that appears when `has_language_param` is true, saying `{language}` will be replaced with current language selection
-- [ ] **Debounce**: Debounce backend PUT requests by 500ms (keep localStorage save immediate)
-- [ ] **Empty prompt semantics**: When prompt textarea is empty, don't send prompt field in requests (let backend use its default)
+- [x] **Phase 1**: Populate textareas from localStorage before any network calls (instant render)
+- [x] **Phase 2**: Parallelize `loadOcrPrompt()`, `loadDedupPrompt()`, `loadPromptForLanguage()` via `Promise.allSettled()`
+- [x] **Timeout**: Add 3-second timeout to backend GET requests during load
+- [x] **saveFormatPrompt()**: Remove `PUT /prompts/format` backend sync
+- [x] **saveTlState()**: Use `has_language_param` check to decide whether to save as base template (no `?language=`) or per-language override (`?language=<lang>`)
+- [x] **{language} hint UI**: Add a small label that appears when `has_language_param` is true, saying `{language}` will be replaced with current language selection
+- [x] **Debounce**: Debounce backend PUT requests by 500ms (keep localStorage save immediate)
+- [x] **Empty prompt semantics**: When prompt textarea is empty, don't send prompt field in requests (let backend use its default)
 
 ### Extension Changes (popup.html)
-- [ ] Add `#translate-prompt-hint` element (hidden by default, shown when `has_language_param` is true)
-- [ ] Add `#save-status` indicator for "Saved locally" / "Synced to backend" feedback
+- [x] Add `#translate-prompt-hint` element (hidden by default, shown when `has_language_param` is true)
+- [ ] ~~Add `#save-status` indicator for "Saved locally" / "Synced to backend" feedback~~ (deferred)
 
 ### Extension Changes (background.js)
-- [ ] No changes needed — already reads prompts from localStorage and includes in requests
-- [ ] Verify empty prompt handling: if `stored.ocrPrompt` is falsy, don't append `prompt` FormData field
+- [x] No changes needed — already reads prompts from localStorage and includes in requests
+- [x] Verify empty prompt handling: if `stored.ocrPrompt` is falsy, don't append `prompt` FormData field
+
+**Status: IMPLEMENTED** — commit `2e187a0` on `dev-textkit`
 
 ---
 

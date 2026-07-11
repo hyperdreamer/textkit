@@ -203,7 +203,7 @@ curl "http://localhost:8765/prompts/translate"
 # Read per-language
 curl "http://localhost:8765/prompts/translate?language=French"
 
-# Write (extension syncs on every keystroke)
+# Write (extension syncs after a short delay)
 curl -X PUT "http://localhost:8765/prompts/ocr" \
   -H "Content-Type: application/json" \
   -d '{"template": "Transcribe all visible text in Japanese"}'
@@ -281,7 +281,7 @@ Main files:
 | **OCR** | Start/stop capture, view status/progress, copy/download OCR result. |
 | **Translation** | Translate OCR result to a target language. Auto-copy, auto-save (with save path), and auto-translate checkboxes. |
 | **Format** | Format text with a custom AI prompt. Choose source (OCR or Translation), auto-copy, auto-save (with dedicated save path), and auto-format checkboxes. Auto-format fires automatically when translation completes. |
-| **Prompts** | Configure the four AI prompts: **OCR Prompt**, **Dedup Prompt**, **Translation Prompt** (per-language), and **Format Prompt**. All prompts sync to the backend so they can be used by other apps.
+| **Prompts** | Configure the four AI prompts: **OCR Prompt**, **Dedup Prompt**, **Translation Prompt** (per-language), and **Format Prompt**. OCR, Dedup, and Translation prompts sync to the backend so they can be used by other apps. Format prompts are local-only (user-supplied per request). |
 
 ### Capture controls
 
@@ -346,9 +346,9 @@ Settings persisted to Chrome local storage:
 
 - Last region size and position.
 - Per-tab: OCR result, translation result, format result, status messages.
-- OCR prompt, dedup prompt (user-defined, synced to backend).
-- Format prompt (user-defined, synced to backend).
-- Translation prompts (per-language, user-defined, synced to backend).
+- OCR prompt, dedup prompt (user-defined, synced to backend after a short delay).
+- Format prompt (user-defined, local-only — not synced to backend).
+- Translation prompts (per-language, user-defined, synced to backend after a short delay).
 - Save path autocomplete — queried in real time from the backend's `GET /paths` endpoint (with local history fallback).
 
 ## Development Notes
