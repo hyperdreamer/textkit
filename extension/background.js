@@ -616,7 +616,21 @@ async function runCaptureLoop(tab, region) {
         break;
       }
 
-      if (atBottom) break;
+      if (atBottom) {
+        // Lazy content (author notes, comments) may not have loaded
+        // when we marked atBottom. Wait then try one more scroll.
+        await sleep(500);
+        const recheck = await chrome.tabs.sendMessage(tab.id, {
+          type: 'page:scroll-down',
+          overlapPx: OVERLAP_PX
+        });
+        if (recheck?.changed) {
+          atBottom = false;
+          lastScrollY = recheck.scrollY;
+          continue;
+        }
+        break;
+      }
 
       const scrollResult = await chrome.tabs.sendMessage(tab.id, {
         type: 'page:scroll-down',
@@ -733,7 +747,19 @@ async function resumeCaptureLoop(rs) {
         break;
       }
 
-      if (atBottom) break;
+      if (atBottom) {
+        await sleep(500);
+        const recheck = await chrome.tabs.sendMessage(tab.id, {
+          type: 'page:scroll-down',
+          overlapPx: OVERLAP_PX
+        });
+        if (recheck?.changed) {
+          atBottom = false;
+          scrollY = recheck.scrollY;
+          continue;
+        }
+        break;
+      }
 
       const scrollResult = await chrome.tabs.sendMessage(tab.id, {
         type: 'page:scroll-down',
