@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TextKit",
-  "version": "2.0.5",
+  "version": "2.0.6",
   "description": "Select a page region, OCR repeated viewport captures, and download merged text.",
   "permissions": [
     "activeTab",
