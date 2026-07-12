@@ -492,8 +492,9 @@ function handleFormatStop(tabId) {
 }
 
 async function autoFormatIfEnabled(tabId, text, host, port) {
-  const settings = await chrome.storage.sync.get({ fmtAutoFormat: false });
+  const settings = await chrome.storage.sync.get({ fmtAutoFormat: false, fmtSourceVal: 'translation' });
   if (!settings.fmtAutoFormat) return;
+  if (settings.fmtSourceVal === 'ocr') return;
   const prompt = await chrome.storage.local.get('formatPrompt');
   if (!prompt.formatPrompt || !prompt.formatPrompt.trim()) return;
   // Fall back to sync storage if caller didn't provide host/port (e.g. auto-translate path)

@@ -687,7 +687,7 @@ async def format_text(config: AIConfig, text: str, prompt: str | None = None) ->
     )
 
 
-app = FastAPI(title="TextKit Backend v2.0.4")
+app = FastAPI(title="TextKit Backend v2.0.5")
 
 
 def _error_payload(error: str) -> dict[str, str | int | None]:
