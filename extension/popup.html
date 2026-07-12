@@ -182,10 +182,11 @@
       }
     
       .header {
+        position: relative;
         display: flex;
         align-items: center;
         gap: 8px;
-        padding: 10px 14px 0 4px;
+        padding: 10px 14px 0 14px;
         background: #fff;
       }
       .header h1 {
@@ -199,7 +200,11 @@
         font-size: 11px;
       }
       .gear-btn {
-        margin-left: auto;
+        position: absolute;
+        right: 6px;
+        top: 50%;
+        transform: translateY(-50%);
+        margin-left: 0;
         padding: 2px 5px;
         border: 1px solid transparent;
         border-radius: 4px;
@@ -257,7 +262,7 @@
   <body>
     <div class="header">
       <h1>TextKit</h1>
-      <span class="version">v2.0.2</span>
+      <span class="version">v2.0.3</span>
       <button id="settings-gear" class="gear-btn" title="Backend Settings">⚙</button>
     </div>
 
