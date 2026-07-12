@@ -3,6 +3,7 @@ const DEFAULT_HOST = 'localhost';
 const DEFAULT_PORT = 8765;
 const OVERLAP_PX = 50;
 const AFTER_SEND_DELAY_MS = 0;
+const DEFAULT_CAPTURE_INTERVAL_MS = 100;
 const BACKEND_TIMEOUT_MS = 12 * 60 * 1000;
 const MAX_CAPTURE_PAGES = 500;
 const LOCAL_BACKEND_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
@@ -561,6 +562,9 @@ async function runCaptureLoop(tab, region) {
 
     while (true) {
       if (state.stopRequested) break;
+      const { captureIntervalMs } = await chrome.storage.sync.get({
+        captureIntervalMs: DEFAULT_CAPTURE_INTERVAL_MS
+      });
       const pageNumber = fragments.length + 1;
       updateState(tabId, {
         currentPage: pageNumber,
@@ -627,7 +631,7 @@ async function runCaptureLoop(tab, region) {
         if (recheck?.changed) {
           atBottom = false;
           lastScrollY = recheck.scrollY;
-          await sleep(100);
+          await sleep(captureIntervalMs);
           continue;
         }
         break;
@@ -641,11 +645,11 @@ async function runCaptureLoop(tab, region) {
       if (scrollResult?.atBottom) {
         if (!scrollResult.changed && fragments.length > 0) break;
         atBottom = true;
-        await sleep(100);
+        await sleep(captureIntervalMs);
         continue;
       }
       lastScrollY = scrollResult.scrollY;
-      await sleep(100);
+      await sleep(captureIntervalMs);
     }
 
     const mergedText = mergeFragments(fragments);
@@ -693,6 +697,9 @@ async function resumeCaptureLoop(rs) {
       if (state.stopRequested) break;
       // Check autoscroll setting
       const { ocrAutoscroll } = await chrome.storage.sync.get({ ocrAutoscroll: true });
+      const { captureIntervalMs } = await chrome.storage.sync.get({
+        captureIntervalMs: DEFAULT_CAPTURE_INTERVAL_MS
+      });
       if (!ocrAutoscroll && fragments.length > 0) {
         updateState(tabId, { progress: 'Single capture complete (autoscroll off).' });
         break;
@@ -760,7 +767,7 @@ async function resumeCaptureLoop(rs) {
         if (recheck?.changed) {
           atBottom = false;
           scrollY = recheck.scrollY;
-          await sleep(100);
+          await sleep(captureIntervalMs);
           continue;
         }
         break;
@@ -774,11 +781,11 @@ async function resumeCaptureLoop(rs) {
       if (scrollResult?.atBottom) {
         if (!scrollResult.changed && fragments.length > 0) break;
         atBottom = true;
-        await sleep(100);
+        await sleep(captureIntervalMs);
         continue;
       }
       scrollY = scrollResult.scrollY;
-      await sleep(100);
+      await sleep(captureIntervalMs);
     }
 
     const mergedText = mergeFragments(fragments);

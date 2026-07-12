@@ -257,7 +257,7 @@
   <body>
     <div class="header">
       <h1>TextKit</h1>
-      <span class="version">v2.0.0</span>
+      <span class="version">v2.0.1</span>
       <button id="settings-gear" class="gear-btn" title="Backend Settings">⚙</button>
     </div>
 
@@ -286,6 +286,7 @@
       <div id="progress">Ready</div>
       <div class="option-row">
         <label><input id="ocr-autoscroll" type="checkbox" checked> Auto-scroll</label>
+        <label>Capture interval (ms) <input id="ocr-capture-interval" type="number" min="50" max="2000" value="100"></label>
       </div>
       <textarea id="result" placeholder="Merged OCR text will appear here."></textarea>
       <div class="actions">

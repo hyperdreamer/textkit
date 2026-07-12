@@ -15,6 +15,7 @@ const portInput = document.getElementById('backend-port');
 const settingsGear = document.getElementById('settings-gear');
 const settingsPanel = document.getElementById('backend-settings-panel');
 const autoscrollCheckbox = document.getElementById('ocr-autoscroll');
+const captureIntervalInput = document.getElementById('ocr-capture-interval');
 const lastRegionEl = document.getElementById('last-region');
 
 // ── Translate panel elements ──────────────────────────────────
@@ -105,6 +106,7 @@ settingsGear.addEventListener('click', () => {
   settingsGear.classList.toggle('active', !isOpen);
 });
 autoscrollCheckbox.addEventListener('change', saveSettings);
+captureIntervalInput.addEventListener('change', saveSettings);
 
 // ── Translate panel listeners ─────────────────────────────────
 tlLanguage.addEventListener('change', () => { onTlLanguageChange(); syncLanguage('prompt'); });
@@ -214,6 +216,7 @@ async function init() {
   const items = await chrome.storage.sync.get({
     backendHost: 'localhost', backendPort: 8765,
     ocrAutoscroll: true,
+    captureIntervalMs: 100,
     ocrHost: null, ocrPort: null
   });
   // Migrate old storage keys
@@ -229,6 +232,7 @@ async function init() {
   tlLanguage.value = tlLanguage.value || 'original';
   tl2Language.value = tl2Language.value || 'original';
   autoscrollCheckbox.checked = items.ocrAutoscroll;
+  captureIntervalInput.value = items.captureIntervalMs;
 
   const resultKey = currentTabId ? `lastResult:${currentTabId}` : null;
   // Get live state first so renderState has the right mergedText
@@ -504,10 +508,14 @@ async function saveSettings() {
     progressEl.textContent = e.message;
     return;
   }
+  const intervalVal = parseInt(captureIntervalInput.value, 10);
+  const captureIntervalMs = (Number.isFinite(intervalVal) && intervalVal >= 50 && intervalVal <= 2000)
+    ? intervalVal : 100;
   await chrome.storage.sync.set({
     backendHost: backend.host,
     backendPort: backend.port,
-    ocrAutoscroll: autoscrollCheckbox.checked
+    ocrAutoscroll: autoscrollCheckbox.checked,
+    captureIntervalMs
   });
   hostInput.value = backend.host;
   portInput.value = backend.port;
