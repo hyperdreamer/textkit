@@ -302,9 +302,9 @@ async function init() {
 
   // Load Translation tab language and last result (per-tab) -- single atomic load
   const tl2k = (k) => currentTabId ? `${k}:${currentTabId}` : k;
-  const tl2Keys = currentTabId ? [tl2k('tl2Language'), tl2k('tl2Result'), tl2k('tl2Status'), tl2k('tl2Translating')] : [];
-  const tl2 = await chrome.storage.local.get(tl2Keys);
-  if (tl2[tl2k('tl2Language')]) tl2Language.value = tl2[tl2k('tl2Language')];
+  const tl2Keys = currentTabId ? [tl2k('tl2Result'), tl2k('tl2Status'), tl2k('tl2Translating')] : [];
+  const tl2 = await chrome.storage.local.get([...tl2Keys, 'tl2Language']);
+  if (tl2.tl2Language) tl2Language.value = tl2.tl2Language;
   if (tl2[tl2k('tl2Result')]) { tl2Result.value = tl2[tl2k('tl2Result')]; tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = false; }
   if (tl2[tl2k('tl2Status')]) {
     // Clear stale "Translating..." state from previous session
@@ -476,8 +476,7 @@ async function saveTlState() {
 }
 
 async function saveTl2Language() {
-  if (!currentTabId) return;
-  await chrome.storage.local.set({ [`tl2Language:${currentTabId}`]: tl2Language.value });
+  await chrome.storage.local.set({ tl2Language: tl2Language.value });
 }
 
 function syncLanguage(source) {

@@ -80,7 +80,6 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   chrome.storage.local.remove([
     `lastResult:${tabId}`,
     `tl2Result:${tabId}`,
-    `tl2Language:${tabId}`,
     `tl2Status:${tabId}`,
     `tl2Translating:${tabId}`,
     `fmtResult:${tabId}`,
@@ -868,10 +867,9 @@ async function autoTranslateIfEnabled(tabId, originalText) {
   });
   if (!ocrAutoTranslate) return;
 
-  // Read language from Translation tab's per-tab setting
-  const tl2LangKey = `tl2Language:${tabId}`;
-  const tl2Lang = await chrome.storage.local.get(tl2LangKey);
-  const language = tl2Lang[tl2LangKey] || 'original';
+  // Read language from the global Translation tab setting
+  const tl2Lang = await chrome.storage.local.get('tl2Language');
+  const language = tl2Lang.tl2Language || 'original';
   // "Original" with no custom prompt → skip (nothing to do)
   if (language === 'original') {
     const promptKey = 'translatePrompt:original';
