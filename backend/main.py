@@ -687,7 +687,7 @@ async def format_text(config: AIConfig, text: str, prompt: str | None = None) ->
     )
 
 
-app = FastAPI(title="TextKit Backend v2.0.7")
+app = FastAPI(title="TextKit Backend v2.0.8")
 
 
 def _error_payload(error: str) -> dict[str, str | int | None]:
@@ -975,6 +975,21 @@ async def list_paths(prefix: str = "") -> dict[str, list[str]]:
     return {"paths": paths}
 
 
+def _read_prompt_direct(name: str, language: str | None = None) -> str | None:
+    """Read a prompt file directly from disk, bypassing the cache.
+
+    Returns None when no file exists (caller should use _DEFAULT_PROMPTS fallback).
+    """
+    if language:
+        specific_path = PROMPTS_DIR / f"{name}.{language}.txt"
+        if specific_path.is_file():
+            return specific_path.read_text(encoding="utf-8").strip()
+    prompt_path = PROMPTS_DIR / f"{name}.txt"
+    if prompt_path.is_file():
+        return prompt_path.read_text(encoding="utf-8").strip()
+    return None
+
+
 @app.get("/prompts")
 async def list_prompts() -> dict[str, dict[str, str]]:
     """Return all available prompt templates."""
@@ -983,7 +998,9 @@ async def list_prompts() -> dict[str, dict[str, str]]:
         for entry in sorted(PROMPTS_DIR.iterdir()):
             if entry.suffix == ".txt":
                 name = entry.stem
-                prompts[name] = _load_prompt(name)
+                content = _read_prompt_direct(name)
+                if content is not None:
+                    prompts[name] = content
     for name, default in _DEFAULT_PROMPTS.items():
         prompts.setdefault(name, default)
     return {"prompts": prompts}
@@ -1024,7 +1041,9 @@ async def get_prompt(name: str, request: Request) -> dict[str, object]:
         if language:
             result["language"] = language
         return result
-    template = _load_prompt(name, language)
+    template = _read_prompt_direct(name, language)
+    if template is None:
+        template = _DEFAULT_PROMPTS.get(name, "")
     result = {
         "name": name,
         "template": template,
