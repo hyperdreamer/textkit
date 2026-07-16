@@ -268,9 +268,14 @@
 
     <div id="backend-settings-panel" class="settings-panel hidden">
       <div class="backend-row">
-        <label>Host <input id="backend-host" type="text" placeholder="localhost"></label>
-        <label>Port <input id="backend-port" type="number" placeholder="8765"></label>
+        <label>Backend host <input id="backend-host" type="text" placeholder="localhost"></label>
+        <label>Backend port <input id="backend-port" type="number" placeholder="8765"></label>
       </div>
+      <div class="backend-row">
+        <label>File bridge host <input id="file-bridge-host" type="text" placeholder="localhost"></label>
+        <label>File bridge port <input id="file-bridge-port" type="number" placeholder="8766"></label>
+      </div>
+      <span class="hint">Leave the file bridge host blank to use the main backend settings during migration.</span>
     </div>
 
     <div class="tab-bar">

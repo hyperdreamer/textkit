@@ -1,5 +1,5 @@
 # Server bind address. Defaults to "127.0.0.1" when omitted.
-# Use "0.0.0.0" only on a trusted network; the backend exposes OCR and save APIs.
+# Use "0.0.0.0" only on a trusted network; the backend exposes local AI APIs.
 host: "127.0.0.1"
 
 # Server port. Defaults to 8765 when omitted.

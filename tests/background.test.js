@@ -561,6 +561,26 @@ test('backend endpoint cache is invalidated when host settings change', async ()
   assert.equal(await harness.context.getBackendEndpoint('/ocr'), 'http://localhost:9876/ocr');
 });
 
+test('file bridge endpoint uses separate settings and invalidates its cache', async () => {
+  const harness = createBackgroundHarness({
+    syncValues: { fileBridgeHost: '127.0.0.1', fileBridgePort: 8766 }
+  });
+  assert.equal(await harness.context.getFileBridgeEndpoint('/save'), 'http://127.0.0.1:8766/save');
+  harness.syncValues.fileBridgePort = 9777;
+  assert.equal(await harness.context.getFileBridgeEndpoint('/save'), 'http://127.0.0.1:8766/save');
+
+  harness.events.onStorageChanged.emit({ fileBridgePort: { oldValue: 8766, newValue: 9777 } }, 'sync');
+  assert.equal(await harness.context.getFileBridgeEndpoint('/save'), 'http://127.0.0.1:9777/save');
+});
+
+test('file bridge endpoint falls back to the main backend during migration', async () => {
+  const harness = createBackgroundHarness({
+    syncValues: { backendHost: 'localhost', backendPort: 8765, fileBridgeHost: '' }
+  });
+
+  assert.equal(await harness.context.getFileBridgeEndpoint('/save'), 'http://localhost:8765/save');
+});
+
 test('a non-OCR capture failure finalizes fragments already collected', async () => {
   const harness = createBackgroundHarness();
   const state = harness.context.getState(1);

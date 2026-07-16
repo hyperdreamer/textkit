@@ -12,6 +12,8 @@ const copyButton = document.getElementById('copy');
 const downloadButton = document.getElementById('download');
 const hostInput = document.getElementById('backend-host');
 const portInput = document.getElementById('backend-port');
+const fileBridgeHostInput = document.getElementById('file-bridge-host');
+const fileBridgePortInput = document.getElementById('file-bridge-port');
 const settingsGear = document.getElementById('settings-gear');
 const settingsPanel = document.getElementById('backend-settings-panel');
 const autoscrollCheckbox = document.getElementById('ocr-autoscroll');
@@ -104,6 +106,7 @@ let currentTabId = null;
 let userEditedResult = false;
 let lastStoredStatus = '';
 const LOCAL_BACKEND_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+const FILE_BRIDGE_DEFAULT_PORT = 8766;
 
 // ── Tab switching ─────────────────────────────────────────────
 tabs.forEach(tab => {
@@ -130,6 +133,8 @@ downloadButton.addEventListener('click', downloadOcrText);
 resultEl.addEventListener('input', saveOcrText);
 hostInput.addEventListener('change', saveSettings);
 portInput.addEventListener('change', saveSettings);
+fileBridgeHostInput.addEventListener('change', saveFileBridgeSettings);
+fileBridgePortInput.addEventListener('change', saveFileBridgeSettings);
 settingsGear.addEventListener('click', () => {
   const isOpen = !settingsPanel.classList.contains('hidden');
   settingsPanel.classList.toggle('hidden', isOpen);
@@ -257,6 +262,7 @@ async function init() {
 
   const items = await chrome.storage.sync.get({
     backendHost: 'localhost', backendPort: 8765,
+    fileBridgeHost: '', fileBridgePort: FILE_BRIDGE_DEFAULT_PORT,
     ocrAutoscroll: true,
     captureIntervalMs: 100,
     ocrHost: null, ocrPort: null
@@ -271,6 +277,8 @@ async function init() {
     hostInput.value = items.backendHost;
     portInput.value = items.backendPort;
   }
+  fileBridgeHostInput.value = items.fileBridgeHost || '';
+  fileBridgePortInput.value = items.fileBridgePort || FILE_BRIDGE_DEFAULT_PORT;
   tlLanguage.value = tlLanguage.value || 'original';
   tl2Language.value = tl2Language.value || 'original';
   autoscrollCheckbox.checked = items.ocrAutoscroll;
@@ -575,6 +583,37 @@ async function saveSettings() {
   });
   hostInput.value = backend.host;
   portInput.value = backend.port;
+}
+
+async function saveFileBridgeSettings() {
+  const rawHost = fileBridgeHostInput.value.trim();
+  if (!rawHost) {
+    let port;
+    try {
+      port = normalizeBackendSettings('localhost', fileBridgePortInput.value || FILE_BRIDGE_DEFAULT_PORT).port;
+    } catch (e) {
+      progressEl.textContent = e.message;
+      return;
+    }
+    await chrome.storage.sync.set({ fileBridgeHost: '', fileBridgePort: port });
+    fileBridgeHostInput.value = '';
+    fileBridgePortInput.value = port;
+    return;
+  }
+
+  let fileBridge;
+  try {
+    fileBridge = normalizeBackendSettings(rawHost, fileBridgePortInput.value || FILE_BRIDGE_DEFAULT_PORT);
+  } catch (e) {
+    progressEl.textContent = e.message;
+    return;
+  }
+  await chrome.storage.sync.set({
+    fileBridgeHost: fileBridge.host,
+    fileBridgePort: fileBridge.port
+  });
+  fileBridgeHostInput.value = fileBridge.host;
+  fileBridgePortInput.value = fileBridge.port;
 }
 
 // ── OCR actions ───────────────────────────────────────────────
@@ -1049,8 +1088,18 @@ function loadPathSuggestions() {
 
 async function fetchPathSuggestions(prefix) {
   try {
-    const backend = normalizeBackendSettings(hostInput.value, portInput.value);
-    const resp = await fetch(`http://${backend.host}:${backend.port}/paths?prefix=${encodeURIComponent(prefix)}`);
+    const items = await chrome.storage.sync.get({
+      backendHost: 'localhost',
+      backendPort: 8765,
+      fileBridgeHost: '',
+      fileBridgePort: FILE_BRIDGE_DEFAULT_PORT
+    });
+    const hasFileBridgeHost = String(items.fileBridgeHost || '').trim().length > 0;
+    const fileBridge = normalizeBackendSettings(
+      hasFileBridgeHost ? items.fileBridgeHost : items.backendHost,
+      hasFileBridgeHost ? items.fileBridgePort : items.backendPort
+    );
+    const resp = await fetch(`http://${fileBridge.host}:${fileBridge.port}/paths?prefix=${encodeURIComponent(prefix)}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json().catch(() => ({}));
     const paths = data.paths || [];

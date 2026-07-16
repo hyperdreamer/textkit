@@ -145,13 +145,6 @@ class FormatRequest(BaseModel):
     prompt: str | None = None
 
 
-class SaveRequest(BaseModel):
-    """Request body accepted by the save endpoint."""
-
-    text: str
-    path: str
-
-
 @dataclass(frozen=True)
 class TimeoutConfig:
     """Per-phase HTTP timeouts for AI provider calls (all in seconds)."""
@@ -928,103 +921,6 @@ async def format_text_endpoint(request: FormatRequest) -> Response:
         media_type="application/json",
         headers={"Connection": "close"},
     )
-
-
-@app.post("/save")
-async def save_text(request: SaveRequest) -> dict[str, str | bool]:
-    """Write text to a local path on the backend machine."""
-
-    try:
-        config = load_config()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    raw_path = request.path.strip()
-    if not raw_path:
-        raise HTTPException(status_code=400, detail="Missing save path")
-
-    _validate_text_size(request.text, config)
-    save_root_expanded = config.save_root.expanduser()
-    save_root = save_root_expanded.resolve()
-    candidate = Path(raw_path).expanduser()
-    path = candidate if candidate.is_absolute() else save_root_expanded / candidate
-
-    # Guard: collapse .. (prevents traversal) without resolving symlinks (allows ~/Ramdisk)
-    clean = Path(os.path.normpath(str(path)))
-    try:
-        clean.relative_to(save_root_expanded)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Save path must stay under configured save_root: {save_root}",
-        ) from exc
-
-    path = path.resolve()
-
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(request.text, encoding="utf-8")
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to save text: {exc.strerror or exc}") from exc
-    return {"ok": True, "path": str(path)}
-
-
-@app.get("/paths")
-async def list_paths(prefix: str = "") -> dict[str, list[str]]:
-    """Return filesystem paths under save_root matching a prefix for autocomplete."""
-    try:
-        config = load_config()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    save_root_expanded = config.save_root.expanduser()
-    prefix = prefix.strip()
-
-    # Determine the directory to search
-    if prefix:
-        candidate = Path(prefix).expanduser()
-        search_dir = candidate if candidate.is_absolute() else save_root_expanded / candidate
-        # If prefix ends with a path separator or matches an existing directory, search inside it
-        if prefix.endswith("/") or prefix.endswith("\\") or (search_dir.is_dir() and search_dir != save_root_expanded / candidate.parent):
-            search_dir = search_dir if search_dir.is_dir() else search_dir.parent
-        else:
-            search_dir = search_dir.parent
-    else:
-        search_dir = save_root_expanded
-
-    # Guard against traversal
-    clean = Path(os.path.normpath(str(search_dir)))
-    try:
-        clean.relative_to(save_root_expanded)
-    except ValueError:
-        return {"paths": []}
-
-    if not search_dir.is_dir():
-        return {"paths": []}
-
-    # Build the prefix stem for filtering from the raw input (not expanded path)
-    prefix_lower = ""
-    if prefix:
-        raw_name = Path(prefix).name.lower()
-        # "~" or "~/" means "show all in that dir" — no filtering
-        if raw_name and raw_name != "~":
-            prefix_lower = raw_name
-
-    paths: list[str] = []
-    try:
-        for entry in sorted(search_dir.iterdir()):
-            if prefix_lower and not entry.name.lower().startswith(prefix_lower):
-                continue
-            rel = str(entry.relative_to(save_root_expanded))
-            if entry.is_dir():
-                rel += "/"
-            paths.append(rel)
-            if len(paths) >= 30:
-                break
-    except OSError:
-        pass
-
-    return {"paths": paths}
 
 
 def _read_prompt_direct(name: str, language: str | None = None) -> str | None:

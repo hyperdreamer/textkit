@@ -95,6 +95,8 @@ function createPopupHarness(options = {}) {
   };
   document.getElementById('backend-host').value = 'localhost';
   document.getElementById('backend-port').value = '8765';
+  document.getElementById('file-bridge-host').value = '';
+  document.getElementById('file-bridge-port').value = '8766';
   document.getElementById('tl-language').value = 'original';
   document.getElementById('tl2-language').value = 'original';
 
@@ -219,4 +221,38 @@ test('path suggestions fall back to local history when the backend fails', async
     harness.elements.get('tl2-path-suggestions').children.map((option) => option.value),
     ['notes/today.md', 'notes/archive.md']
   );
+});
+
+test('path suggestions use configured file bridge settings', async () => {
+  let requestedUrl = '';
+  const harness = createPopupHarness({
+    syncData: { fileBridgeHost: '127.0.0.1', fileBridgePort: 8766 },
+    fetch: async (url) => {
+      requestedUrl = String(url);
+      return { ok: true, json: async () => ({ paths: ['notes/today.md'] }) };
+    }
+  });
+
+  await harness.context.fetchPathSuggestions('notes/');
+
+  assert.equal(requestedUrl, 'http://127.0.0.1:8766/paths?prefix=notes%2F');
+  assert.deepEqual(
+    harness.elements.get('tl2-path-suggestions').children.map((option) => option.value),
+    ['notes/today.md']
+  );
+});
+
+test('path suggestions fall back to main backend settings during migration', async () => {
+  let requestedUrl = '';
+  const harness = createPopupHarness({
+    syncData: { backendHost: 'localhost', backendPort: 9876, fileBridgeHost: '' },
+    fetch: async (url) => {
+      requestedUrl = String(url);
+      return { ok: true, json: async () => ({ paths: [] }) };
+    }
+  });
+
+  await harness.context.fetchPathSuggestions('');
+
+  assert.equal(requestedUrl, 'http://localhost:9876/paths?prefix=');
 });

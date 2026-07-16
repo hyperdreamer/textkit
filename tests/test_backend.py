@@ -166,3 +166,18 @@ def test_prompt_put_returns_422_for_invalid_model(client: TestClient) -> None:
 
     assert response.status_code == 422
     assert "template" in response.json()["error"]
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "kwargs"),
+    [
+        ("post", "/save", {"json": {"text": "hello", "path": "notes.txt"}}),
+        ("get", "/paths", {}),
+    ],
+)
+def test_file_bridge_routes_are_not_exposed_by_textkit(
+    client: TestClient, method: str, path: str, kwargs: dict[str, object]
+) -> None:
+    response = getattr(client, method)(path, **kwargs)
+
+    assert response.status_code == 404

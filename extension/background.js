@@ -1,6 +1,7 @@
 
 const DEFAULT_HOST = 'localhost';
 const DEFAULT_PORT = 8765;
+const FILE_BRIDGE_DEFAULT_PORT = 8766;
 const OVERLAP_PX = 50;
 const AFTER_SEND_DELAY_MS = 0;
 const DEFAULT_CAPTURE_INTERVAL_MS = 100;
@@ -10,12 +11,22 @@ const LOCAL_BACKEND_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 
 let _backendBaseUrl = null;
 let _backendBaseUrlExpiry = 0;
+let _fileBridgeBaseUrl = null;
+let _fileBridgeBaseUrlExpiry = 0;
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== 'sync') return;
-  if (!changes.backendHost && !changes.backendPort) return;
-  _backendBaseUrl = null;
-  _backendBaseUrlExpiry = 0;
+  if (changes.backendHost || changes.backendPort) {
+    _backendBaseUrl = null;
+    _backendBaseUrlExpiry = 0;
+    // The file bridge falls back to the main backend until it is configured.
+    _fileBridgeBaseUrl = null;
+    _fileBridgeBaseUrlExpiry = 0;
+  }
+  if (changes.fileBridgeHost || changes.fileBridgePort) {
+    _fileBridgeBaseUrl = null;
+    _fileBridgeBaseUrlExpiry = 0;
+  }
 });
 
 async function getBackendEndpoint(path) {
@@ -25,6 +36,23 @@ async function getBackendEndpoint(path) {
     _backendBaseUrlExpiry = Date.now() + 60_000;  // cache 1 minute
   }
   return _backendBaseUrl + path;
+}
+
+async function getFileBridgeEndpoint(path) {
+  if (!_fileBridgeBaseUrl || Date.now() > _fileBridgeBaseUrlExpiry) {
+    const items = await chrome.storage.sync.get({
+      backendHost: DEFAULT_HOST,
+      backendPort: DEFAULT_PORT,
+      fileBridgeHost: '',
+      fileBridgePort: FILE_BRIDGE_DEFAULT_PORT
+    });
+    const hasFileBridgeHost = String(items.fileBridgeHost || '').trim().length > 0;
+    const host = hasFileBridgeHost ? items.fileBridgeHost : items.backendHost;
+    const port = hasFileBridgeHost ? items.fileBridgePort : items.backendPort;
+    _fileBridgeBaseUrl = buildBackendEndpoint(host, port, '');
+    _fileBridgeBaseUrlExpiry = Date.now() + 60_000;
+  }
+  return _fileBridgeBaseUrl + path;
 }
 
 function buildBackendEndpoint(host, port, path) {
@@ -469,14 +497,14 @@ function handleTranslateStop(tabId) {
 async function handleSaveTranslation(msg) {
   const { text, path } = msg;
   if (!text || !path) return { ok: false, error: 'Missing text or path' };
-  const url = await getBackendEndpoint('/save');
+  const url = await getFileBridgeEndpoint('/save');
   const response = await fetchWithTimeout(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text, path })
   });
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok || payload.error) return { ok: false, error: payload.error || `HTTP ${response.status}` };
+  if (!response.ok || payload.error) return { ok: false, error: payload.error || payload.detail || `HTTP ${response.status}` };
   return { ok: true, path: payload.path || path };
 }
 

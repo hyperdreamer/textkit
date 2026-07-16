@@ -147,42 +147,6 @@ curl -X POST "http://localhost:8765/format" \
 
 Uses the same AI text provider as `/translate` and `/dedup` (`config.text` override if configured).
 
-### `POST /save`
-
-Writes text to a local file on the backend machine.
-
-**Request:** JSON body with fields:
-- `text` (string, required) — the text to save.
-- `path` (string, required) — file path relative to the configured `save_root`.
-
-```sh
-curl -X POST "http://localhost:8765/save" \
-  -H "Content-Type: application/json" \
-  -d '{"text":"Hello world","path":"ocr/output.txt"}'
-```
-
-Returns `{"ok": true, "path": "/absolute/path/to/ocr/output.txt"}`.
-
-### `GET /paths`
-
-Returns filesystem paths under `save_root` matching a prefix, for autocomplete in the extension's save path fields.
-
-**Query parameters:**
-- `prefix` (string, optional) — path prefix to filter by. Supports `~` for home directory expansion.
-
-```sh
-# List everything under save_root
-curl "http://localhost:8765/paths"
-
-# Filter by prefix
-curl "http://localhost:8765/paths?prefix=ocr/"
-
-# Use ~ to browse the home directory
-curl "http://localhost:8765/paths?prefix=~/Documents"
-```
-
-Returns `{"paths": ["ocr/output.txt", "ocr/notes.md", ...]}`. Directories have a trailing `/`. Results are capped at 30 entries.
-
 ### Prompts: shared defaults vs per-request overrides
 
 Every AI endpoint (`/ocr`, `/dedup`, `/translate`, `/format`) accepts an **optional** `prompt` field. This gives you two usage patterns that coexist without conflict:
@@ -341,13 +305,14 @@ Every result panel (OCR, Translation, Format) supports:
 
 - **Copy** — copies the text to the clipboard.
 - **Download** — saves the text as a `.txt` file (named `textkit-*.txt`, `translate-*.txt`, or `format-*.txt`).
-- **Save** — writes the text to a local file on the backend machine via `POST /save`, using the tab's save path.
+- **Save** — writes the text through the separate localhost file-bridge service, using the tab's save path.
 
 ### Settings and persistence
 
 Settings persisted to Chrome sync storage:
 
 - Backend host and port.
+- File-bridge host and port. If unset, the extension temporarily falls back to the main backend settings for migration.
 - Auto-scroll on/off.
 - Target language.
 - Translation auto-copy, auto-save, auto-translate toggles and save path.
@@ -360,7 +325,7 @@ Settings persisted to Chrome local storage:
 - OCR prompt, dedup prompt (user-defined, synced to backend after a short delay).
 - Format prompt (user-defined, synced to backend after a short delay).
 - Translation prompts (per-language, user-defined, synced to backend after a short delay).
-- Save path autocomplete — queried in real time from the backend's `GET /paths` endpoint (with local history fallback).
+- Save path autocomplete — queried in real time from file-bridge (with local history fallback).
 
 ## Development Notes
 
