@@ -8,7 +8,7 @@ The backend is provider-neutral: it calls OpenAI-compatible chat completion APIs
 
 The project has two parts:
 
-- `backend/`: a Python FastAPI server that exposes OCR, deduplication, translation, format, and save endpoints. It validates uploaded images, sends requests to the configured AI provider, and returns a consistent JSON response.
+- `backend/`: a Python FastAPI server that exposes OCR, deduplication, translation, format, and save endpoints. It validates uploaded images, sends requests to the configured AI provider, and returns endpoint-specific JSON responses.
 - `extension/`: a Chromium Manifest V3 extension that runs a popup, background service worker, and page content script. The content script draws the capture overlay and scrolls the page. The background service worker captures screenshots, crops the selected region, calls the backend, merges fragments, retries failed work, and stores the last region/result.
 
 Typical flow:
@@ -57,18 +57,17 @@ By default, the server binds to `127.0.0.1:8765`. Change `host` in `config.yaml`
 
 The backend is implemented in `backend/main.py` and serves a FastAPI app named `TextKit Backend`.
 
-All endpoints return the same JSON response shape:
+The four AI endpoints (`/ocr`, `/dedup`, `/translate`, and `/format`) return the core result fields:
 
 ```json
 {
   "text": "result text",
   "model": "provider-model-name",
-  "tokens_used": 123,
-  "error": null
+  "tokens_used": 123
 }
 ```
 
-On errors, the response uses the same envelope with an empty `text`, empty `model`, `tokens_used: 0`, and an `error` message.
+`/translate` adds `skipped`, `detected_language`, and `skip_reason` when language detection bypasses the provider. Errors from the AI endpoints use `{"text":"","model":"","tokens_used":0,"error":"..."}`. Utility and prompt endpoints use the shapes documented in their sections below.
 
 The backend is fully usable as a standalone API — you can call any endpoint directly with `curl` or any HTTP client without the extension.
 
@@ -118,7 +117,7 @@ Translates text to a target language.
 **Request:** JSON body with fields:
 - `text` (string, required) — the text to translate.
 - `language` (string, required) — target language, e.g. `"Chinese"`, `"English"`.
-- `prompt` (string, optional) — custom system prompt that overrides the default translation prompt. When provided, the `{language}` template variable is ignored.
+- `prompt` (string, optional) — custom system prompt that overrides the default translation prompt. The backend uses custom prompts verbatim; the extension replaces `{language}` with the selected language before sending one.
 
 ```sh
 curl -X POST "http://localhost:8765/translate" \
@@ -162,6 +161,8 @@ curl -X POST "http://localhost:8765/save" \
   -d '{"text":"Hello world","path":"ocr/output.txt"}'
 ```
 
+Returns `{"ok": true, "path": "/absolute/path/to/ocr/output.txt"}`.
+
 ### `GET /paths`
 
 Returns filesystem paths under `save_root` matching a prefix, for autocomplete in the extension's save path fields.
@@ -194,6 +195,8 @@ Every AI endpoint (`/ocr`, `/dedup`, `/translate`, `/format`) accepts an **optio
 
 Returns all available AI prompt templates (ocr, dedup, translate, format) as JSON.
 
+Response shape: `{"prompts": {"ocr": "...", "dedup": "...", "translate": "...", "format": "..."}}`.
+
 ```sh
 curl "http://localhost:8765/prompts"
 ```
@@ -203,6 +206,8 @@ curl "http://localhost:8765/prompts"
 Read or update a prompt template by name (`ocr`, `dedup`, `translate`, or `format`).
 
 The `translate` prompt supports per-language variants via the `?language=` query parameter (e.g. `?language=French` writes `translate.French.txt`). Other prompts ignore the parameter.
+
+Both GET and successful PUT return `{"name":"translate","template":"...","has_language_param":true}` and add `"language":"French"` when the query parameter is present.
 
 ```sh
 # Read
@@ -320,17 +325,15 @@ For each captured page region, the extension:
 5. Merges fragments locally using line-overlap detection.
 6. Sends the merged text to `POST /dedup`.
 7. If a language other than `Original` is selected, sends the deduplicated text to `POST /translate`.
-8. If auto-format is enabled and a format prompt is set, sends the translated text to `POST /format`.
+8. If auto-format is enabled and a format prompt is set, sends the selected source (Translation or OCR Result) to `POST /format`.
 
 The popup language dropdown supports `Original`, `Chinese`, `English`, `Japanese`, `Korean`, `French`, `German`, and `Spanish`. Choosing `Original` skips translation.
 
 ### Retry behavior
 
-The Retry button appears when OCR, deduplication, or translation fails.
+OCR and deduplication provider failures retry indefinitely in the background, preserving collected fragments, until the user presses Stop. There is intentionally no retry limit for either stage.
 
-- OCR failure: retry resumes capture from the failed page while preserving already collected fragments.
-- Dedup failure: retry runs deduplication again on the pending merged text.
-- Translation failure: retry runs translation again on the pending deduplicated text.
+The Retry button is reserved for a resumable error state that was persisted across a worker restart or for a later-stage retry state. Pressing Stop during an OCR/dedup retry finalizes the text collected so far; a translation failure leaves the OCR result available for another translation attempt.
 
 ### Output actions
 
@@ -376,6 +379,7 @@ The backend dependencies are:
 - `httpx`
 - `pyyaml`
 - `pillow`
+- `langdetect`
 
 The extension does not require a build step. Load the `extension/` folder directly as an unpacked extension.
 
@@ -412,4 +416,4 @@ Select a language other than `Original` before starting capture. You can also us
 
 ### Format does not run automatically
 
-Make sure **Auto-format** is checked on the Format tab and a **Format Prompt** is configured on the Prompt tab. Auto-format triggers when translation completes.
+Make sure **Auto-format** is checked on the Format tab and a **Format Prompt** is configured on the Prompt tab. Auto-format runs after the selected source completes: either Translation or OCR Result.

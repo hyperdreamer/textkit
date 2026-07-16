@@ -56,8 +56,8 @@ Content-Type: application/json
 | Scenario | Behavior |
 |----------|----------|
 | Unknown prompt name | 404 `"Unknown prompt: 'xyz'"` |
-| Malformed JSON body | 400 — FastAPI validation error caught by `validation_error_handler` |
-| Missing `template` field | 400 — Pydantic validation error |
+| Malformed JSON body | 400 — explicit JSON decode error |
+| Missing or invalid `template` field | 422 — Pydantic validation error |
 | Invalid language param (path traversal) | 400 `"Invalid language parameter"` |
 | Filesystem write fails (permissions) | 500 `"Failed to save prompt: ..."` via OSError |
 | PROMPTS_DIR doesn't exist | Auto-created via `mkdir(parents=True)` |
@@ -523,27 +523,27 @@ This way, an empty textarea means "use the backend default," and the user doesn'
 
 This is already implemented in `main.py:97-107`. The error message tells the user which variable is unknown.
 
-### 6.8 Format Prompt Saved to Backend (Current Bug)
+### 6.8 Format Prompt Saved to Backend
 
 **Scenario**: User edits format prompt → `saveFormatPrompt()` fires `PUT /prompts/format`.
 
-**Current behavior**: The call succeeds because "format" is in `_DEFAULT_PROMPTS`. The file `backend/prompts/format.txt` gets overwritten with the user's custom prompt. Next time `GET /prompts/format` is called (if ever), it returns the user's custom prompt — which is misleading because format is supposed to be user-supplied per-request.
+**Current behavior**: The call succeeds because `format` is a managed prompt in `_DEFAULT_PROMPTS`. The file `backend/prompts/format.txt` is updated, and later `GET /prompts/format` calls return the same shared prompt. This matches the final design in §3.4.
 
-**Fix**: Remove the backend sync from `saveFormatPrompt()`. Format prompt stays in `localStorage.formatPrompt` only.
+`POST /format` may omit `prompt` to use this shared disk template, or include a per-request prompt to override it without changing the saved template.
 
 ---
 
 ## 7. Implementation Checklist
 
 ### Backend Changes
-- [x] Remove `"format"` from `_DEFAULT_PROMPTS` dict (or keep as empty string but document it's not managed)
-- [x] Consider removing `format.txt` from `backend/prompts/` (or rename to `format.txt.example`)
+- [x] Keep `"format"` in `_DEFAULT_PROMPTS` as a managed shared prompt
+- [x] Keep `backend/prompts/format.txt` as the persisted format template
 
 ### Extension Changes (popup.js)
 - [x] **Phase 1**: Populate textareas from localStorage before any network calls (instant render)
 - [x] **Phase 2**: Parallelize `loadOcrPrompt()`, `loadDedupPrompt()`, `loadPromptForLanguage()` via `Promise.allSettled()`
 - [x] **Timeout**: Add 3-second timeout to backend GET requests during load
-- [x] **saveFormatPrompt()**: Remove `PUT /prompts/format` backend sync
+- [x] **saveFormatPrompt()**: Debounce `PUT /prompts/format` backend sync
 - [x] **saveTlState()**: Use `has_language_param` check to decide whether to save as base template (no `?language=`) or per-language override (`?language=<lang>`)
 - [x] **{language} hint UI**: Add a small label that appears when `has_language_param` is true, saying `{language}` will be replaced with current language selection
 - [x] **Debounce**: Debounce backend PUT requests by 500ms (keep localStorage save immediate)
@@ -571,7 +571,7 @@ This is already implemented in `main.py:97-107`. The error message tells the use
 | `dedupPrompt` | `chrome.storage.local` | Dedup prompt text |
 | `translatePrompt:{lang}` | `chrome.storage.local` | Per-language translate prompt |
 | `tlLanguage` | `chrome.storage.local` | Currently selected language in Prompts tab |
-| `formatPrompt` | `chrome.storage.local` | Format prompt (local only, no backend sync) |
+| `formatPrompt` | `chrome.storage.local` | Local format prompt cache, synced to `/prompts/format` |
 | `backendHost` | `chrome.storage.sync` | Backend hostname |
 | `backendPort` | `chrome.storage.sync` | Backend port |
 

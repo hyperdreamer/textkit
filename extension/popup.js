@@ -32,6 +32,35 @@ let _ocrSaveTimer = null;
 let _dedupSaveTimer = null;
 let _tlSaveTimer = null;
 let _fmtSaveTimer = null;
+const _promptRefreshState = new WeakMap();
+
+function _getPromptRefreshState(el) {
+  if (!_promptRefreshState.has(el)) {
+    _promptRefreshState.set(el, { generation: 0, dirty: false });
+  }
+  return _promptRefreshState.get(el);
+}
+
+function _beginPromptRefresh(el, { resetDirty = false } = {}) {
+  const state = _getPromptRefreshState(el);
+  state.generation += 1;
+  if (resetDirty) state.dirty = false;
+  return state.generation;
+}
+
+function _markPromptDirty(el) {
+  const state = _getPromptRefreshState(el);
+  state.dirty = true;
+  state.generation += 1;
+}
+
+function _applyIfDifferent(el, newValue, generation) {
+  const state = _getPromptRefreshState(el);
+  if (generation !== state.generation || state.dirty || newValue == null) return false;
+  if (el.value !== newValue) el.value = newValue;
+  state.dirty = false;
+  return true;
+}
 
 // ── Translation panel elements ────────────────────────────────
 const tl2Language = document.getElementById('tl2-language');
@@ -111,7 +140,10 @@ captureIntervalInput.addEventListener('change', saveSettings);
 
 // ── Translate panel listeners ─────────────────────────────────
 tlLanguage.addEventListener('change', () => { onTlLanguageChange(); syncLanguage('prompt'); });
-translatePrompt.addEventListener('input', saveTlState);
+translatePrompt.addEventListener('input', () => {
+  _markPromptDirty(translatePrompt);
+  saveTlState();
+});
 
 // ── Translation panel listeners ───────────────────────────────
 tl2Translate.addEventListener('click', doTranslation);
@@ -132,9 +164,18 @@ fmtFormat.addEventListener('click', doFormat);
 fmtCopy.addEventListener('click', () => copyResult(fmtResult, fmtCopy));
 fmtDownload.addEventListener('click', () => downloadAsFile(fmtResult.value.trim(), 'format'));
 fmtSave.addEventListener('click', saveFormatResult);
-formatPrompt.addEventListener('input', saveFormatPrompt);
-ocrPromptEl.addEventListener('input', saveOcrPrompt);
-dedupPromptEl.addEventListener('input', saveDedupPrompt);
+formatPrompt.addEventListener('input', () => {
+  _markPromptDirty(formatPrompt);
+  saveFormatPrompt();
+});
+ocrPromptEl.addEventListener('input', () => {
+  _markPromptDirty(ocrPromptEl);
+  saveOcrPrompt();
+});
+dedupPromptEl.addEventListener('input', () => {
+  _markPromptDirty(dedupPromptEl);
+  saveDedupPrompt();
+});
 fmtSavePath.addEventListener('input', () => {
   saveFormatSettings();
   updatePathSuggestions(fmtSavePath.value);
@@ -256,15 +297,21 @@ async function init() {
   if (tl.tlLanguage) tlLanguage.value = tl.tlLanguage;
 
   // ── Phase 1: populate ALL prompt textareas from localStorage (instant) ──
-  const ocrStored = await chrome.storage.local.get('ocrPrompt');
-  ocrPromptEl.value = ocrStored.ocrPrompt || '';
-  const dedupStored = await chrome.storage.local.get('dedupPrompt');
-  dedupPromptEl.value = dedupStored.dedupPrompt || '';
+  const ocrLocalGeneration = _beginPromptRefresh(ocrPromptEl, { resetDirty: true });
+  const dedupLocalGeneration = _beginPromptRefresh(dedupPromptEl, { resetDirty: true });
   const tlLangKey = `translatePrompt:${tlLanguage.value}`;
-  const tlStored = await chrome.storage.local.get(tlLangKey);
-  translatePrompt.value = tlStored[tlLangKey] || '';
-  const fmtStored = await chrome.storage.local.get('formatPrompt');
-  formatPrompt.value = fmtStored.formatPrompt || '';
+  const tlLocalGeneration = _beginPromptRefresh(translatePrompt, { resetDirty: true });
+  const fmtLocalGeneration = _beginPromptRefresh(formatPrompt, { resetDirty: true });
+  const [ocrStored, dedupStored, tlStored, fmtStored] = await Promise.all([
+    chrome.storage.local.get('ocrPrompt'),
+    chrome.storage.local.get('dedupPrompt'),
+    chrome.storage.local.get(tlLangKey),
+    chrome.storage.local.get('formatPrompt')
+  ]);
+  _applyIfDifferent(ocrPromptEl, ocrStored.ocrPrompt || '', ocrLocalGeneration);
+  _applyIfDifferent(dedupPromptEl, dedupStored.dedupPrompt || '', dedupLocalGeneration);
+  _applyIfDifferent(translatePrompt, tlStored[tlLangKey] || '', tlLocalGeneration);
+  _applyIfDifferent(formatPrompt, fmtStored.formatPrompt || '', fmtLocalGeneration);
   updateTranslateHintFromValue();
 
   // ── Phase 2: non-blocking backend refresh in parallel (SWR) ──
@@ -273,12 +320,15 @@ async function init() {
     const t = setTimeout(() => ctrl.abort(), ms);
     return fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(t));
   };
-  const _applyIfDifferent = (el, newValue) => {
-    if (newValue != null && el.value !== newValue) el.value = newValue;
-  };
   (async () => {
     let backend;
     try { backend = normalizeBackendSettings(hostInput.value, portInput.value); } catch { return; }
+    const generations = {
+      ocr: _beginPromptRefresh(ocrPromptEl),
+      dedup: _beginPromptRefresh(dedupPromptEl),
+      translate: _beginPromptRefresh(translatePrompt),
+      format: _beginPromptRefresh(formatPrompt)
+    };
     const [ocrRes, dedupRes, tlRes, fmtRes] = await Promise.allSettled([
       _fetchWithTimeout(`http://${backend.host}:${backend.port}/prompts/ocr`, 3000).then(r => r.ok ? r.json() : null).catch(() => null),
       _fetchWithTimeout(`http://${backend.host}:${backend.port}/prompts/dedup`, 3000).then(r => r.ok ? r.json() : null).catch(() => null),
@@ -286,17 +336,18 @@ async function init() {
       _fetchWithTimeout(`http://${backend.host}:${backend.port}/prompts/format`, 3000).then(r => r.ok ? r.json() : null).catch(() => null)
     ]);
     if (ocrRes.status === 'fulfilled' && ocrRes.value) {
-      _applyIfDifferent(ocrPromptEl, ocrRes.value.template || '');
+      _applyIfDifferent(ocrPromptEl, ocrRes.value.template || '', generations.ocr);
     }
     if (dedupRes.status === 'fulfilled' && dedupRes.value) {
-      _applyIfDifferent(dedupPromptEl, dedupRes.value.template || '');
+      _applyIfDifferent(dedupPromptEl, dedupRes.value.template || '', generations.dedup);
     }
     if (tlRes.status === 'fulfilled' && tlRes.value) {
-      _applyIfDifferent(translatePrompt, tlRes.value.template || '');
-      updateTranslateHintFromBackend(tlRes.value);
+      if (_applyIfDifferent(translatePrompt, tlRes.value.template || '', generations.translate)) {
+        updateTranslateHintFromBackend(tlRes.value);
+      }
     }
     if (fmtRes.status === 'fulfilled' && fmtRes.value) {
-      _applyIfDifferent(formatPrompt, fmtRes.value.template || '');
+      _applyIfDifferent(formatPrompt, fmtRes.value.template || '', generations.format);
     }
   })();
 
@@ -427,10 +478,12 @@ function updateTranslateHintFromBackend(data) {
 async function loadPromptForLanguage() {
   const lang = tlLanguage.value;
   const key = `translatePrompt:${lang}`;
+  const localGeneration = _beginPromptRefresh(translatePrompt, { resetDirty: true });
   // Phase 1: seed from localStorage (instant)
   const stored = await chrome.storage.local.get(key);
-  translatePrompt.value = stored[key] || '';
+  if (!_applyIfDifferent(translatePrompt, stored[key] || '', localGeneration)) return;
   updateTranslateHintFromValue();
+  const requestGeneration = _beginPromptRefresh(translatePrompt);
   // Phase 2: backend refresh (SWR) — applied only if different
   (async () => {
     try {
@@ -441,10 +494,9 @@ async function loadPromptForLanguage() {
       clearTimeout(t);
       if (resp && resp.ok) {
         const data = await resp.json();
-        if (data.template != null && translatePrompt.value !== data.template) {
-          translatePrompt.value = data.template;
+        if (_applyIfDifferent(translatePrompt, data.template, requestGeneration)) {
+          updateTranslateHintFromBackend(data);
         }
-        updateTranslateHintFromBackend(data);
       }
     } catch {}
   })();
@@ -999,20 +1051,30 @@ async function fetchPathSuggestions(prefix) {
   try {
     const backend = normalizeBackendSettings(hostInput.value, portInput.value);
     const resp = await fetch(`http://${backend.host}:${backend.port}/paths?prefix=${encodeURIComponent(prefix)}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json().catch(() => ({}));
     const paths = data.paths || [];
     // If user typed a ~ prefix, prepend ~/ so the browser's <datalist>
     // filtering matches. The backend returns paths relative to save_root;
     // we only need to restore the tilde the user typed.
     const tildePrefix = prefix.startsWith('~/') ? '~/' : (prefix === '~' ? '~/' : '');
-    tl2PathSuggestions.replaceChildren(...paths.map((path) => {
-      const option = document.createElement('option');
-      option.value = tildePrefix + path;
-      return option;
-    }));
+    populatePathSuggestions(paths.map((path) => tildePrefix + path));
   } catch {
-    // Backend unreachable — keep existing suggestions
+    const stored = await chrome.storage.local.get(PATH_HISTORY_KEY);
+    const history = Array.isArray(stored[PATH_HISTORY_KEY]) ? stored[PATH_HISTORY_KEY] : [];
+    const prefixLower = prefix.toLowerCase();
+    populatePathSuggestions(history.filter((path) => (
+      !prefixLower || String(path).toLowerCase().startsWith(prefixLower)
+    )));
   }
+}
+
+function populatePathSuggestions(paths) {
+  tl2PathSuggestions.replaceChildren(...paths.map((path) => {
+    const option = document.createElement('option');
+    option.value = path;
+    return option;
+  }));
 }
 
 function updatePathSuggestions(current) {

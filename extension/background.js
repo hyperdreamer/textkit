@@ -11,6 +11,13 @@ const LOCAL_BACKEND_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 let _backendBaseUrl = null;
 let _backendBaseUrlExpiry = 0;
 
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'sync') return;
+  if (!changes.backendHost && !changes.backendPort) return;
+  _backendBaseUrl = null;
+  _backendBaseUrlExpiry = 0;
+});
+
 async function getBackendEndpoint(path) {
   if (!_backendBaseUrl || Date.now() > _backendBaseUrlExpiry) {
     const items = await chrome.storage.sync.get({ backendHost: DEFAULT_HOST, backendPort: DEFAULT_PORT });
@@ -72,6 +79,15 @@ chrome.storage.local.get('lastRegion', (items) => {
     states.forEach((state) => { state.lastRegion = savedLastRegion; });
   }
 });
+
+async function recoverScrollLocks() {
+  const tabs = await chrome.tabs.query({});
+  await Promise.allSettled(tabs
+    .filter((tab) => tab?.id)
+    .map((tab) => chrome.tabs.sendMessage(tab.id, { type: 'page:unlock-scroll' })));
+}
+
+recoverScrollLocks().catch(() => {});
 
 function notifyTargetTabChange() {
   targetTabChangeRevision += 1;
@@ -173,10 +189,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // connection can be aborted before uvicorn logs the /dedup 200.
     sendResponse({ ok: true });
     runCaptureLoop(sender.tab, message.region)
-      .catch((error) => {
-        console.error('Capture loop failed:', error);
-        updateState(tabId, { active: false, status: 'Error', error: error.message, progress: 'Failed.' });
-      });
+      .catch((error) => handleCaptureLoopFailure(tabId, error, 'Capture loop failed:'));
     return false;
   }
   if (message?.type === 'popup:start-with-region') {
@@ -227,10 +240,20 @@ async function handlePopupStart() {
   const tab = await getActiveTab();
   await ensureContentScript(tab.id);
   updateState(tab.id, { active: true, status: 'Selecting', progress: 'Drag a rectangle.' });
-  await chrome.tabs.sendMessage(tab.id, {
-    type: 'selection:start',
-    lastRegion: getState(tab.id).lastRegion || undefined
-  });
+  try {
+    await chrome.tabs.sendMessage(tab.id, {
+      type: 'selection:start',
+      lastRegion: getState(tab.id).lastRegion || undefined
+    });
+  } catch (error) {
+    updateState(tab.id, {
+      active: false,
+      status: 'Error',
+      error: error.message,
+      progress: 'Failed.'
+    });
+    throw error;
+  }
   return { ok: true };
 }
 
@@ -249,17 +272,43 @@ async function handleReuseRegion() {
     devicePixelRatio: vp?.dpr || 1
   };
   // Run capture directly — no overlay needed
-  runCaptureLoop(tab, fullRegion).catch((e) => {
-    console.error('Reuse capture failed:', e);
-    updateState(tab.id, { active: false, status: 'Error', error: e.message, progress: 'Failed.' });
-  });
+  runCaptureLoop(tab, fullRegion)
+    .catch((error) => handleCaptureLoopFailure(tab.id, error, 'Reuse capture failed:'));
   return { ok: true };
+}
+
+async function handleCaptureLoopFailure(tabId, error, logPrefix) {
+  console.error(logPrefix, error);
+  const state = getState(tabId);
+  if (state.fragments?.length > 0) {
+    try {
+      await finalizePostCapture(tabId, mergeFragments(state.fragments), state.fragments);
+      return;
+    } catch (finalizeError) {
+      error = finalizeError;
+    }
+  }
+  updateState(tabId, {
+    active: false,
+    status: 'Error',
+    error: error.message,
+    progress: 'Failed.'
+  });
 }
 
 async function handleStop() {
   const tab = await getActiveTab();
   const state = getState(tab.id);
   state.stopRequested = true;
+  if (state.status === 'Selecting') {
+    updateState(tab.id, {
+      active: false,
+      status: 'Cancelled',
+      progress: 'Selection cancelled.'
+    });
+    await chrome.tabs.sendMessage(tab.id, { type: 'selection:cancel' }).catch(() => {});
+    return { ok: true };
+  }
   // Abort in-flight OCR AND translation so Stop responds immediately
   captureControllers.get(tab.id)?.abort();
   handleTranslateStop(tab.id);
@@ -353,6 +402,7 @@ async function handleTranslateStart(msg) {
     try {
       const key = `translatePrompt:${language}`;
       const stored = await chrome.storage.local.get(key);
+      const customPrompt = renderTranslationPrompt(stored[key], language);
       // "Original" with no custom prompt → pass through unchanged
       if (language === 'original' && !stored[key]) {
         const translated = text;
@@ -367,7 +417,7 @@ async function handleTranslateStart(msg) {
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, language, prompt: stored[key] || undefined }),
+        body: JSON.stringify({ text, language, prompt: customPrompt || undefined }),
         signal: controller.signal
       });
       const payload = await response.json().catch(() => ({}));
@@ -511,10 +561,10 @@ function handleFormatStop(tabId) {
   }
 }
 
-async function autoFormatIfEnabled(tabId, text, host, port) {
+async function autoFormatIfEnabled(tabId, text, host, port, source = 'translation') {
   const settings = await chrome.storage.sync.get({ fmtAutoFormat: false, fmtSourceVal: 'translation' });
   if (!settings.fmtAutoFormat) return;
-  if (settings.fmtSourceVal === 'ocr') return;
+  if (settings.fmtSourceVal !== source) return;
   const prompt = await chrome.storage.local.get('formatPrompt');
   if (!prompt.formatPrompt || !prompt.formatPrompt.trim()) return;
   // Fall back to sync storage if caller didn't provide host/port (e.g. auto-translate path)
@@ -931,8 +981,9 @@ async function finalizeCapture(tabId, finalText, fragments) {
   chrome.storage.local.set({ [`lastResult:${tabId}`]: finalText });
   chrome.storage.local.set({ [`lastStatus:${tabId}`]: 'Done' });
 
-  // Auto-translate to Translation tab if enabled (skip if user stopped)
+  // Run post-capture automation only for a normally completed capture.
   if (!state.stopRequested && !state.targetRemoved) {
+    await autoFormatIfEnabled(tabId, finalText, undefined, undefined, 'ocr');
     await autoTranslateIfEnabled(tabId, finalText);
   }
 
@@ -979,11 +1030,12 @@ async function autoTranslateIfEnabled(tabId, originalText) {
     chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: true }).catch(() => {});
     const key = `translatePrompt:${language}`;
     const stored = await chrome.storage.local.get(key);
+    const customPrompt = renderTranslationPrompt(stored[key], language);
     const url = await getBackendEndpoint('/translate');
     const response = await fetch(url + '?_=' + Date.now(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: originalText, language, prompt: stored[key] || undefined }),
+      body: JSON.stringify({ text: originalText, language, prompt: customPrompt || undefined }),
       signal: controller.signal
     });
     const payload = await response.json().catch(() => ({}));
@@ -1014,6 +1066,11 @@ async function autoTranslateIfEnabled(tabId, originalText) {
       chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: false }).catch(() => {});
     }
   }
+}
+
+function renderTranslationPrompt(template, language) {
+  if (!template) return '';
+  return String(template).replace(/\{language\}/g, language);
 }
 
 // ── crop ───────────────────────────────────────────────────────

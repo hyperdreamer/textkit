@@ -20,6 +20,11 @@
       sendResponse({ ok: true });
       return false;
     }
+    if (message?.type === 'selection:cancel') {
+      removeOverlay();
+      sendResponse({ ok: true });
+      return false;
+    }
     if (message?.type === 'page:scroll-down') {
       scrollDown(message.overlapPx)
         .then(sendResponse)

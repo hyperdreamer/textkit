@@ -50,12 +50,13 @@ function createBackgroundHarness(options = {}) {
   const onRemoved = createEvent();
   const onAttached = createEvent();
   const onDetached = createEvent();
+  const onStorageChanged = createEvent();
   const captureCalls = [];
   const messageCalls = [];
   const ocrCalls = [];
   const cropCalls = [];
   const finalized = [];
-  const localData = {};
+  const localData = { ...(options.localData || {}) };
   const syncValues = {
     ocrAutoscroll: false,
     captureIntervalMs: 0,
@@ -68,11 +69,13 @@ function createBackgroundHarness(options = {}) {
     onActivated,
     onRemoved,
     onAttached,
-    onDetached
+    onDetached,
+    onStorageChanged
   };
 
   const chrome = {
     storage: {
+      onChanged: onStorageChanged,
       local: {
         get(keys, callback) {
           let result = {};
@@ -103,6 +106,10 @@ function createBackgroundHarness(options = {}) {
       sync: {
         get(defaults) {
           return Promise.resolve({ ...defaults, ...syncValues });
+        },
+        set(values) {
+          Object.assign(syncValues, values);
+          return Promise.resolve();
         }
       }
     },
@@ -116,7 +123,10 @@ function createBackgroundHarness(options = {}) {
         if (!tab) throw new Error(`No tab with id: ${tabId}`);
         return { ...tab };
       },
-      async query() {
+      async query(queryInfo = {}) {
+        if (Object.keys(queryInfo).length === 0) {
+          return [...tabs.values()].map((tab) => ({ ...tab }));
+        }
         const tabId = options.popupTabId || 1;
         const tab = tabs.get(tabId);
         return tab ? [{ ...tab }] : [];
@@ -162,7 +172,7 @@ function createBackgroundHarness(options = {}) {
     clearInterval,
     clearTimeout,
     console,
-    fetch,
+    fetch: options.fetch || fetch,
     setInterval: () => 1,
     setTimeout
   };
@@ -175,6 +185,7 @@ function createBackgroundHarness(options = {}) {
     }
   };
   vm.runInContext(fs.readFileSync(BACKGROUND_PATH, 'utf8'), context, { filename: BACKGROUND_PATH });
+  const originalFinalizeCapture = vm.runInContext('finalizeCapture', context);
 
   context.__testCrop = async (dataUrl, region) => {
     cropCalls.push({ dataUrl, region });
@@ -215,10 +226,14 @@ function createBackgroundHarness(options = {}) {
     context,
     cropCalls,
     finalized,
+    events,
+    localData,
     messageCalls,
     ocrCalls,
+    originalFinalizeCapture,
     removeTab,
     setActive,
+    syncValues,
     tabs
   };
 }
@@ -514,4 +529,125 @@ test('a mismatching line between equal anchors is retained', () => {
     context.mergeFragments(['start\nanchor one\nleft only\nanchor two', 'anchor one\nright only\nanchor two\nend']),
     'start\nanchor one\nleft only\nanchor two\nanchor one\nright only\nanchor two\nend'
   );
+});
+
+test('worker startup broadcasts scroll unlock to every open tab', async () => {
+  const harness = createBackgroundHarness({
+    tabs: [
+      { id: 1, windowId: 10, active: true },
+      { id: 2, windowId: 10, active: false }
+    ]
+  });
+  await waitFor(
+    () => harness.messageCalls.filter((call) => call.message.type === 'page:unlock-scroll').length === 2,
+    'startup scroll recovery did not message all tabs'
+  );
+  assert.deepEqual(
+    harness.messageCalls
+      .filter((call) => call.message.type === 'page:unlock-scroll')
+      .map((call) => call.tabId)
+      .sort(),
+    [1, 2]
+  );
+});
+
+test('backend endpoint cache is invalidated when host settings change', async () => {
+  const harness = createBackgroundHarness({ syncValues: { backendPort: 8765 } });
+  assert.equal(await harness.context.getBackendEndpoint('/ocr'), 'http://localhost:8765/ocr');
+  harness.syncValues.backendPort = 9876;
+  assert.equal(await harness.context.getBackendEndpoint('/ocr'), 'http://localhost:8765/ocr');
+
+  harness.events.onStorageChanged.emit({ backendPort: { oldValue: 8765, newValue: 9876 } }, 'sync');
+  assert.equal(await harness.context.getBackendEndpoint('/ocr'), 'http://localhost:9876/ocr');
+});
+
+test('a non-OCR capture failure finalizes fragments already collected', async () => {
+  const harness = createBackgroundHarness();
+  const state = harness.context.getState(1);
+  state.fragments = ['first fragment', 'second fragment'];
+  vm.runInContext("runCaptureLoop = async () => { throw new Error('scroll failed'); };", harness.context);
+
+  let response;
+  harness.events.runtimeMessage.emit(
+    { type: 'selection:complete', region: REGION },
+    { tab: { id: 1, windowId: 10, active: true } },
+    (value) => { response = value; }
+  );
+  assert.equal(response.ok, true);
+  await waitFor(() => harness.finalized.length === 1, 'partial fragments were not finalized');
+  assert.equal(harness.finalized[0].tabId, 1);
+  assert.deepEqual(harness.finalized[0].fragments, ['first fragment', 'second fragment']);
+});
+
+test('failed selection start resets active state to Error', async () => {
+  const harness = createBackgroundHarness({
+    sendMessage(_tabId, message) {
+      if (message.type === 'selection:start') throw new Error('content script unavailable');
+      return { ok: true };
+    }
+  });
+  await assert.rejects(harness.context.handlePopupStart(), /content script unavailable/);
+  assert.equal(harness.context.getState(1).active, false);
+  assert.equal(harness.context.getState(1).status, 'Error');
+});
+
+test('Stop cancels an in-progress selection', async () => {
+  const harness = createBackgroundHarness();
+  harness.context.updateState(1, { active: true, status: 'Selecting' });
+
+  await harness.context.handleStop();
+
+  assert.equal(harness.context.getState(1).active, false);
+  assert.equal(harness.context.getState(1).status, 'Cancelled');
+  assert.equal(
+    harness.messageCalls.filter((call) => call.message.type === 'selection:cancel').length,
+    1
+  );
+});
+
+test('manual translation substitutes every language placeholder in a custom prompt', async () => {
+  let requestBody;
+  const harness = createBackgroundHarness({
+    localData: {
+      'translatePrompt:French': 'Translate to {language}. Answer only in {language}.'
+    },
+    fetch: async (_url, options) => {
+      requestBody = JSON.parse(options.body);
+      return { ok: true, json: async () => ({ text: 'bonjour' }) };
+    }
+  });
+
+  const result = await harness.context.handleTranslateStart({
+    tabId: 1,
+    text: 'hello',
+    language: 'French',
+    host: 'localhost',
+    port: 8765
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(requestBody.prompt, 'Translate to French. Answer only in French.');
+});
+
+test('OCR-source auto-format runs once even when auto-translate also completes', async () => {
+  const harness = createBackgroundHarness({
+    localData: { formatPrompt: 'Clean up the text.' },
+    syncValues: {
+      fmtAutoFormat: true,
+      fmtSourceVal: 'ocr',
+      ocrAutoTranslate: true
+    }
+  });
+  harness.context.__formatCalls = [];
+  vm.runInContext(`
+    handleFormatStart = async (message) => { __formatCalls.push(message); return { ok: true }; };
+    autoTranslateIfEnabled = async (tabId) => {
+      await autoFormatIfEnabled(tabId, 'translated text', undefined, undefined, 'translation');
+    };
+  `, harness.context);
+
+  await harness.originalFinalizeCapture(1, 'ocr text', ['ocr text']);
+
+  assert.equal(harness.context.__formatCalls.length, 1);
+  assert.equal(harness.context.__formatCalls[0].text, 'ocr text');
 });

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import yaml
@@ -17,7 +18,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from PIL import Image, UnidentifiedImageError
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 try:
     from langdetect import DetectorFactory, detect
     from langdetect.lang_detect_exception import LangDetectException
@@ -696,6 +697,53 @@ def _error_payload(error: str) -> dict[str, str | int | None]:
     return {"text": "", "model": "", "tokens_used": 0, "error": error}
 
 
+_AI_ENDPOINTS = {"/ocr", "/dedup", "/translate", "/format"}
+
+
+def _origin_matches_configured_host(origin: str, configured_host: str) -> bool:
+    """Return whether an HTTP(S) origin targets the configured backend host."""
+
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    normalized_host = configured_host.strip().strip("[]").lower()
+    return parsed.hostname.lower() == normalized_host
+
+
+@app.middleware("http")
+async def validate_ai_request_origin(request: Request, call_next: Any) -> Response:
+    """Block browser pages from invoking the local AI endpoints."""
+
+    if request.url.path not in _AI_ENDPOINTS:
+        return await call_next(request)
+
+    origin = request.headers.get("origin")
+    if not origin:
+        return await call_next(request)
+
+    try:
+        parsed_origin = urlsplit(origin)
+    except ValueError:
+        parsed_origin = None
+    if parsed_origin and parsed_origin.scheme == "chrome-extension" and parsed_origin.netloc:
+        return await call_next(request)
+
+    try:
+        configured_host = load_config().host
+    except RuntimeError as exc:
+        return JSONResponse(status_code=500, content=_error_payload(str(exc)))
+    if _origin_matches_configured_host(origin, configured_host):
+        return await call_next(request)
+
+    return JSONResponse(
+        status_code=403,
+        content=_error_payload(f"Origin not allowed for AI endpoint: {origin}"),
+    )
+
+
 @app.exception_handler(HTTPException)
 async def http_error_handler(_request: Request, exc: HTTPException) -> JSONResponse:
     """Return HTTP errors in the standard OCR response envelope."""
@@ -750,10 +798,11 @@ async def ocr(
     _debug("ocr", f"request: {len(image_bytes)} bytes", enabled=config.debug)
 
     # Debug: save last screenshot for manual inspection
-    try:
-        Path("/tmp/last_screenshot.png").write_bytes(image_bytes)
-    except OSError:
-        pass
+    if config.debug:
+        try:
+            Path("/tmp/last_screenshot.png").write_bytes(image_bytes)
+        except OSError:
+            pass
 
     data_url = _image_to_data_url(image_bytes, image.content_type)
     _debug("ocr", f"calling model={config.ai.model} ocr_model={config.ai.ocr.model if config.ai.ocr else '-'}", enabled=config.debug)
@@ -761,10 +810,11 @@ async def ocr(
     _debug("ocr", f"response: {len(result.text)} chars model={result.model}", enabled=config.debug)
 
     # Debug: save last OCR text (before dedup) for manual inspection
-    try:
-        Path("/tmp/last_ocr.txt").write_text(result.text, encoding="utf-8")
-    except OSError:
-        pass
+    if config.debug:
+        try:
+            Path("/tmp/last_ocr.txt").write_text(result.text, encoding="utf-8")
+        except OSError:
+            pass
 
     return result
 
@@ -784,18 +834,20 @@ async def dedup(request: DedupRequest) -> Response:
     _validate_text_size(request.text, config)
     _debug("dedup", f"request: {len(request.text)} chars", enabled=config.debug)
     # Debug: save pre-dedup text for retry troubleshooting
-    try:
-        Path("/tmp/pre_dedup.txt").write_text(request.text, encoding="utf-8")
-    except OSError:
-        pass
+    if config.debug:
+        try:
+            Path("/tmp/pre_dedup.txt").write_text(request.text, encoding="utf-8")
+        except OSError:
+            pass
     _debug("dedup", "calling provider...", enabled=config.debug)
     result = await deduplicate_text(config.ai, request.text, request.prompt)
     _debug("dedup", f"AI returned {len(result.text)} chars model={result.model}", enabled=config.debug)
     # Debug: save post-dedup text for quick comparison
-    try:
-        Path("/tmp/after_dedup.txt").write_text(result.text, encoding="utf-8")
-    except OSError:
-        pass
+    if config.debug:
+        try:
+            Path("/tmp/after_dedup.txt").write_text(result.text, encoding="utf-8")
+        except OSError:
+            pass
     body = {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
     body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
     _debug("dedup", f"sending {len(body_bytes)} byte response", enabled=config.debug)
@@ -1019,8 +1071,17 @@ async def get_prompt(name: str, request: Request) -> dict[str, object]:
     if name not in _DEFAULT_PROMPTS:
         raise HTTPException(status_code=404, detail=f"Unknown prompt: '{name}'")
     if request.method == "PUT":
-        body = await request.json()
-        update = PromptUpdate(**body)
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Malformed JSON request body") from exc
+        try:
+            if hasattr(PromptUpdate, "model_validate"):
+                update = PromptUpdate.model_validate(body)
+            else:  # pragma: no cover - compatibility with Pydantic v1
+                update = PromptUpdate.parse_obj(body)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         filename = f"{name}.{language}.txt" if language else f"{name}.txt"
         prompt_path = PROMPTS_DIR / filename
         try:
@@ -1030,8 +1091,7 @@ async def get_prompt(name: str, request: Request) -> dict[str, object]:
             raise HTTPException(
                 status_code=500, detail=f"Failed to save prompt: {exc.strerror or exc}"
             ) from exc
-        cache_key = f"{name}.{language}" if language else name
-        _prompt_cache.pop(cache_key, None)
+        _prompt_cache.clear()
         template = _load_prompt(name, language)
         result: dict[str, object] = {
             "name": name,
