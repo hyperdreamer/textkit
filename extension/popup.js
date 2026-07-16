@@ -110,6 +110,7 @@ let currentTabId = null;
 let userEditedResult = false;
 let lastStoredStatus = '';
 let promptEditorLanguage = 'original';
+let _tlSaveTimer = null;
 const LOCAL_BACKEND_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 const FILE_BRIDGE_DEFAULT_PORT = 8766;
 
@@ -570,11 +571,17 @@ function updateTranslateHintFromValue() {
   }
 }
 
+let _loadPromptSeq = 0;  // concurrency guard: only the most recent call takes effect
+
 async function loadPromptForLanguage() {
+  const seq = ++_loadPromptSeq;
   const lang = tlLanguage.value;
   const key = `translatePrompt:${lang}`;
   const localGeneration = _beginPromptRefresh(translatePrompt, { resetDirty: true });
   const stored = await chrome.storage.local.get(key);
+  // If another loadPromptForLanguage call started while we were awaiting,
+  // abort — the newer call has the authority.
+  if (seq !== _loadPromptSeq) return;
   if (!_applyIfDifferent(translatePrompt, stored[key] || '', localGeneration)) return;
   promptEditorLanguage = lang;
   updateTranslateHintFromValue();
@@ -603,10 +610,17 @@ function syncLanguage(source) {
 }
 
 async function onTlLanguageChange() {
-  const oldLang = (await chrome.storage.local.get('tlLanguage')).tlLanguage;
   clearTimeout(_tlSaveTimer);
-  if (oldLang && oldLang !== tlLanguage.value) {
-    await chrome.storage.local.set({ [`translatePrompt:${oldLang}`]: translatePrompt.value });
+  // Save the current textarea content to the language it actually belongs to
+  // (tracked by promptEditorLanguage), not the stale value from storage.
+  // Using oldLang from storage is racy: a pending loadPromptForLanguage (fired
+  // by a previous syncLanguage call) may not have cleared the textarea yet,
+  // causing the wrong prompt to be persisted under the wrong language key.
+  const langToSave = promptEditorLanguage !== 'original' && promptEditorLanguage !== tlLanguage.value
+    ? promptEditorLanguage
+    : null;
+  if (langToSave) {
+    await chrome.storage.local.set({ [`translatePrompt:${langToSave}`]: translatePrompt.value });
   }
   await chrome.storage.local.set({ tlLanguage: tlLanguage.value });
   await loadPromptForLanguage();
