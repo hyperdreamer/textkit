@@ -208,6 +208,27 @@ def test_prompt_put_returns_422_for_invalid_model(client: TestClient) -> None:
     assert "template" in response.json()["error"]
 
 
+@pytest.mark.parametrize("method", ["get", "put"])
+@pytest.mark.parametrize("name", ["ocr", "dedup", "format"])
+def test_language_parameter_is_rejected_for_non_translation_prompts(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    method: str,
+    name: str,
+) -> None:
+    monkeypatch.setattr(main, "PROMPTS_DIR", tmp_path)
+    kwargs = {"json": {"template": "custom prompt"}} if method == "put" else {}
+
+    response = getattr(client, method)(f"/prompts/{name}?language=French", **kwargs)
+
+    assert response.status_code == 400
+    assert response.json()["error"] == (
+        "The language parameter is only supported for the translate prompt"
+    )
+    assert not (tmp_path / f"{name}.French.txt").exists()
+
+
 @pytest.mark.parametrize(
     ("method", "path", "kwargs"),
     [

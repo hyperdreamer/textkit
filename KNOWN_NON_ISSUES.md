@@ -5,32 +5,6 @@ Future audits should NOT re-report these.
 
 ---
 
-## 1. Path traversal in `POST /save` via symlink bypass
-**File:** `backend/main.py:885-899`
-
-The traversal guard uses unresolvable `save_root_expanded` (lexical check only), but
-the actual write follows symlinks via `path.resolve()`. A symlink inside `save_root`
-pointing outside would bypass the guard.
-
-**Decision:** NOT fixing. The user's system uses symlinks everywhere
-(`~/Ramdisk → /ramdisk/...`). Resolving before containment would break legitimate
-saves to symlinked paths. The `normpath` guard already catches `../` escapes.
-Symlink escapes require an attacker with filesystem access — out of scope for a
-localhost-only tool.
-
----
-
-## 2. Path traversal in `GET /paths` via symlink
-**File:** `backend/main.py:909-964`
-
-Same unresolved-`save_root_expanded` pattern as #1. `iterdir()` follows symlinks
-but the guard is lexical only.
-
-**Decision:** NOT fixing — same rationale as #1. Symlinks are intentional in
-this user's environment.
-
----
-
 ## 3. OCR/dedup retry loops have no maximum retry count
 **File:** `extension/background.js:576-588`, `extension/background.js:772`
 
@@ -75,16 +49,13 @@ fully serialized. The redundant `winId` field is sufficient for resume.
 
 ---
 
-## 7. Offscreen document lifecycle — timer-based close
-**File:** `extension/background.js:1119-1135`
+## 7. ~~Offscreen document lifecycle — timer-based close~~ → FIXED
+**Files:** `extension/background.js`, `extension/offscreen.js`
 
-The 2-second `setTimeout` to close the offscreen document is not tied to actual
-copy completion. In practice, the copy is synchronous and 2 seconds is ample.
-
-**Decision:** NOT fixing. The fix (tracking document ownership, confirmation
-messages) adds complexity disproportionate to the risk. The current pattern works
-reliably; Chrome MV3 allows only one offscreen document, and the 2s delay is
-conservative.
+Copy requests now carry a correlation ID. The background worker consumes the
+offscreen success/failure response, closes the document when all pending copies
+finish, and uses the 2-second timer only as a failure fallback. Success
+notifications are emitted only after confirmed clipboard completion.
 
 ---
 
@@ -136,4 +107,4 @@ viewport height. Future audits should not report this as a defect.
 
 ---
 
-*Last updated: 2026-07-16 — post-Codex audit of master 2.0.8 (3c84d66)*
+*Last updated: 2026-07-16 — file-bridge, retry persistence, and offscreen copy fixes*

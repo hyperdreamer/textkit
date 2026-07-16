@@ -996,6 +996,11 @@ async def get_prompt(name: str, request: Request) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="Invalid language parameter")
     if name not in _DEFAULT_PROMPTS:
         raise HTTPException(status_code=404, detail=f"Unknown prompt: '{name}'")
+    if language and name != "translate":
+        raise HTTPException(
+            status_code=400,
+            detail="The language parameter is only supported for the translate prompt",
+        )
     if request.method == "PUT":
         try:
             body = await request.json()

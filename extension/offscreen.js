@@ -26,10 +26,14 @@ chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === 'offscreen:copy') {
     try {
       copyTextViaTextarea(message.text || '');
-      chrome.runtime.sendMessage({ type: 'offscreen:copied' });
+      chrome.runtime.sendMessage({ type: 'offscreen:copied', copyId: message.copyId });
     } catch (e) {
       console.error('Offscreen copy failed:', e);
-      chrome.runtime.sendMessage({ type: 'offscreen:copy-failed' });
+      chrome.runtime.sendMessage({
+        type: 'offscreen:copy-failed',
+        copyId: message.copyId,
+        error: e.message
+      });
     }
   }
   if (message?.type === 'offscreen:download') {

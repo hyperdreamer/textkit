@@ -8,7 +8,7 @@ The backend is provider-neutral: it calls OpenAI-compatible chat completion APIs
 
 The project has two parts:
 
-- `backend/`: a Python FastAPI server that exposes OCR, deduplication, translation, format, and save endpoints. It validates uploaded images, sends requests to the configured AI provider, and returns endpoint-specific JSON responses.
+- `backend/`: a Python FastAPI server that exposes OCR, deduplication, translation, format, and prompt-administration endpoints. It validates uploaded images, sends requests to the configured AI provider, and returns endpoint-specific JSON responses. File saving and path suggestions are provided by a separate localhost file-bridge service.
 - `extension/`: a Chromium Manifest V3 extension that runs a popup, background service worker, and page content script. The content script draws the capture overlay and scrolls the page. The background service worker captures screenshots, crops the selected region, calls the backend, merges fragments, retries failed work, and stores the last region/result.
 
 Typical flow:
@@ -187,7 +187,7 @@ curl "http://localhost:8765/prompts/translate/fallback?language=French"
 
 Read or update a canonical server prompt template by name (`ocr`, `dedup`, `translate`, or `format`). These endpoints remain available for server administrators and external administration tools; the extension does not call `PUT`.
 
-The `translate` prompt supports per-language variants via the `?language=` query parameter (e.g. `?language=French` writes `translate.French.txt`). Other prompts ignore the parameter.
+The `translate` prompt supports per-language variants via the `?language=` query parameter (e.g. `?language=French` writes `translate.French.txt`). Supplying `?language=` for any other prompt returns HTTP 400.
 
 Both GET and successful PUT return `{"name":"translate","template":"...","has_language_param":true}` and add `"language":"French"` when the query parameter is present.
 
@@ -330,7 +330,7 @@ Every result panel (OCR, Translation, Format) supports:
 Settings persisted to Chrome sync storage:
 
 - Backend host and port.
-- File-bridge host and port. If unset, the extension temporarily falls back to the main backend settings for migration.
+- File-bridge host and port. A blank host uses `localhost` with the configured file-bridge port (default `8766`), independently of the main backend settings.
 - Auto-scroll on/off.
 - Target language.
 - Translation auto-copy, auto-save, auto-translate toggles and save path.

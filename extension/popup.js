@@ -30,10 +30,6 @@ const ocrPromptEl = document.getElementById('ocr-prompt');
 const dedupPromptEl = document.getElementById('dedup-prompt');
 
 // ── Prompt edit/fallback state ─────────────────────────────────
-let _ocrSaveTimer = null;
-let _dedupSaveTimer = null;
-let _tlSaveTimer = null;
-let _fmtSaveTimer = null;
 const _promptRefreshState = new WeakMap();
 
 function _getPromptRefreshState(el) {
@@ -81,10 +77,10 @@ const tl2PathSuggestions = document.getElementById('tl2-path-suggestions');
 // ── Format panel elements ─────────────────────────────────────
 const formatPrompt = document.getElementById('format-prompt');
 const PROMPT_CONFIGS = {
-  ocr: { name: 'ocr', element: ocrPromptEl, storageKey: () => 'ocrPrompt', timer: '_ocrSaveTimer' },
-  dedup: { name: 'dedup', element: dedupPromptEl, storageKey: () => 'dedupPrompt', timer: '_dedupSaveTimer' },
-  translate: { name: 'translate', element: translatePrompt, storageKey: () => `translatePrompt:${tlLanguage.value}`, timer: '_tlSaveTimer' },
-  format: { name: 'format', element: formatPrompt, storageKey: () => 'formatPrompt', timer: '_fmtSaveTimer' }
+  ocr: { name: 'ocr', element: ocrPromptEl, storageKey: () => 'ocrPrompt' },
+  dedup: { name: 'dedup', element: dedupPromptEl, storageKey: () => 'dedupPrompt' },
+  translate: { name: 'translate', element: translatePrompt, storageKey: () => `translatePrompt:${tlLanguage.value}` },
+  format: { name: 'format', element: formatPrompt, storageKey: () => 'formatPrompt' }
 };
 const _fallbackRequests = new Map();
 const _fallbackData = new Map();
@@ -116,19 +112,6 @@ let lastStoredStatus = '';
 let promptEditorLanguage = 'original';
 const LOCAL_BACKEND_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 const FILE_BRIDGE_DEFAULT_PORT = 8766;
-
-function getPromptTimer(config) {
-  return {
-    _ocrSaveTimer, _dedupSaveTimer, _tlSaveTimer, _fmtSaveTimer
-  }[config.timer];
-}
-
-function setPromptTimer(config, value) {
-  if (config.timer === '_ocrSaveTimer') _ocrSaveTimer = value;
-  if (config.timer === '_dedupSaveTimer') _dedupSaveTimer = value;
-  if (config.timer === '_tlSaveTimer') _tlSaveTimer = value;
-  if (config.timer === '_fmtSaveTimer') _fmtSaveTimer = value;
-}
 
 function fallbackElements(config) {
   return {
@@ -171,10 +154,7 @@ async function persistPrompt(config, key, value) {
 function schedulePromptSave(config) {
   const key = config.storageKey();
   const value = config.element.value;
-  clearTimeout(getPromptTimer(config));
-  setPromptTimer(config, setTimeout(() => {
-    persistPrompt(config, key, value).catch(() => {});
-  }, 350));
+  persistPrompt(config, key, value).catch(() => {});
 }
 
 function handlePromptInput(config) {
@@ -219,11 +199,12 @@ async function refreshFallback(config, { force = false } = {}) {
       if (!response.ok) return;
       const data = await response.json();
       if (!data || typeof data.template !== 'string' || !data.version) return;
-      if (cached?.version !== data.version) await chrome.storage.local.set({ [cacheKey]: data });
-      _fallbackData.set(identity, data);
       const liveBackend = normalizeBackendSettings(hostInput.value, portInput.value);
       if (_fallbackRequests.get(`${identity}:generation`) !== generation) return;
       if (fallbackIdentity(config, liveBackend) !== identity) return;
+      if (cached?.version !== data.version) await chrome.storage.local.set({ [cacheKey]: data });
+      if (_fallbackRequests.get(`${identity}:generation`) !== generation) return;
+      _fallbackData.set(identity, data);
       updatePromptUi(config);
     } finally {
       clearTimeout(timeoutId);
@@ -245,13 +226,11 @@ async function useFallbackAsCustom(config) {
   if (!fallback || config.element.value.trim()) return;
   config.element.value = fallback.template;
   _markPromptDirty(config.element);
-  clearTimeout(getPromptTimer(config));
   await persistPrompt(config, config.storageKey(), config.element.value);
   updatePromptUi(config);
 }
 
 async function resetPromptToFallback(config) {
-  clearTimeout(getPromptTimer(config));
   config.element.value = '';
   _beginPromptRefresh(config.element, { resetDirty: true });
   await chrome.storage.local.remove(config.storageKey());
@@ -1125,15 +1104,13 @@ function loadPathSuggestions() {
 async function fetchPathSuggestions(prefix) {
   try {
     const items = await chrome.storage.sync.get({
-      backendHost: 'localhost',
-      backendPort: 8765,
       fileBridgeHost: '',
       fileBridgePort: FILE_BRIDGE_DEFAULT_PORT
     });
     const hasFileBridgeHost = String(items.fileBridgeHost || '').trim().length > 0;
     const fileBridge = normalizeBackendSettings(
-      hasFileBridgeHost ? items.fileBridgeHost : items.backendHost,
-      hasFileBridgeHost ? items.fileBridgePort : items.backendPort
+      hasFileBridgeHost ? items.fileBridgeHost : 'localhost',
+      items.fileBridgePort || FILE_BRIDGE_DEFAULT_PORT
     );
     const resp = await fetch(`http://${fileBridge.host}:${fileBridge.port}/paths?prefix=${encodeURIComponent(prefix)}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);

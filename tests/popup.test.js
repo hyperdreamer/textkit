@@ -245,7 +245,7 @@ test('fallback preview stays separate and can be copied or reset', async () => {
   assert.equal(harness.elements.get('ocr-fallback').classList.contains('hidden'), false);
 });
 
-test('prompt edits debounce into local storage without writing backend prompts', async () => {
+test('prompt edits save immediately without writing backend prompts', async () => {
   const fetchCalls = [];
   const harness = createPopupHarness({
     fetch: async (...args) => { fetchCalls.push(args); return { ok: true, status: 200 }; }
@@ -256,12 +256,44 @@ test('prompt edits debounce into local storage without writing backend prompts',
   prompt.dispatch('input');
   prompt.value = 'Final edit';
   prompt.dispatch('input');
-  assert.equal(harness.localData.dedupPrompt, undefined);
-
-  await harness.runTimers();
 
   assert.equal(harness.localData.dedupPrompt, 'Final edit');
   assert.equal(fetchCalls.length, 0);
+});
+
+test('stale forced fallback response cannot overwrite the current cache', async () => {
+  const first = deferred();
+  const second = deferred();
+  let fetchCalls = 0;
+  const harness = createPopupHarness({
+    fetch: async () => {
+      fetchCalls += 1;
+      return fetchCalls === 1 ? first.promise : second.promise;
+    }
+  });
+  const config = vm.runInContext('PROMPT_CONFIGS.ocr', harness.context);
+
+  const firstRefresh = harness.context.refreshFallback(config, { force: true });
+  await waitFor(() => fetchCalls === 1, 'first fallback request did not start');
+  const secondRefresh = harness.context.refreshFallback(config, { force: true });
+  await waitFor(() => fetchCalls === 2, 'second fallback request did not start');
+
+  second.resolve({
+    ok: true,
+    status: 200,
+    json: async () => ({ template: 'new prompt', source: 'file', version: 'new' })
+  });
+  await secondRefresh;
+  first.resolve({
+    ok: true,
+    status: 200,
+    json: async () => ({ template: 'stale prompt', source: 'file', version: 'old' })
+  });
+  await firstRefresh;
+
+  const cacheKey = 'promptFallback:localhost:8765:ocr:';
+  assert.equal(harness.localData[cacheKey].template, 'new prompt');
+  assert.equal(harness.elements.get('ocr-fallback-template').textContent, 'new prompt');
 });
 
 test('path suggestions fall back to local history when the backend fails', async () => {
@@ -299,10 +331,15 @@ test('path suggestions use configured file bridge settings', async () => {
   );
 });
 
-test('path suggestions fall back to main backend settings during migration', async () => {
+test('blank file bridge host uses localhost with its configured port', async () => {
   let requestedUrl = '';
   const harness = createPopupHarness({
-    syncData: { backendHost: 'localhost', backendPort: 9876, fileBridgeHost: '' },
+    syncData: {
+      backendHost: '127.0.0.1',
+      backendPort: 9876,
+      fileBridgeHost: '',
+      fileBridgePort: 9777
+    },
     fetch: async (url) => {
       requestedUrl = String(url);
       return { ok: true, json: async () => ({ paths: [] }) };
@@ -311,5 +348,5 @@ test('path suggestions fall back to main backend settings during migration', asy
 
   await harness.context.fetchPathSuggestions('');
 
-  assert.equal(requestedUrl, 'http://localhost:9876/paths?prefix=');
+  assert.equal(requestedUrl, 'http://localhost:9777/paths?prefix=');
 });

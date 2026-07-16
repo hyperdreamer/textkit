@@ -19,9 +19,6 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   if (changes.backendHost || changes.backendPort) {
     _backendBaseUrl = null;
     _backendBaseUrlExpiry = 0;
-    // The file bridge falls back to the main backend until it is configured.
-    _fileBridgeBaseUrl = null;
-    _fileBridgeBaseUrlExpiry = 0;
   }
   if (changes.fileBridgeHost || changes.fileBridgePort) {
     _fileBridgeBaseUrl = null;
@@ -41,14 +38,12 @@ async function getBackendEndpoint(path) {
 async function getFileBridgeEndpoint(path) {
   if (!_fileBridgeBaseUrl || Date.now() > _fileBridgeBaseUrlExpiry) {
     const items = await chrome.storage.sync.get({
-      backendHost: DEFAULT_HOST,
-      backendPort: DEFAULT_PORT,
       fileBridgeHost: '',
       fileBridgePort: FILE_BRIDGE_DEFAULT_PORT
     });
     const hasFileBridgeHost = String(items.fileBridgeHost || '').trim().length > 0;
-    const host = hasFileBridgeHost ? items.fileBridgeHost : items.backendHost;
-    const port = hasFileBridgeHost ? items.fileBridgePort : items.backendPort;
+    const host = hasFileBridgeHost ? items.fileBridgeHost : DEFAULT_HOST;
+    const port = items.fileBridgePort || FILE_BRIDGE_DEFAULT_PORT;
     _fileBridgeBaseUrl = buildBackendEndpoint(host, port, '');
     _fileBridgeBaseUrlExpiry = Date.now() + 60_000;
   }
@@ -106,6 +101,8 @@ let savedLastRegion = null;
 const windowActivationGenerations = new Map();
 const targetTabWaiters = new Set();
 let targetTabChangeRevision = 0;
+const pendingOffscreenCopies = new Map();
+let nextOffscreenCopyId = 1;
 
 function getState(tabId) {
   if (!states.has(tabId)) {
@@ -118,6 +115,28 @@ function getState(tabId) {
     });
   }
   return states.get(tabId);
+}
+
+async function getRecoverableState(tabId) {
+  const state = getState(tabId);
+  if (state.status !== 'Idle' || state.captureInFlight || state.retryState) return state;
+  const retryState = await loadRetryState(tabId);
+  if (!retryState) return state;
+
+  const fragments = Array.isArray(retryState.fragments) ? retryState.fragments : [];
+  Object.assign(state, {
+    active: true,
+    status: 'Error',
+    progress: retryState.stage === 'dedup'
+      ? 'Dedup retry was interrupted. Click Retry to continue.'
+      : 'OCR retry was interrupted. Click Retry to continue.',
+    error: 'The extension service worker restarted during a backend retry.',
+    fragments,
+    fragmentsCollected: fragments.length,
+    retryState,
+    operationPrompts: normalizeCapturePrompts(retryState.promptSnapshot)
+  });
+  return state;
 }
 
 // Load saved region on startup
@@ -209,9 +228,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === 'popup:get-state') {
     getActiveTab()
-      .then((tab) => sendResponse({ ok: true, state: getState(tab.id), tabId: tab.id }))
+      .then(async (tab) => sendResponse({ ok: true, state: await getRecoverableState(tab.id), tabId: tab.id }))
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
+  }
+  if (message?.type === 'offscreen:copied' || message?.type === 'offscreen:copy-failed') {
+    handleOffscreenCopyResult(message);
+    return false;
   }
   if (message?.type === 'selection:complete') {
     const tabId = sender.tab?.id;
@@ -398,6 +421,12 @@ async function handleRetry() {
   if (!rs) throw new Error('No retry state saved.');
   state.retryState = null;
   chrome.storage.local.remove(`retryState:${tab.id}`).catch(() => {});
+  if (rs.stage === 'dedup') {
+    state.operationPrompts = normalizeCapturePrompts(rs.promptSnapshot);
+    updateState(tab.id, { active: true, status: 'Deduplicating', progress: 'Retrying dedup...', error: '' });
+    await finalizePostCapture(tab.id, rs.mergedText || mergeFragments(rs.fragments || []), rs.fragments || []);
+    return { ok: true };
+  }
   updateState(tab.id, { active: true, status: 'Capturing', progress: 'Retrying...', error: '' });
   await resumeCaptureLoop(rs);
   return { ok: true };
@@ -764,7 +793,15 @@ async function executeCaptureLoop({
       const croppedBlob = await cropVisibleCapture(dataUrl, region);
 
       updateState(tabId, { progress: `Sending page ${pageNumber} to OCR...` });
-      let ocrErr = null;
+      state.retryState = {
+        stage: 'ocr',
+        tabId,
+        region,
+        fragments: [...fragments],
+        lastScrollY: scrollY,
+        promptSnapshot: state.operationPrompts
+      };
+      await chrome.storage.local.set({ [`retryState:${tabId}`]: state.retryState });
       for (let attempt = 1; ; attempt++) {
         const target = await waitForTargetActive(
           tabId,
@@ -774,7 +811,10 @@ async function executeCaptureLoop({
             ? `Sending page ${pageNumber} to OCR...`
             : `Retrying page ${pageNumber} (attempt ${attempt})...`
         );
-        if (target.status !== 'active') break capturePages;
+        if (target.status !== 'active') {
+          await clearRetryState(tabId, state);
+          break capturePages;
+        }
         try {
           const text = await postImageForOcr(
             croppedBlob,
@@ -783,36 +823,16 @@ async function executeCaptureLoop({
             state.operationPrompts?.ocr
           );
           fragments.push(text);
-          ocrErr = null;
+          await clearRetryState(tabId, state);
           break;
         } catch (e) {
           if (state.stopRequested || state.targetRemoved || controller.signal.aborted) {
-            ocrErr = null;
+            await clearRetryState(tabId, state);
             break capturePages;
           }
-          ocrErr = e;
           updateState(tabId, { progress: `Retrying page ${pageNumber} (attempt ${attempt + 1})...` });
           await sleep(2000);
         }
-      }
-      if (ocrErr) {
-        state.retryState = {
-          tabId,
-          region,
-          fragments,
-          lastScrollY: scrollY,
-          promptSnapshot: state.operationPrompts
-        };
-        chrome.storage.local.set({ [`retryState:${tabId}`]: state.retryState }).catch(() => {});
-        updateState(tabId, {
-          active: true,
-          status: 'Error',
-          error: ocrErr.message,
-          progress: `Failed on page ${pageNumber}. Click Retry to continue.`,
-          fragmentsCollected: fragments.length
-        });
-        chrome.storage.local.set({ [`lastStatus:${tabId}`]: 'Error' }).catch(() => {});
-        return;
       }
 
       updateState(tabId, {
@@ -1020,6 +1040,16 @@ async function finalizePostCapture(tabId, mergedText, fragments) {
   // Save pre-dedup text for debugging
   chrome.storage.local.set({ [`preDedup:${tabId}`]: mergedText }).catch(() => {});
   const signal = captureControllers.get(tabId)?.signal;
+  state.retryStage = 'dedup';
+  state.pendingText = mergedText;
+  state.retryState = {
+    stage: 'dedup',
+    tabId,
+    mergedText,
+    fragments: [...fragments],
+    promptSnapshot: state.operationPrompts
+  };
+  await chrome.storage.local.set({ [`retryState:${tabId}`]: state.retryState });
   let finalText;
   for (let attempt = 1; ; attempt++) {
     try {
@@ -1030,9 +1060,14 @@ async function finalizePostCapture(tabId, mergedText, fragments) {
       );
       // Save post-dedup text for debugging
       chrome.storage.local.set({ [`postDedup:${tabId}`]: finalText }).catch(() => {});
+      await clearRetryState(tabId, state);
       break;
     } catch (e) {
-      if (state.stopRequested) { finalText = null; break; }
+      if (state.stopRequested) {
+        await clearRetryState(tabId, state);
+        finalText = null;
+        break;
+      }
       updateState(tabId, { progress: `Retrying dedup (${attempt + 1})...` });
       await sleep(2000);
     }
@@ -1043,10 +1078,6 @@ async function finalizePostCapture(tabId, mergedText, fragments) {
     await finalizeCapture(tabId, mergedText, fragments);
     return;
   }
-
-  // Persist dedup-pending state so handleRetry can re-run dedup on failure
-  state.retryStage = 'dedup';
-  state.pendingText = mergedText;
 
   await finalizeCapture(tabId, finalText, fragments);
 }
@@ -1369,7 +1400,7 @@ function resetState(tabId) {
 }
 
 async function copyToClipboard(text) {
-  if (!text) return;
+  if (!text) return false;
   try {
     await chrome.offscreen.createDocument({
       url: 'offscreen.html',
@@ -1379,12 +1410,36 @@ async function copyToClipboard(text) {
   } catch (e) {
     // Document may already exist — that's fine
   }
-  chrome.runtime.sendMessage({ type: 'offscreen:copy', text }).catch(() => {});
-  // Close the offscreen document after the copy completes so it doesn't block
-  // future offscreen operations (MV3 allows only one at a time).
-  setTimeout(() => {
+  const copyId = nextOffscreenCopyId++;
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      finishOffscreenCopy(copyId, new Error('Clipboard copy timed out.'));
+    }, 2000);
+    pendingOffscreenCopies.set(copyId, { resolve, reject, timeoutId });
+    chrome.runtime.sendMessage({ type: 'offscreen:copy', copyId, text }).catch((error) => {
+      finishOffscreenCopy(copyId, error);
+    });
+  });
+}
+
+function handleOffscreenCopyResult(message) {
+  const error = message.type === 'offscreen:copy-failed'
+    ? new Error(message.error || 'Clipboard copy failed.')
+    : null;
+  finishOffscreenCopy(message.copyId, error);
+}
+
+function finishOffscreenCopy(copyId, error = null) {
+  const pending = pendingOffscreenCopies.get(copyId);
+  if (pending) {
+    pendingOffscreenCopies.delete(copyId);
+    clearTimeout(pending.timeoutId);
+    if (error) pending.reject(error);
+    else pending.resolve(true);
+  }
+  if (pendingOffscreenCopies.size === 0) {
     chrome.offscreen.closeDocument().catch(() => {});
-  }, 2000);
+  }
 }
 
 function updateState(tabId, partial) {
@@ -1401,16 +1456,25 @@ function broadcastState(tabId) {
 async function autoCopyIfEnabled(text) {
   const { tl2AutoCopy } = await chrome.storage.sync.get({ tl2AutoCopy: false });
   if (!tl2AutoCopy || !text) return;
-  // Use offscreen clipboard so it works from service worker
-  copyToClipboard(text);
-  // Notify user
-  chrome.notifications.create('auto-copy', {
-    type: 'basic',
-    iconUrl: 'icons/icon128.png',
-    title: 'TextKit — Copied',
-    message: 'Translation copied to system clipboard.',
-    priority: 0
-  });
+  try {
+    await copyToClipboard(text);
+    chrome.notifications.create('auto-copy', {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'TextKit — Copied',
+      message: 'Translation copied to system clipboard.',
+      priority: 0
+    });
+  } catch (e) {
+    console.error('Auto-copy failed:', e);
+    chrome.notifications.create('auto-copy-failed', {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'TextKit — Copy failed',
+      message: e.message,
+      priority: 1
+    });
+  }
 }
 
 async function autoSaveIfEnabled(text) {
@@ -1445,14 +1509,25 @@ async function autoSaveIfEnabled(text) {
 async function fmtAutoCopyIfEnabled(text) {
   const { fmtAutoCopy } = await chrome.storage.sync.get({ fmtAutoCopy: false });
   if (!fmtAutoCopy || !text) return;
-  copyToClipboard(text);
-  chrome.notifications.create('fmt-auto-copy', {
-    type: 'basic',
-    iconUrl: 'icons/icon128.png',
-    title: 'TextKit — Copied',
-    message: 'Formatted text copied to system clipboard.',
-    priority: 0
-  });
+  try {
+    await copyToClipboard(text);
+    chrome.notifications.create('fmt-auto-copy', {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'TextKit — Copied',
+      message: 'Formatted text copied to system clipboard.',
+      priority: 0
+    });
+  } catch (e) {
+    console.error('Auto-copy format failed:', e);
+    chrome.notifications.create('fmt-auto-copy-failed', {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'TextKit — Copy failed',
+      message: e.message,
+      priority: 1
+    });
+  }
 }
 
 async function fmtAutoSaveIfEnabled(text) {
@@ -1486,4 +1561,9 @@ async function loadRetryState(tabId) {
   const key = `retryState:${tabId}`;
   const stored = await chrome.storage.local.get(key);
   return stored[key] || null;
+}
+
+async function clearRetryState(tabId, state = getState(tabId)) {
+  state.retryState = null;
+  await chrome.storage.local.remove(`retryState:${tabId}`);
 }

@@ -56,6 +56,9 @@ function createBackgroundHarness(options = {}) {
   const ocrCalls = [];
   const cropCalls = [];
   const finalized = [];
+  const runtimeMessages = [];
+  const notifications = [];
+  let offscreenCloseCalls = 0;
   const localData = { ...(options.localData || {}) };
   const syncValues = {
     ocrAutoscroll: false,
@@ -148,7 +151,11 @@ function createBackgroundHarness(options = {}) {
     commands: { onCommand: events.command },
     runtime: {
       onMessage: events.runtimeMessage,
-      sendMessage() { return Promise.resolve(); },
+      sendMessage(message) {
+        runtimeMessages.push(message);
+        if (options.runtimeSendMessage) return options.runtimeSendMessage(message);
+        return Promise.resolve();
+      },
       getPlatformInfo(callback) { if (callback) callback({}); }
     },
     scripting: {
@@ -157,9 +164,11 @@ function createBackgroundHarness(options = {}) {
     },
     offscreen: {
       createDocument() { return Promise.resolve(); },
-      closeDocument() { return Promise.resolve(); }
+      closeDocument() { offscreenCloseCalls += 1; return Promise.resolve(); }
     },
-    notifications: { create() {} },
+    notifications: {
+      create(id, options) { notifications.push({ id, options }); }
+    },
     downloads: { download() { return Promise.resolve(1); } }
   };
 
@@ -186,6 +195,7 @@ function createBackgroundHarness(options = {}) {
   };
   vm.runInContext(fs.readFileSync(BACKGROUND_PATH, 'utf8'), context, { filename: BACKGROUND_PATH });
   const originalFinalizeCapture = vm.runInContext('finalizeCapture', context);
+  const originalFinalizePostCapture = vm.runInContext('finalizePostCapture', context);
 
   context.__testCrop = async (dataUrl, region) => {
     cropCalls.push({ dataUrl, region });
@@ -229,9 +239,13 @@ function createBackgroundHarness(options = {}) {
     events,
     localData,
     messageCalls,
+    notifications,
     ocrCalls,
     originalFinalizeCapture,
+    originalFinalizePostCapture,
+    get offscreenCloseCalls() { return offscreenCloseCalls; },
     removeTab,
+    runtimeMessages,
     setActive,
     syncValues,
     tabs
@@ -573,12 +587,116 @@ test('file bridge endpoint uses separate settings and invalidates its cache', as
   assert.equal(await harness.context.getFileBridgeEndpoint('/save'), 'http://127.0.0.1:9777/save');
 });
 
-test('file bridge endpoint falls back to the main backend during migration', async () => {
+test('blank file bridge host uses localhost and the configured file bridge port', async () => {
   const harness = createBackgroundHarness({
-    syncValues: { backendHost: 'localhost', backendPort: 8765, fileBridgeHost: '' }
+    syncValues: {
+      backendHost: '127.0.0.1',
+      backendPort: 9876,
+      fileBridgeHost: '',
+      fileBridgePort: 9777
+    }
   });
 
-  assert.equal(await harness.context.getFileBridgeEndpoint('/save'), 'http://localhost:8765/save');
+  assert.equal(await harness.context.getFileBridgeEndpoint('/save'), 'http://localhost:9777/save');
+  harness.events.onStorageChanged.emit({ backendPort: { oldValue: 9876, newValue: 9999 } }, 'sync');
+  assert.equal(await harness.context.getFileBridgeEndpoint('/save'), 'http://localhost:9777/save');
+});
+
+test('OCR retry snapshot is persisted before the infinite retry loop', async () => {
+  const retryDelay = deferred();
+  const harness = createBackgroundHarness({ syncValues: { ocrAutoscroll: true } });
+  harness.context.__testOcr = async (_blob, pageNumber) => {
+    harness.ocrCalls.push({ pageNumber });
+    throw new Error('OCR unavailable');
+  };
+  harness.context.__retryDelay = retryDelay.promise;
+  vm.runInContext('sleep = (ms) => ms === 2000 ? __retryDelay : Promise.resolve();', harness.context);
+
+  const operation = harness.context.executeCaptureLoop({
+    tabId: 1,
+    region: REGION,
+    fragments: ['first page'],
+    lastScrollY: 100,
+    resetBeforeStart: false,
+    refreshAutoscroll: false,
+    promptSnapshot: { ocr: 'OCR prompt', dedup: 'Dedup prompt' }
+  });
+  await waitFor(() => harness.ocrCalls.length === 1, 'OCR request did not start');
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(harness.localData['retryState:1'])),
+    {
+      stage: 'ocr',
+      tabId: 1,
+      region: REGION,
+      fragments: ['first page'],
+      lastScrollY: 100,
+      promptSnapshot: { ocr: 'OCR prompt', dedup: 'Dedup prompt' }
+    }
+  );
+
+  harness.context.getState(1).stopRequested = true;
+  retryDelay.resolve();
+  await operation;
+  assert.equal(Object.hasOwn(harness.localData, 'retryState:1'), false);
+});
+
+test('dedup retry snapshot is persisted before the infinite retry loop', async () => {
+  const retryDelay = deferred();
+  const harness = createBackgroundHarness();
+  harness.context.getState(1).operationPrompts = { dedup: 'Dedup prompt' };
+  harness.context.__testDedup = async () => { throw new Error('Dedup unavailable'); };
+  harness.context.__retryDelay = retryDelay.promise;
+  vm.runInContext(`
+    postTextForDedup = (...args) => __testDedup(...args);
+    sleep = (ms) => ms === 2000 ? __retryDelay : Promise.resolve();
+  `, harness.context);
+
+  const operation = harness.originalFinalizePostCapture(1, 'merged text', ['first', 'second']);
+  await waitFor(() => harness.localData['retryState:1'], 'dedup retry state was not saved');
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(harness.localData['retryState:1'])),
+    {
+      stage: 'dedup',
+      tabId: 1,
+      mergedText: 'merged text',
+      fragments: ['first', 'second'],
+      promptSnapshot: { dedup: 'Dedup prompt' }
+    }
+  );
+
+  harness.context.getState(1).stopRequested = true;
+  retryDelay.resolve();
+  await operation;
+  assert.equal(Object.hasOwn(harness.localData, 'retryState:1'), false);
+});
+
+test('stored retry state becomes actionable after a service worker restart', async () => {
+  const storedRetry = {
+    stage: 'ocr',
+    tabId: 1,
+    region: REGION,
+    fragments: ['recovered fragment'],
+    lastScrollY: 100,
+    promptSnapshot: { ocr: 'Saved OCR prompt' }
+  };
+  const harness = createBackgroundHarness({ localData: { 'retryState:1': storedRetry } });
+  const recovered = await harness.context.getRecoverableState(1);
+
+  assert.equal(recovered.status, 'Error');
+  assert.equal(recovered.active, true);
+  assert.deepEqual([...recovered.fragments], ['recovered fragment']);
+
+  harness.context.__resumedRetry = null;
+  vm.runInContext('resumeCaptureLoop = async (retryState) => { __resumedRetry = retryState; };', harness.context);
+  const result = await harness.context.handleRetry();
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(harness.context.__resumedRetry)),
+    storedRetry
+  );
 });
 
 test('a non-OCR capture failure finalizes fragments already collected', async () => {
@@ -647,6 +765,46 @@ test('manual translation substitutes every language placeholder in a custom prom
 
   assert.equal(result.ok, true);
   assert.equal(requestBody.prompt, 'Translate to French. Answer only in French.');
+});
+
+test('auto-copy waits for offscreen confirmation before showing success', async () => {
+  const harness = createBackgroundHarness({ syncValues: { tl2AutoCopy: true } });
+
+  const operation = harness.context.autoCopyIfEnabled('translated text');
+  await waitFor(
+    () => harness.runtimeMessages.some((message) => message.type === 'offscreen:copy'),
+    'offscreen copy request was not sent'
+  );
+  const request = harness.runtimeMessages.find((message) => message.type === 'offscreen:copy');
+  assert.equal(harness.notifications.length, 0);
+  assert.equal(harness.offscreenCloseCalls, 0);
+
+  harness.events.runtimeMessage.emit({ type: 'offscreen:copied', copyId: request.copyId }, {}, () => {});
+  await operation;
+
+  assert.deepEqual(harness.notifications.map(({ id }) => id), ['auto-copy']);
+  assert.equal(harness.offscreenCloseCalls, 1);
+});
+
+test('offscreen copy failure suppresses success and reports failure', async () => {
+  const harness = createBackgroundHarness({ syncValues: { fmtAutoCopy: true } });
+
+  const operation = harness.context.fmtAutoCopyIfEnabled('formatted text');
+  await waitFor(
+    () => harness.runtimeMessages.some((message) => message.type === 'offscreen:copy'),
+    'offscreen copy request was not sent'
+  );
+  const request = harness.runtimeMessages.find((message) => message.type === 'offscreen:copy');
+  harness.events.runtimeMessage.emit({
+    type: 'offscreen:copy-failed',
+    copyId: request.copyId,
+    error: 'clipboard denied'
+  }, {}, () => {});
+  await operation;
+
+  assert.deepEqual(harness.notifications.map(({ id }) => id), ['fmt-auto-copy-failed']);
+  assert.equal(harness.notifications[0].options.message, 'clipboard denied');
+  assert.equal(harness.offscreenCloseCalls, 1);
 });
 
 test('capture prompt overrides are snapshotted when selection starts', async () => {
