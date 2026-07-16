@@ -241,19 +241,16 @@ test('fallback preview stays separate and can be copied or reset', async () => {
   const prompt = harness.elements.get('ocr-prompt');
 
   await harness.context.refreshFallback(config, { force: true });
-  assert.equal(prompt.value, '');
-  assert.equal(harness.elements.get('ocr-fallback-template').textContent, 'Server OCR default');
-  assert.equal(harness.elements.get('ocr-fallback').classList.contains('hidden'), false);
-
-  await harness.context.useFallbackAsCustom(config);
   assert.equal(prompt.value, 'Server OCR default');
+
+  // Simulate user edit: typing marks dirty and saves to localStorage
+  prompt.value = 'Server OCR default';
+  prompt.dispatch('input');
   assert.equal(harness.localData.ocrPrompt, 'Server OCR default');
-  assert.equal(harness.elements.get('ocr-fallback').classList.contains('hidden'), true);
 
   await harness.context.resetPromptToFallback(config);
-  assert.equal(prompt.value, '');
+  assert.equal(prompt.value, 'Server OCR default');
   assert.equal(Object.hasOwn(harness.localData, 'ocrPrompt'), false);
-  assert.equal(harness.elements.get('ocr-fallback').classList.contains('hidden'), false);
 });
 
 test('prompt edits save immediately without writing backend prompts', async () => {
@@ -283,6 +280,7 @@ test('stale forced fallback response cannot overwrite the current cache', async 
     }
   });
   const config = vm.runInContext('PROMPT_CONFIGS.ocr', harness.context);
+  const prompt = harness.elements.get('ocr-prompt');
 
   const firstRefresh = harness.context.refreshFallback(config, { force: true });
   await waitFor(() => fetchCalls === 1, 'first fallback request did not start');
@@ -304,7 +302,7 @@ test('stale forced fallback response cannot overwrite the current cache', async 
 
   const cacheKey = 'promptFallback:localhost:8765:ocr:';
   assert.equal(harness.localData[cacheKey].template, 'new prompt');
-  assert.equal(harness.elements.get('ocr-fallback-template').textContent, 'new prompt');
+  assert.equal(prompt.value, 'new prompt');
 });
 
 test('path suggestions fall back to local history when the backend fails', async () => {

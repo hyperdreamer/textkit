@@ -115,10 +115,6 @@ const FILE_BRIDGE_DEFAULT_PORT = 8766;
 
 function fallbackElements(config) {
   return {
-    container: document.getElementById(`${config.name}-fallback`),
-    template: document.getElementById(`${config.name}-fallback-template`),
-    source: document.getElementById(`${config.name}-fallback-source`),
-    use: document.getElementById(`${config.name}-use-default`),
     reset: document.getElementById(`${config.name}-reset-default`)
   };
 }
@@ -133,16 +129,18 @@ function fallbackStorageKey(identity) {
 }
 
 function updatePromptUi(config) {
-  const elements = fallbackElements(config);
-  const hasCustom = config.element.value.trim().length > 0;
+  const state = _getPromptRefreshState(config.element);
   let backend;
   try { backend = normalizeBackendSettings(hostInput.value, portInput.value); } catch { backend = null; }
   const fallback = backend ? _fallbackData.get(fallbackIdentity(config, backend)) : null;
+  const elements = fallbackElements(config);
+  const hasCustom = state.dirty && config.element.value.trim().length > 0;
   elements.reset.disabled = !hasCustom;
-  elements.container.classList.toggle('hidden', hasCustom || !fallback);
-  if (fallback) {
-    elements.template.textContent = fallback.template;
-    elements.source.textContent = fallback.source === 'file' ? 'backend file' : 'hardcoded failsafe';
+  if (!state.dirty && fallback) {
+    if (config.element.value !== fallback.template) config.element.value = fallback.template;
+    config.element.classList.add('server-default');
+  } else {
+    config.element.classList.remove('server-default');
   }
   if (config.name === 'translate') updateTranslateHintFromValue();
 }
@@ -159,13 +157,15 @@ function schedulePromptSave(config) {
 
 function handlePromptInput(config) {
   _markPromptDirty(config.element);
+  config.element.classList.remove('server-default');
   schedulePromptSave(config);
   updatePromptUi(config);
   if (!config.element.value.trim()) refreshFallback(config).catch(() => {});
 }
 
 async function refreshFallback(config, { force = false } = {}) {
-  if (config.element.value.trim()) {
+  const state = _getPromptRefreshState(config.element);
+  if (state.dirty && config.element.value.trim()) {
     updatePromptUi(config);
     return;
   }
@@ -219,19 +219,7 @@ function refreshAllFallbacks(options = {}) {
   return Promise.allSettled(Object.values(PROMPT_CONFIGS).map((config) => refreshFallback(config, options)));
 }
 
-async function useFallbackAsCustom(config) {
-  let backend;
-  try { backend = normalizeBackendSettings(hostInput.value, portInput.value); } catch { return; }
-  const fallback = _fallbackData.get(fallbackIdentity(config, backend));
-  if (!fallback || config.element.value.trim()) return;
-  config.element.value = fallback.template;
-  _markPromptDirty(config.element);
-  await persistPrompt(config, config.storageKey(), config.element.value);
-  updatePromptUi(config);
-}
-
 async function resetPromptToFallback(config) {
-  config.element.value = '';
   _beginPromptRefresh(config.element, { resetDirty: true });
   await chrome.storage.local.remove(config.storageKey());
   updatePromptUi(config);
@@ -322,7 +310,6 @@ dedupPromptEl.addEventListener('input', () => {
 });
 Object.values(PROMPT_CONFIGS).forEach((config) => {
   const elements = fallbackElements(config);
-  elements.use.addEventListener('click', () => useFallbackAsCustom(config));
   elements.reset.addEventListener('click', () => resetPromptToFallback(config));
 });
 fmtSavePath.addEventListener('input', () => {

@@ -304,40 +304,25 @@
         justify-content: flex-end;
         margin-top: 7px;
       }
-      .prompt-controls button,
-      .fallback-preview button {
+      .prompt-controls button {
         flex: none;
         width: auto;
         height: 28px;
         padding: 0 9px;
       }
-      .fallback-preview {
-        margin-top: 8px;
-        padding: 8px;
-        border: 1px solid #d7dee8;
-        border-radius: 6px;
-        color: #64748b;
-        background: #f1f5f9;
+      .prompt-editor textarea {
+        min-height: 105px;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       }
-      .fallback-label {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-        margin-bottom: 5px;
-        color: #6b7280;
-        font-size: 11px;
-        font-weight: 650;
+      .prompt-editor textarea::placeholder {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        font-size: 12px;
+        font-weight: normal;
+        font-style: normal;
+        line-height: 1.45;
       }
-      .fallback-source { color: #94a3b8; font-weight: 400; }
-      .fallback-template {
-        max-height: 120px;
-        margin: 0 0 7px;
-        overflow: auto;
-        white-space: pre-wrap;
-        overflow-wrap: anywhere;
-        color: #7c8798;
-        font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      .prompt-editor textarea.server-default {
+        color: #94a3b8;
       }
       .hidden { display: none; }
     </style>
@@ -395,17 +380,12 @@
     <!-- Prompt editor panel -->
     <main id="translate-panel" class="hidden">
       <h1>Prompts</h1>
-      <p class="prompt-intro">Custom prompts stay in this extension. Leave a prompt empty to use the server default.</p>
+      <p class="prompt-intro">Edit prompts below. Server defaults are shown in monospace.</p>
       <div class="prompt-accordion">
         <details class="prompt-section" data-prompt-section="ocr" open>
           <summary>OCR</summary>
           <div class="prompt-editor">
             <textarea id="ocr-prompt" placeholder="Optional custom OCR prompt"></textarea>
-            <div id="ocr-fallback" class="fallback-preview hidden">
-              <div class="fallback-label"><span>Using server default</span><span id="ocr-fallback-source" class="fallback-source"></span></div>
-              <pre id="ocr-fallback-template" class="fallback-template"></pre>
-              <button id="ocr-use-default" type="button" class="secondary">Use as custom</button>
-            </div>
             <div class="prompt-controls"><button id="ocr-reset-default" type="button" class="secondary">Reset to server default</button></div>
           </div>
         </details>
@@ -413,11 +393,6 @@
           <summary>Dedup</summary>
           <div class="prompt-editor">
             <textarea id="dedup-prompt" placeholder="Optional custom dedup prompt"></textarea>
-            <div id="dedup-fallback" class="fallback-preview hidden">
-              <div class="fallback-label"><span>Using server default</span><span id="dedup-fallback-source" class="fallback-source"></span></div>
-              <pre id="dedup-fallback-template" class="fallback-template"></pre>
-              <button id="dedup-use-default" type="button" class="secondary">Use as custom</button>
-            </div>
             <div class="prompt-controls"><button id="dedup-reset-default" type="button" class="secondary">Reset to server default</button></div>
           </div>
         </details>
@@ -440,11 +415,6 @@
             </div>
             <textarea id="translate-prompt" placeholder="Optional custom translation prompt for this language"></textarea>
             <span id="translate-prompt-hint" class="hint hidden"></span>
-            <div id="translate-fallback" class="fallback-preview hidden">
-              <div class="fallback-label"><span>Using server default</span><span id="translate-fallback-source" class="fallback-source"></span></div>
-              <pre id="translate-fallback-template" class="fallback-template"></pre>
-              <button id="translate-use-default" type="button" class="secondary">Use as custom</button>
-            </div>
             <div class="prompt-controls"><button id="translate-reset-default" type="button" class="secondary">Reset to server default</button></div>
           </div>
         </details>
@@ -452,11 +422,6 @@
           <summary>Format</summary>
           <div class="prompt-editor">
             <textarea id="format-prompt" placeholder="Optional custom formatting prompt"></textarea>
-            <div id="format-fallback" class="fallback-preview hidden">
-              <div class="fallback-label"><span>Using server default</span><span id="format-fallback-source" class="fallback-source"></span></div>
-              <pre id="format-fallback-template" class="fallback-template"></pre>
-              <button id="format-use-default" type="button" class="secondary">Use as custom</button>
-            </div>
             <div class="prompt-controls"><button id="format-reset-default" type="button" class="secondary">Reset to server default</button></div>
           </div>
         </details>
