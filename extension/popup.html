@@ -256,6 +256,80 @@
         outline: none;
       }
       .hint { display: block; font-size: 11px; color: #888; margin-top: 4px; }
+      .prompt-intro {
+        margin: -4px 0 10px;
+        color: #64748b;
+        font-size: 11px;
+      }
+      .prompt-accordion {
+        display: grid;
+        gap: 8px;
+      }
+      .prompt-section {
+        overflow: hidden;
+        border: 1px solid #dbe3ef;
+        border-radius: 8px;
+        background: #fff;
+      }
+      .prompt-section summary {
+        padding: 9px 10px;
+        color: #334155;
+        font-weight: 650;
+        cursor: pointer;
+        list-style: none;
+      }
+      .prompt-section summary::-webkit-details-marker { display: none; }
+      .prompt-section summary::after {
+        content: "▸";
+        float: right;
+        color: #94a3b8;
+      }
+      .prompt-section[open] summary {
+        border-bottom: 1px solid #e2e8f0;
+      }
+      .prompt-section[open] summary::after { content: "▾"; }
+      .prompt-editor { padding: 10px; }
+      .prompt-editor textarea { min-height: 105px; }
+      .prompt-controls {
+        display: flex;
+        justify-content: flex-end;
+        margin-top: 7px;
+      }
+      .prompt-controls button,
+      .fallback-preview button {
+        flex: none;
+        width: auto;
+        height: 28px;
+        padding: 0 9px;
+      }
+      .fallback-preview {
+        margin-top: 8px;
+        padding: 8px;
+        border: 1px solid #d7dee8;
+        border-radius: 6px;
+        color: #64748b;
+        background: #f1f5f9;
+      }
+      .fallback-label {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 5px;
+        color: #6b7280;
+        font-size: 11px;
+        font-weight: 650;
+      }
+      .fallback-source { color: #94a3b8; font-weight: 400; }
+      .fallback-template {
+        max-height: 120px;
+        margin: 0 0 7px;
+        overflow: auto;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        color: #7c8798;
+        font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
       .hidden { display: none; }
     </style>
   </head>
@@ -309,31 +383,75 @@
       <div id="last-region"></div>
     </main>
 
-    <!-- Translate Panel → "Prompts" -->
+    <!-- Prompt editor panel -->
     <main id="translate-panel" class="hidden">
-      <h1>OCR Prompt</h1>
-      <textarea id="ocr-prompt" placeholder="Custom OCR prompt. E.g.: Transcribe all visible Japanese text." style="min-height:80px"></textarea>
-      <h1>Dedup Prompt</h1>
-      <textarea id="dedup-prompt" placeholder="Custom dedup prompt. E.g.: Remove duplicates and fix OCR errors." style="min-height:80px;margin-top:8px"></textarea>
-      <h1>Translation Prompt</h1>
-      <div class="settings">
-        <label>Language
-          <select id="tl-language">
-            <option value="original">Original</option>
-            <option value="Chinese">Chinese</option>
-            <option value="English">English</option>
-            <option value="Japanese">Japanese</option>
-            <option value="Korean">Korean</option>
-            <option value="French">French</option>
-            <option value="German">German</option>
-            <option value="Spanish">Spanish</option>
-          </select>
-        </label>
+      <h1>Prompts</h1>
+      <p class="prompt-intro">Custom prompts stay in this extension. Leave a prompt empty to use the server default.</p>
+      <div class="prompt-accordion">
+        <details class="prompt-section" data-prompt-section="ocr" open>
+          <summary>OCR</summary>
+          <div class="prompt-editor">
+            <textarea id="ocr-prompt" placeholder="Optional custom OCR prompt"></textarea>
+            <div id="ocr-fallback" class="fallback-preview hidden">
+              <div class="fallback-label"><span>Using server default</span><span id="ocr-fallback-source" class="fallback-source"></span></div>
+              <pre id="ocr-fallback-template" class="fallback-template"></pre>
+              <button id="ocr-use-default" type="button" class="secondary">Use as custom</button>
+            </div>
+            <div class="prompt-controls"><button id="ocr-reset-default" type="button" class="secondary">Reset to server default</button></div>
+          </div>
+        </details>
+        <details class="prompt-section" data-prompt-section="dedup">
+          <summary>Dedup</summary>
+          <div class="prompt-editor">
+            <textarea id="dedup-prompt" placeholder="Optional custom dedup prompt"></textarea>
+            <div id="dedup-fallback" class="fallback-preview hidden">
+              <div class="fallback-label"><span>Using server default</span><span id="dedup-fallback-source" class="fallback-source"></span></div>
+              <pre id="dedup-fallback-template" class="fallback-template"></pre>
+              <button id="dedup-use-default" type="button" class="secondary">Use as custom</button>
+            </div>
+            <div class="prompt-controls"><button id="dedup-reset-default" type="button" class="secondary">Reset to server default</button></div>
+          </div>
+        </details>
+        <details class="prompt-section" data-prompt-section="translate">
+          <summary>Translate</summary>
+          <div class="prompt-editor">
+            <div class="settings">
+              <label>Language
+                <select id="tl-language">
+                  <option value="original">Original</option>
+                  <option value="Chinese">Chinese</option>
+                  <option value="English">English</option>
+                  <option value="Japanese">Japanese</option>
+                  <option value="Korean">Korean</option>
+                  <option value="French">French</option>
+                  <option value="German">German</option>
+                  <option value="Spanish">Spanish</option>
+                </select>
+              </label>
+            </div>
+            <textarea id="translate-prompt" placeholder="Optional custom translation prompt for this language"></textarea>
+            <span id="translate-prompt-hint" class="hint hidden"></span>
+            <div id="translate-fallback" class="fallback-preview hidden">
+              <div class="fallback-label"><span>Using server default</span><span id="translate-fallback-source" class="fallback-source"></span></div>
+              <pre id="translate-fallback-template" class="fallback-template"></pre>
+              <button id="translate-use-default" type="button" class="secondary">Use as custom</button>
+            </div>
+            <div class="prompt-controls"><button id="translate-reset-default" type="button" class="secondary">Reset to server default</button></div>
+          </div>
+        </details>
+        <details class="prompt-section" data-prompt-section="format">
+          <summary>Format</summary>
+          <div class="prompt-editor">
+            <textarea id="format-prompt" placeholder="Optional custom formatting prompt"></textarea>
+            <div id="format-fallback" class="fallback-preview hidden">
+              <div class="fallback-label"><span>Using server default</span><span id="format-fallback-source" class="fallback-source"></span></div>
+              <pre id="format-fallback-template" class="fallback-template"></pre>
+              <button id="format-use-default" type="button" class="secondary">Use as custom</button>
+            </div>
+            <div class="prompt-controls"><button id="format-reset-default" type="button" class="secondary">Reset to server default</button></div>
+          </div>
+        </details>
       </div>
-      <textarea id="translate-prompt" placeholder="Custom AI prompt (per language). E.g.: Translate to formal academic Chinese." style="min-height:200px"></textarea>
-      <span id="translate-prompt-hint" class="hint hidden"></span>
-      <h1>Format Prompt</h1>
-      <textarea id="format-prompt" placeholder="Custom formatting prompt. E.g.: Reformat this text as clean Markdown with headings and bullet points." style="min-height:100px;margin-top:8px"></textarea>
     </main>
 
     <!-- Translation Panel -->

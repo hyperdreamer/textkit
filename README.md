@@ -24,7 +24,7 @@ The popup has four tabs:
 - **OCR** — capture controls, progress, raw result, copy/download.
 - **Translation** — translate OCR result to a target language, with auto-copy/auto-save/auto-translate.
 - **Format** — format the translated text with a custom AI prompt, with auto-copy/auto-save/auto-format.
-- **Prompts** — configure the custom AI prompts used by OCR, Dedup, Translation, and Format.
+- **Prompts** — edit extension-local OCR, Dedup, Translation, and Format overrides in a compact accordion, with server-default previews.
 
 ## Quick Start
 
@@ -147,13 +147,15 @@ curl -X POST "http://localhost:8765/format" \
 
 Uses the same AI text provider as `/translate` and `/dedup` (`config.text` override if configured).
 
-### Prompts: shared defaults vs per-request overrides
+### Three-tier prompt precedence
 
-Every AI endpoint (`/ocr`, `/dedup`, `/translate`, `/format`) accepts an **optional** `prompt` field. This gives you two usage patterns that coexist without conflict:
+Every AI endpoint (`/ocr`, `/dedup`, `/translate`, `/format`) accepts an optional `prompt` field. The effective prompt is selected in this order:
 
-**Shared prompt (omit `prompt`):** The backend uses the default template from `backend/prompts/{name}.txt`. All apps and the extension share the same prompt. Edit it once via the Prompts tab, `PUT /prompts/{name}`, or by editing the file directly.
+1. **Plugin prompt** — a nonempty custom prompt sent with the request. The extension stores these overrides only in `chrome.storage.local`.
+2. **Backend file** — `backend/prompts/{name}.txt`, or `translate.{Language}.txt` before the base translate file.
+3. **Hardcoded failsafe** — the matching entry in `_DEFAULT_PROMPTS` when no prompt file exists.
 
-**Per-app override (include `prompt`):** Send your own prompt in the request body. The backend uses it *instead* of the disk file — no other app is affected. Your app can use whatever prompt logic it wants.
+The extension never writes canonical backend prompt files. Its Prompts tab leaves an empty editor empty, shows the server fallback separately, and offers **Use as custom** and **Reset to server default** actions.
 
 ### `GET /prompts`
 
@@ -165,9 +167,25 @@ Response shape: `{"prompts": {"ocr": "...", "dedup": "...", "translate": "...", 
 curl "http://localhost:8765/prompts"
 ```
 
+### `GET /prompts/{name}/fallback`
+
+Returns the prompt the server would use if no custom prompt were supplied. The response includes the source tier and a SHA-256 version used by the extension's preview cache:
+
+```json
+{"template":"...","source":"file","version":"<sha256>"}
+```
+
+Translation fallbacks accept a language selector:
+
+```sh
+curl "http://localhost:8765/prompts/translate/fallback?language=French"
+```
+
+`source` is `file` for a language-specific or base prompt file and `hardcoded` for `_DEFAULT_PROMPTS`.
+
 ### `GET /prompts/{name}` · `PUT /prompts/{name}`
 
-Read or update a prompt template by name (`ocr`, `dedup`, `translate`, or `format`).
+Read or update a canonical server prompt template by name (`ocr`, `dedup`, `translate`, or `format`). These endpoints remain available for server administrators and external administration tools; the extension does not call `PUT`.
 
 The `translate` prompt supports per-language variants via the `?language=` query parameter (e.g. `?language=French` writes `translate.French.txt`). Other prompts ignore the parameter.
 
@@ -180,13 +198,13 @@ curl "http://localhost:8765/prompts/translate"
 # Read per-language
 curl "http://localhost:8765/prompts/translate?language=French"
 
-# Write (extension syncs after a short delay)
+# Administrative write
 curl -X PUT "http://localhost:8765/prompts/ocr" \
   -H "Content-Type: application/json" \
   -d '{"template": "Transcribe all visible text in Japanese"}'
 ```
 
-Prompts are persisted to `backend/prompts/*.txt` on disk and survive backend restarts. Other apps or scripts can read and write them through the same API.
+Administrative PUTs are persisted to `backend/prompts/*.txt` on disk and survive backend restarts. Extension-local prompt overrides remain in Chrome storage and are sent only with individual AI requests.
 
 ### Configuration
 
@@ -258,7 +276,7 @@ Main files:
 | **OCR** | Start/stop capture, view status/progress, copy/download OCR result. |
 | **Translation** | Translate OCR result to a target language. Auto-copy, auto-save (with save path), and auto-translate checkboxes. |
 | **Format** | Format text with a custom AI prompt. Choose source (OCR or Translation), auto-copy, auto-save (with dedicated save path), and auto-format checkboxes. Auto-format fires automatically when translation completes. |
-| **Prompts** | Configure the four AI prompts: **OCR Prompt**, **Dedup Prompt**, **Translation Prompt** (per-language), and **Format Prompt**. All prompts sync to the backend so they can be used by other apps. |
+| **Prompts** | Edit extension-local OCR, Dedup, per-language Translation, and Format overrides in a one-at-a-time accordion. Empty editors show the server fallback without copying it into the custom value. |
 
 ### Capture controls
 
@@ -289,7 +307,7 @@ For each captured page region, the extension:
 5. Merges fragments locally using line-overlap detection.
 6. Sends the merged text to `POST /dedup`.
 7. If a language other than `Original` is selected, sends the deduplicated text to `POST /translate`.
-8. If auto-format is enabled and a format prompt is set, sends the selected source (Translation or OCR Result) to `POST /format`.
+8. If auto-format is enabled, sends the selected source (Translation or OCR Result) to `POST /format`, using the extension override when set or the server fallback otherwise.
 
 The popup language dropdown supports `Original`, `Chinese`, `English`, `Japanese`, `Korean`, `French`, `German`, and `Spanish`. Choosing `Original` skips translation.
 
@@ -322,9 +340,10 @@ Settings persisted to Chrome local storage:
 
 - Last region size and position.
 - Per-tab: OCR result, translation result, format result, status messages.
-- OCR prompt, dedup prompt (user-defined, synced to backend after a short delay).
-- Format prompt (user-defined, synced to backend after a short delay).
-- Translation prompts (per-language, user-defined, synced to backend after a short delay).
+- OCR prompt and dedup prompt (extension-local user overrides).
+- Format prompt (extension-local user override).
+- Translation prompts (extension-local, per-language user overrides).
+- Cached server fallback previews and their SHA-256 versions.
 - Save path autocomplete — queried in real time from file-bridge (with local history fallback).
 
 ## Development Notes
@@ -381,4 +400,4 @@ Select a language other than `Original` before starting capture. You can also us
 
 ### Format does not run automatically
 
-Make sure **Auto-format** is checked on the Format tab and a **Format Prompt** is configured on the Prompt tab. Auto-format runs after the selected source completes: either Translation or OCR Result.
+Make sure **Auto-format** is checked on the Format tab. Auto-format runs after the selected source completes and uses the custom Format prompt when present, otherwise the server fallback.

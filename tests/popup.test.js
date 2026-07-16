@@ -82,6 +82,7 @@ function createPopupHarness(options = {}) {
   const localData = { ...(options.localData || {}) };
   const syncData = { ...(options.syncData || {}) };
   let timerId = 0;
+  const timers = new Map();
 
   const document = {
     getElementById(id) {
@@ -150,18 +151,28 @@ function createPopupHarness(options = {}) {
     Blob,
     URL,
     chrome,
-    clearTimeout() {},
+    clearTimeout(id) { timers.delete(id); },
     console,
     document,
     fetch: options.fetch || fetch,
     navigator: { clipboard: { writeText: async () => {} } },
-    setTimeout() { timerId += 1; return timerId; }
+    setTimeout(callback) {
+      timerId += 1;
+      timers.set(timerId, callback);
+      return timerId;
+    }
   };
   context.globalThis = context;
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(POPUP_PATH, 'utf8'), context, { filename: POPUP_PATH });
 
-  return { context, elements, localData, runtimeMessage, syncData };
+  async function runTimers() {
+    const callbacks = [...timers.values()];
+    timers.clear();
+    await Promise.all(callbacks.map((callback) => callback()));
+  }
+
+  return { context, elements, localData, runTimers, runtimeMessage, syncData };
 }
 
 test('prompt refresh rejects stale generations and dirty textareas', () => {
@@ -177,11 +188,10 @@ test('prompt refresh rejects stale generations and dirty textareas', () => {
   assert.equal(prompt.value, 'current');
 });
 
-test('language prompt refresh does not clobber an edit made while fetch is pending', async () => {
+test('fallback refresh does not clobber an edit made while fetch is pending', async () => {
   const response = deferred();
   let fetchCalls = 0;
   const harness = createPopupHarness({
-    localData: { 'translatePrompt:English': 'local prompt' },
     fetch: async () => {
       fetchCalls += 1;
       return response.promise;
@@ -192,19 +202,66 @@ test('language prompt refresh does not clobber an edit made while fetch is pendi
   language.value = 'English';
 
   await harness.context.loadPromptForLanguage();
-  await waitFor(() => fetchCalls === 1, 'language prompt fetch did not start');
-  assert.equal(prompt.value, 'local prompt');
+  await waitFor(() => fetchCalls === 1, 'fallback fetch did not start');
+  assert.equal(prompt.value, '');
 
   prompt.value = 'user edit';
   prompt.dispatch('input');
   response.resolve({
     ok: true,
-    json: async () => ({ template: 'backend prompt', has_language_param: false })
+    status: 200,
+    json: async () => ({ template: 'backend prompt', source: 'file', version: 'v1' })
   });
   await delay();
   await delay();
 
   assert.equal(prompt.value, 'user edit');
+});
+
+test('fallback preview stays separate and can be copied or reset', async () => {
+  const harness = createPopupHarness({
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ template: 'Server OCR default', source: 'file', version: 'abc' })
+    })
+  });
+  const config = vm.runInContext('PROMPT_CONFIGS.ocr', harness.context);
+  const prompt = harness.elements.get('ocr-prompt');
+
+  await harness.context.refreshFallback(config, { force: true });
+  assert.equal(prompt.value, '');
+  assert.equal(harness.elements.get('ocr-fallback-template').textContent, 'Server OCR default');
+  assert.equal(harness.elements.get('ocr-fallback').classList.contains('hidden'), false);
+
+  await harness.context.useFallbackAsCustom(config);
+  assert.equal(prompt.value, 'Server OCR default');
+  assert.equal(harness.localData.ocrPrompt, 'Server OCR default');
+  assert.equal(harness.elements.get('ocr-fallback').classList.contains('hidden'), true);
+
+  await harness.context.resetPromptToFallback(config);
+  assert.equal(prompt.value, '');
+  assert.equal(Object.hasOwn(harness.localData, 'ocrPrompt'), false);
+  assert.equal(harness.elements.get('ocr-fallback').classList.contains('hidden'), false);
+});
+
+test('prompt edits debounce into local storage without writing backend prompts', async () => {
+  const fetchCalls = [];
+  const harness = createPopupHarness({
+    fetch: async (...args) => { fetchCalls.push(args); return { ok: true, status: 200 }; }
+  });
+  const prompt = harness.elements.get('dedup-prompt');
+
+  prompt.value = 'First edit';
+  prompt.dispatch('input');
+  prompt.value = 'Final edit';
+  prompt.dispatch('input');
+  assert.equal(harness.localData.dedupPrompt, undefined);
+
+  await harness.runTimers();
+
+  assert.equal(harness.localData.dedupPrompt, 'Final edit');
+  assert.equal(fetchCalls.length, 0);
 });
 
 test('path suggestions fall back to local history when the backend fails', async () => {

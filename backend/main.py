@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -938,6 +939,14 @@ def _read_prompt_direct(name: str, language: str | None = None) -> str | None:
     return None
 
 
+def _fallback_prompt(name: str, language: str | None = None) -> tuple[str, str]:
+    """Return the server-side fallback template and its source tier."""
+    template = _read_prompt_direct(name, language)
+    if template is not None:
+        return template, "file"
+    return _DEFAULT_PROMPTS.get(name, ""), "hardcoded"
+
+
 @app.get("/prompts")
 async def list_prompts() -> dict[str, dict[str, str]]:
     """Return all available prompt templates."""
@@ -952,6 +961,27 @@ async def list_prompts() -> dict[str, dict[str, str]]:
     for name, default in _DEFAULT_PROMPTS.items():
         prompts.setdefault(name, default)
     return {"prompts": prompts}
+
+
+@app.get("/prompts/{name}/fallback")
+async def get_prompt_fallback(name: str, request: Request) -> Response:
+    """Preview the prompt used when a request supplies no custom prompt."""
+    language: str | None = request.query_params.get("language")
+    if language and any(c in language for c in ("/", "\\", "..")):
+        raise HTTPException(status_code=400, detail="Invalid language parameter")
+    if name not in _DEFAULT_PROMPTS:
+        raise HTTPException(status_code=404, detail=f"Unknown prompt: '{name}'")
+
+    selected_language = language if name == "translate" else None
+    template, source = _fallback_prompt(name, selected_language)
+    version = hashlib.sha256(template.encode("utf-8")).hexdigest()
+    etag = f'"{version}"'
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag})
+    return JSONResponse(
+        content={"template": template, "source": source, "version": version},
+        headers={"ETag": etag},
+    )
 
 
 @app.api_route("/prompts/{name}", methods=["GET", "PUT"])

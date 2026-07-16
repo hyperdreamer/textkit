@@ -81,6 +81,26 @@ function normalizeBackendSettings(host, port) {
   };
 }
 
+function normalizeCustomPrompt(value) {
+  const prompt = value == null ? '' : String(value);
+  return prompt.trim() ? prompt : undefined;
+}
+
+function normalizeCapturePrompts(prompts = {}) {
+  return {
+    ocr: normalizeCustomPrompt(prompts.ocr),
+    dedup: normalizeCustomPrompt(prompts.dedup)
+  };
+}
+
+async function snapshotCapturePrompts() {
+  const stored = await chrome.storage.local.get(['ocrPrompt', 'dedupPrompt']);
+  return normalizeCapturePrompts({
+    ocr: stored.ocrPrompt,
+    dedup: stored.dedupPrompt
+  });
+}
+
 let states = new Map();
 let savedLastRegion = null;
 const windowActivationGenerations = new Map();
@@ -94,7 +114,7 @@ function getState(tabId) {
       progress: 'Ready', mergedText: '', fragments: [], error: '',
       lastRegion: savedLastRegion, stopRequested: false, retryState: null,
       retryStage: null, pendingText: '', captureInFlight: false,
-      targetRemoved: false
+      targetRemoved: false, operationPrompts: null
     });
   }
   return states.get(tabId);
@@ -166,6 +186,7 @@ chrome.commands.onCommand.addListener(async (command) => {
       return;
     }
     await ensureContentScript(tab.id);
+    getState(tab.id).operationPrompts = await snapshotCapturePrompts();
 
     updateState(tab.id, { active: true, status: 'Selecting', progress: 'Drag a rectangle.' });
     await chrome.tabs.sendMessage(tab.id, {
@@ -183,7 +204,7 @@ chrome.commands.onCommand.addListener(async (command) => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'popup:start') {
-    handlePopupStart().then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
+    handlePopupStart(message).then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
   }
   if (message?.type === 'popup:get-state') {
@@ -264,9 +285,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 // ── popup start ────────────────────────────────────────────────
 
-async function handlePopupStart() {
+async function handlePopupStart(message = {}) {
   const tab = await getActiveTab();
   await ensureContentScript(tab.id);
+  getState(tab.id).operationPrompts = message.prompts
+    ? normalizeCapturePrompts(message.prompts)
+    : await snapshotCapturePrompts();
   updateState(tab.id, { active: true, status: 'Selecting', progress: 'Drag a rectangle.' });
   try {
     await chrome.tabs.sendMessage(tab.id, {
@@ -291,6 +315,7 @@ async function handleReuseRegion() {
   if (!region) throw new Error('No saved region. Select a region first.');
   if (tab.windowId == null || tab.windowId < 0) throw new Error('Invalid windowId.');
   await ensureContentScript(tab.id);
+  getState(tab.id).operationPrompts = await snapshotCapturePrompts();
   // Get actual viewport dimensions from the content script
   const vp = await chrome.tabs.sendMessage(tab.id, { type: 'get-viewport' });
   const fullRegion = {
@@ -401,6 +426,13 @@ function stopKeepAlive() {
 async function handleTranslateStart(msg) {
   const { tabId, text, language, host, port } = msg;
   if (!tabId || !text) return { ok: false, error: 'Missing tabId or text' };
+  const promptWasProvided = Object.prototype.hasOwnProperty.call(msg, 'prompt');
+  let promptSnapshot = promptWasProvided ? normalizeCustomPrompt(msg.prompt) : undefined;
+  if (!promptWasProvided) {
+    const key = `translatePrompt:${language}`;
+    const stored = await chrome.storage.local.get(key);
+    promptSnapshot = normalizeCustomPrompt(stored[key]);
+  }
 
   // Abort any in-flight translation for this tab
   handleTranslateStop(tabId);
@@ -428,11 +460,9 @@ async function handleTranslateStart(msg) {
     chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: true }).catch(() => {});
 
     try {
-      const key = `translatePrompt:${language}`;
-      const stored = await chrome.storage.local.get(key);
-      const customPrompt = renderTranslationPrompt(stored[key], language);
+      const customPrompt = renderTranslationPrompt(promptSnapshot, language);
       // "Original" with no custom prompt → pass through unchanged
-      if (language === 'original' && !stored[key]) {
+      if (language === 'original' && !promptSnapshot) {
         const translated = text;
         await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
         chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
@@ -511,8 +541,14 @@ async function handleSaveTranslation(msg) {
 // ── manual format (delegated to background so it survives popup close) ─
 
 async function handleFormatStart(msg) {
-  const { tabId, text, prompt, host, port } = msg;
-  if (!tabId || !text || !prompt) return { ok: false, error: 'Missing tabId, text, or prompt' };
+  const { tabId, text, host, port } = msg;
+  if (!tabId || !text) return { ok: false, error: 'Missing tabId or text' };
+  const promptWasProvided = Object.prototype.hasOwnProperty.call(msg, 'prompt');
+  let prompt = promptWasProvided ? normalizeCustomPrompt(msg.prompt) : undefined;
+  if (!promptWasProvided) {
+    const stored = await chrome.storage.local.get('formatPrompt');
+    prompt = normalizeCustomPrompt(stored.formatPrompt);
+  }
 
   // Abort any in-flight formatting for this tab
   handleFormatStop(tabId);
@@ -590,18 +626,19 @@ function handleFormatStop(tabId) {
 }
 
 async function autoFormatIfEnabled(tabId, text, host, port, source = 'translation') {
-  const settings = await chrome.storage.sync.get({ fmtAutoFormat: false, fmtSourceVal: 'translation' });
+  const [settings, prompt] = await Promise.all([
+    chrome.storage.sync.get({ fmtAutoFormat: false, fmtSourceVal: 'translation' }),
+    chrome.storage.local.get('formatPrompt')
+  ]);
   if (!settings.fmtAutoFormat) return;
   if (settings.fmtSourceVal !== source) return;
-  const prompt = await chrome.storage.local.get('formatPrompt');
-  if (!prompt.formatPrompt || !prompt.formatPrompt.trim()) return;
   // Fall back to sync storage if caller didn't provide host/port (e.g. auto-translate path)
   if (!host || port === undefined) {
     const backend = await chrome.storage.sync.get({ backendHost: 'localhost', backendPort: 8765 });
     host = backend.backendHost;
     port = backend.backendPort;
   }
-  handleFormatStart({ tabId, text, prompt: prompt.formatPrompt.trim(), host, port })
+  handleFormatStart({ tabId, text, prompt: prompt.formatPrompt, host, port })
     .catch(() => {});
 }
 
@@ -629,6 +666,7 @@ async function ensureContentScript(tabId) {
 async function runCaptureLoop(tab, region) {
   if (!tab?.id) throw new Error('Missing tab id.');
   const tabId = tab.id;
+  const promptSnapshot = getState(tabId).operationPrompts || await snapshotCapturePrompts();
   const normalizedRegion = normalizeRegion(region);
   if (normalizedRegion.width < 2 || normalizedRegion.height < 2) {
     throw new Error('Selected region is too small.');
@@ -639,7 +677,8 @@ async function runCaptureLoop(tab, region) {
     fragments: [],
     lastScrollY: -1,
     resetBeforeStart: true,
-    refreshAutoscroll: false
+    refreshAutoscroll: false,
+    promptSnapshot
   });
 }
 
@@ -652,7 +691,8 @@ async function resumeCaptureLoop(rs) {
     fragments: rs.fragments || [],
     lastScrollY: rs.lastScrollY ?? -1,
     resetBeforeStart: false,
-    refreshAutoscroll: true
+    refreshAutoscroll: true,
+    promptSnapshot: rs.promptSnapshot || getState(tabId).operationPrompts || await snapshotCapturePrompts()
   });
 }
 
@@ -662,7 +702,8 @@ async function executeCaptureLoop({
   fragments,
   lastScrollY,
   resetBeforeStart,
-  refreshAutoscroll
+  refreshAutoscroll,
+  promptSnapshot
 }) {
   const state = getState(tabId);
 
@@ -679,7 +720,10 @@ async function executeCaptureLoop({
   try {
     if (resetBeforeStart) {
       resetState(tabId);
+      state.operationPrompts = normalizeCapturePrompts(promptSnapshot);
       updateState(tabId, { active: true, status: 'Capturing', progress: 'Starting capture loop.' });
+    } else if (!state.operationPrompts) {
+      state.operationPrompts = normalizeCapturePrompts(promptSnapshot);
     }
 
     let scrollY = lastScrollY;
@@ -732,7 +776,12 @@ async function executeCaptureLoop({
         );
         if (target.status !== 'active') break capturePages;
         try {
-          const text = await postImageForOcr(croppedBlob, pageNumber, controller.signal);
+          const text = await postImageForOcr(
+            croppedBlob,
+            pageNumber,
+            controller.signal,
+            state.operationPrompts?.ocr
+          );
           fragments.push(text);
           ocrErr = null;
           break;
@@ -747,7 +796,13 @@ async function executeCaptureLoop({
         }
       }
       if (ocrErr) {
-        state.retryState = { tabId, region, fragments, lastScrollY: scrollY };
+        state.retryState = {
+          tabId,
+          region,
+          fragments,
+          lastScrollY: scrollY,
+          promptSnapshot: state.operationPrompts
+        };
         chrome.storage.local.set({ [`retryState:${tabId}`]: state.retryState }).catch(() => {});
         updateState(tabId, {
           active: true,
@@ -968,7 +1023,11 @@ async function finalizePostCapture(tabId, mergedText, fragments) {
   let finalText;
   for (let attempt = 1; ; attempt++) {
     try {
-      finalText = await postTextForDedup(mergedText, signal);
+      finalText = await postTextForDedup(
+        mergedText,
+        signal,
+        state.operationPrompts?.dedup
+      );
       // Save post-dedup text for debugging
       chrome.storage.local.set({ [`postDedup:${tabId}`]: finalText }).catch(() => {});
       break;
@@ -1027,12 +1086,11 @@ async function autoTranslateIfEnabled(tabId, originalText) {
   // Read language from the global Translation tab setting
   const tl2Lang = await chrome.storage.local.get('tl2Language');
   const language = tl2Lang.tl2Language || 'original';
+  const key = `translatePrompt:${language}`;
+  const stored = await chrome.storage.local.get(key);
+  const promptSnapshot = normalizeCustomPrompt(stored[key]);
   // "Original" with no custom prompt → skip (nothing to do)
-  if (language === 'original') {
-    const promptKey = 'translatePrompt:original';
-    const promptStored = await chrome.storage.local.get(promptKey);
-    if (!promptStored[promptKey]) return;
-  }
+  if (language === 'original' && !promptSnapshot) return;
 
   // Abort any in-flight translation for this tab
   handleTranslateStop(tabId);
@@ -1056,9 +1114,7 @@ async function autoTranslateIfEnabled(tabId, originalText) {
     });
     await chrome.storage.local.remove(`tl2Result:${tabId}`);
     chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: true }).catch(() => {});
-    const key = `translatePrompt:${language}`;
-    const stored = await chrome.storage.local.get(key);
-    const customPrompt = renderTranslationPrompt(stored[key], language);
+    const customPrompt = renderTranslationPrompt(promptSnapshot, language);
     const url = await getBackendEndpoint('/translate');
     const response = await fetch(url + '?_=' + Date.now(), {
       method: 'POST',
@@ -1129,17 +1185,14 @@ async function cropVisibleCapture(dataUrl, region) {
 
 // ── OCR call ───────────────────────────────────────────────────
 
-async function postImageForOcr(blob, pageNumber, signal) {
+async function postImageForOcr(blob, pageNumber, signal, customPrompt) {
+  if (arguments.length < 4) {
+    const stored = await chrome.storage.local.get('ocrPrompt');
+    customPrompt = normalizeCustomPrompt(stored.ocrPrompt);
+  }
   const formData = new FormData();
   formData.append('image', blob, `page-${String(pageNumber).padStart(4, '0')}.png`);
-
-  // Include custom OCR prompt if set
-  try {
-    const stored = await chrome.storage.local.get('ocrPrompt');
-    if (stored.ocrPrompt) {
-      formData.append('prompt', stored.ocrPrompt);
-    }
-  } catch {}
+  if (customPrompt) formData.append('prompt', customPrompt);
 
   const url = await getBackendEndpoint('/ocr');
   const response = await fetchWithTimeout(url, { method: 'POST', body: formData }, signal);
@@ -1160,17 +1213,15 @@ async function postImageForOcr(blob, pageNumber, signal) {
   return (await response.text()).trim();
 }
 
-async function postTextForDedup(text, signal) {
+async function postTextForDedup(text, signal, customPrompt) {
+  if (arguments.length < 3) {
+    const stored = await chrome.storage.local.get('dedupPrompt');
+    customPrompt = normalizeCustomPrompt(stored.dedupPrompt);
+  }
   const url = await getBackendEndpoint('/dedup');
 
-  // Include custom dedup prompt if set
   const body = { text };
-  try {
-    const stored = await chrome.storage.local.get('dedupPrompt');
-    if (stored.dedupPrompt) {
-      body.prompt = stored.dedupPrompt;
-    }
-  } catch {}
+  if (customPrompt) body.prompt = customPrompt;
 
   const response = await fetchWithTimeout(url + '?_=' + Date.now(), {
     method: 'POST',
@@ -1299,7 +1350,8 @@ function resetState(tabId) {
     retryState: null,
     retryStage: null,
     pendingText: '',
-    targetRemoved: false
+    targetRemoved: false,
+    operationPrompts: null
   });
   broadcastState(tabId);
   // Clear stale stored result/status so popup init() doesn't reload old capture

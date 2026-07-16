@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from io import BytesIO
 from pathlib import Path
 
@@ -148,6 +149,45 @@ def test_put_base_prompt_invalidates_language_fallback_cache(
 
     assert response.status_code == 200
     assert main._load_prompt("translate", "French") == "new {language}"
+
+
+def test_prompt_fallback_reports_file_source_and_version(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(main, "PROMPTS_DIR", tmp_path)
+    template = "Translate specifically to French"
+    (tmp_path / "translate.French.txt").write_text(template, encoding="utf-8")
+
+    response = client.get("/prompts/translate/fallback?language=French")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "template": template,
+        "source": "file",
+        "version": hashlib.sha256(template.encode("utf-8")).hexdigest(),
+    }
+
+
+def test_prompt_fallback_reports_hardcoded_source_and_supports_etag(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(main, "PROMPTS_DIR", tmp_path)
+
+    response = client.get("/prompts/ocr/fallback")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["template"] == main._DEFAULT_PROMPTS["ocr"]
+    assert payload["source"] == "hardcoded"
+    assert payload["version"] == hashlib.sha256(
+        main._DEFAULT_PROMPTS["ocr"].encode("utf-8")
+    ).hexdigest()
+
+    cached = client.get(
+        "/prompts/ocr/fallback", headers={"If-None-Match": response.headers["etag"]}
+    )
+    assert cached.status_code == 304
+    assert cached.content == b""
 
 
 def test_prompt_put_returns_400_for_malformed_json(client: TestClient) -> None:

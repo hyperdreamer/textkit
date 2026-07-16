@@ -649,6 +649,51 @@ test('manual translation substitutes every language placeholder in a custom prom
   assert.equal(requestBody.prompt, 'Translate to French. Answer only in French.');
 });
 
+test('capture prompt overrides are snapshotted when selection starts', async () => {
+  const harness = createBackgroundHarness({
+    localData: { ocrPrompt: 'stored OCR', dedupPrompt: 'stored dedup' }
+  });
+
+  await harness.context.handlePopupStart({
+    prompts: { ocr: 'popup OCR', dedup: 'popup dedup' }
+  });
+  await harness.context.chrome.storage.local.set({
+    ocrPrompt: 'edited later',
+    dedupPrompt: 'edited later'
+  });
+
+  assert.deepEqual(
+    { ...harness.context.getState(1).operationPrompts },
+    { ocr: 'popup OCR', dedup: 'popup dedup' }
+  );
+});
+
+test('manual format reads the stored prompt once when the operation starts', async () => {
+  let requestBody;
+  const response = deferred();
+  const harness = createBackgroundHarness({
+    localData: { formatPrompt: 'Initial format prompt' },
+    fetch: async (_url, options) => {
+      requestBody = JSON.parse(options.body);
+      return response.promise;
+    }
+  });
+
+  const operation = harness.context.handleFormatStart({
+    tabId: 1,
+    text: 'hello',
+    host: 'localhost',
+    port: 8765
+  });
+  await waitFor(() => requestBody, 'format request did not start');
+  await harness.context.chrome.storage.local.set({ formatPrompt: 'Edited later' });
+  response.resolve({ ok: true, json: async () => ({ text: 'HELLO' }) });
+
+  const result = await operation;
+  assert.equal(result.ok, true);
+  assert.equal(requestBody.prompt, 'Initial format prompt');
+});
+
 test('OCR-source auto-format runs once even when auto-translate also completes', async () => {
   const harness = createBackgroundHarness({
     localData: { formatPrompt: 'Clean up the text.' },
