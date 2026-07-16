@@ -130,4 +130,19 @@ Both the Format save path input (`#fmt-save-path`) and Translation save path inp
 
 ---
 
-*Last updated: 2026-07-11 — post-Hermes audit of dev-textkit branch (343e599)*
+## 12. Auto-scroll distance uses viewport height rather than selected-region height
+**File:** `extension/content.js:308-320`, `extension/background.js:627-643`
+
+The capture loop crops screenshots to the selected region but advances the page by
+`window.innerHeight - overlapPx`, so a region shorter than the viewport does not
+provide continuous document-coordinate coverage.
+
+**Decision:** NOT fixing — intentional capture behavior. Auto-scroll advances one
+viewport at a time while preserving a small viewport overlap; the selected region
+is a fixed sampling window, not the scrolling step size. Users who require
+continuous full-page coverage should select a region spanning the relevant
+viewport height. Future audits should not report this as a defect.
+
+---
+
+*Last updated: 2026-07-16 — post-Codex audit of master 2.0.8 (3c84d66)*
