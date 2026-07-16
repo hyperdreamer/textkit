@@ -92,7 +92,7 @@ function createPopupHarness(options = {}) {
     querySelectorAll() { return []; },
     createElement(tagName) { return createElement(tagName); },
     addEventListener() {},
-    execCommand() { return true; }
+    execCommand() { return options.execCommand ? options.execCommand() : true; }
   };
   document.getElementById('backend-host').value = 'localhost';
   document.getElementById('backend-port').value = '8765';
@@ -104,6 +104,7 @@ function createPopupHarness(options = {}) {
   const runtimeMessage = createEvent();
   const chrome = {
     runtime: {
+      lastError: options.runtimeLastError,
       onMessage: runtimeMessage,
       sendMessage() { return Promise.resolve({ ok: true }); }
     },
@@ -142,7 +143,13 @@ function createPopupHarness(options = {}) {
       }
     },
     tabs: { query: async () => [{ id: 1, windowId: 10, active: true }] },
-    downloads: { download() {} },
+    downloads: {
+      download(downloadOptions, callback) {
+        if (options.download) return options.download(downloadOptions, callback);
+        callback?.(1);
+        return undefined;
+      }
+    },
     notifications: { create() {} }
   };
 
@@ -155,7 +162,11 @@ function createPopupHarness(options = {}) {
     console,
     document,
     fetch: options.fetch || fetch,
-    navigator: { clipboard: { writeText: async () => {} } },
+    navigator: {
+      clipboard: {
+        writeText: options.writeText || (async () => {})
+      }
+    },
     setTimeout(callback) {
       timerId += 1;
       timers.set(timerId, callback);
@@ -349,4 +360,56 @@ test('blank file bridge host uses localhost with its configured port', async () 
   await harness.context.fetchPathSuggestions('');
 
   assert.equal(requestedUrl, 'http://localhost:9777/paths?prefix=');
+});
+
+test('slow path response cannot overwrite newer suggestions', async () => {
+  const first = deferred();
+  const second = deferred();
+  let fetchCalls = 0;
+  const harness = createPopupHarness({
+    fetch: async () => {
+      fetchCalls += 1;
+      return fetchCalls === 1 ? first.promise : second.promise;
+    }
+  });
+
+  const oldRequest = harness.context.fetchPathSuggestions('old');
+  const newRequest = harness.context.fetchPathSuggestions('new');
+  second.resolve({ ok: true, json: async () => ({ paths: ['new/result.txt'] }) });
+  await newRequest;
+  first.resolve({ ok: true, json: async () => ({ paths: ['old/stale.txt'] }) });
+  await oldRequest;
+
+  assert.deepEqual(
+    harness.elements.get('tl2-path-suggestions').children.map((option) => option.value),
+    ['new/result.txt']
+  );
+});
+
+test('manual clipboard failure is reported instead of silently succeeding', async () => {
+  const harness = createPopupHarness({
+    writeText: async () => { throw new Error('clipboard denied'); },
+    execCommand: () => false
+  });
+  harness.elements.get('result').value = 'text to copy';
+
+  const copied = await harness.context.copyOcrText();
+
+  assert.equal(copied, false);
+  assert.equal(harness.elements.get('progress').textContent, 'Copy failed: Clipboard copy was rejected.');
+  assert.equal(harness.elements.get('copy').textContent, '');
+});
+
+test('manual download failure is reported instead of silently succeeding', async () => {
+  const harness = createPopupHarness({
+    runtimeLastError: { message: 'downloads blocked' },
+    download(_options, callback) { callback(undefined); }
+  });
+  harness.elements.get('result').value = 'text to download';
+
+  const downloaded = await harness.context.downloadOcrText();
+
+  assert.equal(downloaded, false);
+  assert.equal(harness.elements.get('progress').textContent, 'Download failed: downloads blocked');
+  assert.equal(harness.elements.get('download').textContent, '');
 });

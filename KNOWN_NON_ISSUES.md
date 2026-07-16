@@ -6,7 +6,7 @@ Future audits should NOT re-report these.
 ---
 
 ## 3. OCR/dedup retry loops have no maximum retry count
-**File:** `extension/background.js:576-588`, `extension/background.js:772`
+**File:** `extension/background.js` (`executeCaptureLoop`, `finalizePostCapture`)
 
 Both loops use `for (let attempt = 1; ; attempt++)` — infinite retry with only
 user Stop as exit. The "guard" code after the loop is dead code (never reached).
@@ -18,7 +18,7 @@ on OCR AND dedup backend errors. Only user Stop breaks the loop. Both use
 ---
 
 ## 4. `normalizeBackendSettings` duplicated in background.js and popup.js
-**File:** `extension/background.js:27-46`, `extension/popup.js:951-970`
+**Files:** `extension/background.js`, `extension/popup.js`
 
 Both files define the same function with identical logic. `LOCAL_BACKEND_HOSTS`
 is also duplicated.
@@ -36,16 +36,12 @@ Was dead code — removed in commit `7d78b25` (10 audit fixes).
 
 ---
 
-## 6. Service worker restart: `tab` object in `retryState` not fully serializable
-**File:** `extension/background.js:591`
+## 6. ~~Service worker retry state stored a non-serializable `tab` object~~ → FIXED
+**File:** `extension/background.js`
 
-The `tab` object from `chrome.tabs.query()` contains non-serializable properties.
-Only `tab.id` (a number) survives `chrome.storage.local.set`. `winId` is
-redundantly stored as a top-level field, partially mitigating this.
-
-**Decision:** NOT fixing. The code re-queries the tab if needed via
-`chrome.tabs.get(tabId)`. This is a known MV3 limitation — tab objects can't be
-fully serialized. The redundant `winId` field is sufficient for resume.
+Retry snapshots now store serializable scalar/plain-data fields such as `tabId`,
+`captureUrl`, region, fragments, scroll position, stage, and prompt snapshot.
+Live tab data is re-queried with `chrome.tabs.get(tabId)` when work resumes.
 
 ---
 
@@ -55,7 +51,9 @@ fully serialized. The redundant `winId` field is sufficient for resume.
 Copy requests now carry a correlation ID. The background worker consumes the
 offscreen success/failure response, closes the document when all pending copies
 finish, and uses the 2-second timer only as a failure fallback. Success
-notifications are emitted only after confirmed clipboard completion.
+notifications are emitted only after confirmed clipboard completion. Manual
+popup copy and download actions also check their fallback/API results and expose
+failures in the relevant status panel.
 
 ---
 
@@ -72,7 +70,7 @@ See memory for version management rules.
 ---
 
 ## 9. Single module-level `keepAlive` interval
-**File:** `extension/background.js:287-300`
+**File:** `extension/background.js` (`startKeepAlive`, `stopKeepAlive`)
 
 A single `keepAliveIntervalId` is shared across all tabs. `stopKeepAlive()` is
 called only when ALL controllers are empty.
@@ -84,7 +82,7 @@ keepalive would add complexity with no benefit.
 ---
 
 ## 10. Format save path shares datalist ID with Translation save path
-**File:** `extension/popup.html:387`
+**File:** `extension/popup.html`
 
 Both the Format save path input (`#fmt-save-path`) and Translation save path input (`#tl2-autosave-path`) reference `list="tl2-path-suggestions"` — the same `<datalist>`. 
 
@@ -93,7 +91,7 @@ Both the Format save path input (`#fmt-save-path`) and Translation save path inp
 ---
 
 ## 12. Auto-scroll distance uses viewport height rather than selected-region height
-**File:** `extension/content.js:308-320`, `extension/background.js:627-643`
+**Files:** `extension/content.js`, `extension/background.js`
 
 The capture loop crops screenshots to the selected region but advances the page by
 `window.innerHeight - overlapPx`, so a region shorter than the viewport does not
@@ -107,4 +105,4 @@ viewport height. Future audits should not report this as a defect.
 
 ---
 
-*Last updated: 2026-07-16 — file-bridge, retry persistence, and offscreen copy fixes*
+*Last updated: 2026-07-16 — retry serialization, clipboard/download reporting, navigation isolation, and partial-capture status*

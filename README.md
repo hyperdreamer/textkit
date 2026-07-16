@@ -1,6 +1,6 @@
 # TextKit
 
-TextKit is a text capture and processing tool for reading long web pages through a browser extension and an AI-backed FastAPI service. The Chromium Manifest V3 extension lets you select a fixed region of the current page, capture that region page-by-page while scrolling, merge overlapping OCR fragments, optionally translate and format the result, and copy or download the final text.
+TextKit is a text capture and processing tool for reading long web pages through a browser extension and an AI-backed FastAPI service. The Chromium Manifest V3 extension lets you select a fixed region of the current page, capture that region page-by-page while scrolling, merge overlapping OCR fragments, optionally translate or format the result, and copy, download, or save the final text.
 
 The backend is provider-neutral: it calls OpenAI-compatible chat completion APIs, configured through `backend/config.yaml`.
 
@@ -17,7 +17,7 @@ Typical flow:
 2. Load the extension in Chrome or another Chromium browser.
 3. Press `Ctrl+Shift+S` or click `Select Region` in the popup.
 4. Draw or adjust the capture region and press `Ctrl+Space`.
-5. The extension captures the selected region, sends each page image to `POST /ocr`, merges fragments, sends merged text to `POST /dedup`, optionally sends the result to `POST /translate`, optionally formats the translation via `POST /format`, and stores the final text.
+5. The extension captures the selected region, sends each page image to `POST /ocr`, merges fragments, sends merged text to `POST /dedup`, optionally sends the result to `POST /translate`, optionally formats the configured OCR or Translation source via `POST /format`, and stores the results per tab.
 
 The popup has four tabs:
 
@@ -89,7 +89,7 @@ curl -X POST "http://localhost:8765/ocr" \
   -F "prompt=Transcribe all visible Japanese text"
 ```
 
-The backend validates the image with Pillow, encodes it as a data URL, and sends it to the configured AI model.
+The backend validates and fully decodes the image with Pillow, rejects corrupt or truncated PNGs, derives the MIME type from the decoded bytes rather than the multipart claim, encodes it as a data URL, and sends it to the configured AI model.
 
 ### `POST /dedup`
 
@@ -137,7 +137,7 @@ Formats text using a user-provided custom AI prompt. Designed to run on the *out
 
 **Request:** JSON body with fields:
 - `text` (string, required) — the text to format.
-- `prompt` (string, optional) — custom system prompt that overrides the default format prompt. When omitted, the backend falls back to `backend/prompts/format.txt`. Examples: `"Convert to ALL CAPS"`, `"Reformat as clean Markdown with headings and bullet points"`, `"Summarise this text in 3 bullet points"`.
+- `prompt` (string, optional) — custom system prompt that overrides the default format prompt. When omitted, the backend uses `backend/prompts/format.txt` when present, otherwise its nonempty built-in readability prompt. Examples: `"Convert to ALL CAPS"`, `"Reformat as clean Markdown with headings and bullet points"`, `"Summarise this text in 3 bullet points"`.
 
 ```sh
 curl -X POST "http://localhost:8765/format" \
@@ -159,7 +159,7 @@ The extension never writes canonical backend prompt files. Its Prompts tab leave
 
 ### `GET /prompts`
 
-Returns all available AI prompt templates (ocr, dedup, translate, format) as JSON.
+Returns exactly the four canonical AI prompt templates (`ocr`, `dedup`, `translate`, and `format`) as JSON. Language-specific translation files are selected through the language-aware prompt endpoints and are not exposed as extra keys such as `translate.English`.
 
 Response shape: `{"prompts": {"ocr": "...", "dedup": "...", "translate": "...", "format": "..."}}`.
 
@@ -263,7 +263,7 @@ The extension lives in `extension/` and uses Manifest V3.
 
 Main files:
 
-- `manifest.json`: extension metadata, permissions, content script registration, and keyboard command.
+- `manifest.json`: extension metadata, permissions, host access, and keyboard command. The page content script and overlay CSS are injected on demand with `chrome.scripting`.
 - `popup.html` and `popup.js`: popup UI with four tabs (OCR, Translation, Format, Prompts) for status, backend settings, language selection, custom prompts, and output actions.
 - `background.js`: capture orchestration, backend calls, fragment merging, retry state, and persistence.
 - `content.js`: selection overlay, saved-region editing, viewport reporting, and page scrolling.
@@ -275,7 +275,7 @@ Main files:
 |-----|---------|
 | **OCR** | Start/stop capture, view status/progress, copy/download OCR result. |
 | **Translation** | Translate OCR result to a target language. Auto-copy, auto-save (with save path), and auto-translate checkboxes. |
-| **Format** | Format text with a custom AI prompt. Choose source (OCR or Translation), auto-copy, auto-save (with dedicated save path), and auto-format checkboxes. Auto-format fires automatically when translation completes. |
+| **Format** | Format text with a custom AI prompt. Choose source (OCR or Translation), auto-copy, auto-save (with dedicated save path), and auto-format checkboxes. Auto-format fires when the selected source completes. |
 | **Prompts** | Edit extension-local OCR, Dedup, per-language Translation, and Format overrides in a one-at-a-time accordion. Empty editors show the server fallback without copying it into the custom value. |
 
 ### Capture controls
@@ -294,7 +294,7 @@ Main files:
 - **Auto-scroll enabled:** the extension captures the selected region, scrolls down by about one viewport with overlap, captures again, and repeats until the page stops scrolling.
 - **Auto-scroll disabled:** the extension captures only the current viewport region once.
 
-During capture, the popup shows status, current page, fragment count, and progress. The Stop button requests capture to stop and preserves fragments already collected.
+During capture, the popup shows status, current page, fragment count, and progress. The Stop button requests capture to stop and preserves fragments already collected as a result marked `Partial`; partial results do not trigger automatic translation or formatting. Navigating the capture tab to another URL also stops capture as partial before content from the new document can be accepted.
 
 ### OCR, deduplication, translation, and formatting
 
@@ -321,8 +321,8 @@ The Retry button is reserved for a resumable error state that was persisted acro
 
 Every result panel (OCR, Translation, Format) supports:
 
-- **Copy** — copies the text to the clipboard.
-- **Download** — saves the text as a `.txt` file (named `textkit-*.txt`, `translate-*.txt`, or `format-*.txt`).
+- **Copy** — copies the text to the clipboard and reports clipboard permission or fallback failures in the panel status.
+- **Download** — saves the text as a `.txt` file (named `textkit-*.txt`, `translate-*.txt`, or `format-*.txt`) and reports browser download failures.
 - **Save** — writes the text through the separate localhost file-bridge service, using the tab's save path.
 
 ### Settings and persistence
@@ -366,6 +366,15 @@ The backend dependencies are:
 - `langdetect`
 
 The extension does not require a build step. Load the `extension/` folder directly as an unpacked extension.
+
+### Tests
+
+Run tests from the repository root:
+
+```sh
+python -m pytest tests/ -v
+node tests/background.test.js && node tests/popup.test.js && node tests/content.test.js
+```
 
 ## Troubleshooting
 

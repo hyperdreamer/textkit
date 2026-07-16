@@ -34,6 +34,26 @@ def _png_bytes() -> bytes:
     return buffer.getvalue()
 
 
+def _jpeg_bytes() -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", (1, 1), color="white").save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+def test_image_data_url_uses_detected_type_not_claimed_mime() -> None:
+    data_url = main._image_to_data_url(_jpeg_bytes(), "image/png")
+
+    assert data_url.startswith("data:image/jpeg;base64,")
+
+
+def test_image_data_url_rejects_truncated_png() -> None:
+    with pytest.raises(main.HTTPException) as exc_info:
+        main._image_to_data_url(_png_bytes()[:-4], "image/png")
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Uploaded file is not a valid image"
+
+
 @pytest.mark.parametrize("path", ["/ocr", "/dedup", "/translate", "/format"])
 def test_ai_endpoints_reject_untrusted_web_origins(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, path: str
@@ -188,6 +208,35 @@ def test_prompt_fallback_reports_hardcoded_source_and_supports_etag(
     )
     assert cached.status_code == 304
     assert cached.content == b""
+
+
+def test_list_prompts_returns_only_canonical_keys(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(main, "PROMPTS_DIR", tmp_path)
+    (tmp_path / "translate.txt").write_text("base {language}", encoding="utf-8")
+    (tmp_path / "translate.English.txt").write_text(
+        "English-specific", encoding="utf-8"
+    )
+
+    response = client.get("/prompts")
+
+    assert response.status_code == 200
+    assert response.json()["prompts"] == {
+        "ocr": main._DEFAULT_PROMPTS["ocr"],
+        "dedup": main._DEFAULT_PROMPTS["dedup"],
+        "translate": "base {language}",
+        "format": main._DEFAULT_PROMPTS["format"],
+    }
+
+
+def test_fresh_install_has_nonempty_format_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(main, "PROMPTS_DIR", tmp_path)
+    main._prompt_cache.clear()
+
+    assert main._render_prompt("format").strip()
 
 
 def test_prompt_put_returns_400_for_malformed_json(client: TestClient) -> None:

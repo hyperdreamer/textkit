@@ -111,7 +111,8 @@ function getState(tabId) {
       progress: 'Ready', mergedText: '', fragments: [], error: '',
       lastRegion: savedLastRegion, stopRequested: false, retryState: null,
       retryStage: null, pendingText: '', captureInFlight: false,
-      targetRemoved: false, operationPrompts: null
+      targetRemoved: false, navigationChanged: false, captureUrl: null,
+      collectionComplete: false, partialReason: '', partialError: '', operationPrompts: null
     });
   }
   return states.get(tabId);
@@ -167,13 +168,22 @@ chrome.tabs.onActivated.addListener(({ windowId }) => {
 });
 chrome.tabs.onAttached?.addListener(notifyTargetTabChange);
 chrome.tabs.onDetached?.addListener(notifyTargetTabChange);
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (!changeInfo.url) return;
+  const state = states.get(tabId);
+  if (!state?.captureInFlight || state.collectionComplete || !state.captureUrl || changeInfo.url === state.captureUrl) return;
+  markTargetNavigated(tabId, state);
+});
 
 // Clean up per-tab state and storage when a tab is closed, so the in-memory
 // Map and chrome.storage.local don't grow unbounded over a browsing session.
 chrome.tabs.onRemoved.addListener((tabId) => {
   const state = states.get(tabId);
   const captureInFlight = Boolean(state?.captureInFlight);
-  if (captureInFlight) state.targetRemoved = true;
+  if (captureInFlight) {
+    state.targetRemoved = true;
+    state.partialReason = 'tab_closed';
+  }
   else states.delete(tabId);
   notifyTargetTabChange();
   handleTranslateStop(tabId);
@@ -358,6 +368,9 @@ async function handleCaptureLoopFailure(tabId, error, logPrefix) {
   const state = getState(tabId);
   if (state.fragments?.length > 0) {
     try {
+      state.partialReason = 'error';
+      state.partialError = error.message || 'Capture failed.';
+      updateState(tabId, { error: state.partialError });
       await finalizePostCapture(tabId, mergeFragments(state.fragments), state.fragments);
       return;
     } catch (finalizeError) {
@@ -376,6 +389,7 @@ async function handleStop() {
   const tab = await getActiveTab();
   const state = getState(tab.id);
   state.stopRequested = true;
+  state.partialReason = 'stopped';
   if (state.status === 'Selecting') {
     updateState(tab.id, {
       active: false,
@@ -707,6 +721,7 @@ async function runCaptureLoop(tab, region) {
     lastScrollY: -1,
     resetBeforeStart: true,
     refreshAutoscroll: false,
+    captureUrl: tab.url || null,
     promptSnapshot
   });
 }
@@ -721,6 +736,7 @@ async function resumeCaptureLoop(rs) {
     lastScrollY: rs.lastScrollY ?? -1,
     resetBeforeStart: false,
     refreshAutoscroll: true,
+    captureUrl: rs.captureUrl || null,
     promptSnapshot: rs.promptSnapshot || getState(tabId).operationPrompts || await snapshotCapturePrompts()
   });
 }
@@ -732,6 +748,7 @@ async function executeCaptureLoop({
   lastScrollY,
   resetBeforeStart,
   refreshAutoscroll,
+  captureUrl,
   promptSnapshot
 }) {
   const state = getState(tabId);
@@ -754,6 +771,9 @@ async function executeCaptureLoop({
     } else if (!state.operationPrompts) {
       state.operationPrompts = normalizeCapturePrompts(promptSnapshot);
     }
+
+    const initialTab = await getLiveTargetTab(tabId);
+    state.captureUrl = captureUrl || initialTab?.url || state.captureUrl || null;
 
     let scrollY = lastScrollY;
     let atBottom = false;
@@ -799,7 +819,8 @@ async function executeCaptureLoop({
         region,
         fragments: [...fragments],
         lastScrollY: scrollY,
-        promptSnapshot: state.operationPrompts
+        promptSnapshot: state.operationPrompts,
+        ...(state.captureUrl ? { captureUrl: state.captureUrl } : {})
       };
       await chrome.storage.local.set({ [`retryState:${tabId}`]: state.retryState });
       for (let attempt = 1; ; attempt++) {
@@ -884,10 +905,14 @@ async function executeCaptureLoop({
       await sleep(captureIntervalMs);
     }
 
+    state.collectionComplete = true;
     const mergedText = mergeFragments(fragments);
-    if (state.stopRequested || state.targetRemoved) {
-      // User stopped or the capture tab closed — skip backend post-processing
-      // and preserve every fragment collected up to that point.
+    if (state.navigationChanged) state.partialReason = 'navigation';
+    else if (state.stopRequested) state.partialReason = 'stopped';
+    else if (state.targetRemoved) state.partialReason = 'tab_closed';
+    if (state.partialReason) {
+      // An interrupted capture preserves every fragment collected so far but
+      // must not present or automate the result as a complete capture.
       await finalizeCapture(tabId, mergedText, fragments);
     } else {
       updateState(tabId, { progress: 'Deduplicating merged text...', fragments });
@@ -911,6 +936,23 @@ async function getLiveTargetTab(tabId) {
   }
 }
 
+function markTargetNavigated(tabId, state = getState(tabId)) {
+  if (state.navigationChanged) return;
+  state.navigationChanged = true;
+  state.partialReason = 'navigation';
+  captureControllers.get(tabId)?.abort();
+  updateState(tabId, {
+    progress: 'Capture stopped because the page navigated. Preserving collected fragments.'
+  });
+  notifyTargetTabChange();
+}
+
+function targetDocumentChanged(tabId, state, tab) {
+  if (!state.captureUrl || !tab?.url || tab.url === state.captureUrl) return false;
+  markTargetNavigated(tabId, state);
+  return true;
+}
+
 function waitForTargetTabChange(revision, signal) {
   if (targetTabChangeRevision !== revision || signal?.aborted) return Promise.resolve();
   return new Promise((resolve) => {
@@ -929,6 +971,7 @@ async function waitForTargetActive(tabId, state, signal, resumeProgress) {
   let paused = false;
   while (true) {
     if (state.targetRemoved) return { status: 'removed' };
+    if (state.navigationChanged) return { status: 'navigated' };
     if (state.stopRequested || signal?.aborted) return { status: 'stopped' };
 
     const revision = targetTabChangeRevision;
@@ -937,6 +980,7 @@ async function waitForTargetActive(tabId, state, signal, resumeProgress) {
       state.targetRemoved = true;
       return { status: 'removed' };
     }
+    if (targetDocumentChanged(tabId, state, tab)) return { status: 'navigated' };
     if (tab.active && tab.windowId != null && tab.windowId >= 0) {
       if (paused) {
         updateState(tabId, {
@@ -994,8 +1038,10 @@ async function captureTargetFrame(tabId, state, signal, resumeProgress) {
     }
 
     if (state.targetRemoved) return { status: 'removed' };
+    if (state.navigationChanged) return { status: 'navigated' };
     if (state.stopRequested || signal?.aborted) return { status: 'stopped' };
     const liveAfterCapture = await getLiveTargetTab(tabId);
+    if (targetDocumentChanged(tabId, state, liveAfterCapture)) return { status: 'navigated' };
     if (isSameActiveTarget(snapshot, liveAfterCapture)) {
       return { status: 'accepted', dataUrl, windowId: snapshot.windowId };
     }
@@ -1011,6 +1057,7 @@ async function sendMessageToActiveTarget(tabId, state, signal, message, resumePr
     const snapshot = await waitForTargetActive(tabId, state, signal, resumeProgress);
     if (snapshot.status !== 'active') return snapshot;
     const liveBeforeSend = await getLiveTargetTab(tabId);
+    if (targetDocumentChanged(tabId, state, liveBeforeSend)) return { status: 'navigated' };
     if (!isSameActiveTarget(snapshot, liveBeforeSend)) {
       if (!liveBeforeSend) {
         state.targetRemoved = true;
@@ -1026,6 +1073,7 @@ async function sendMessageToActiveTarget(tabId, state, signal, message, resumePr
       };
     } catch (error) {
       const liveAfterError = await getLiveTargetTab(tabId);
+      if (targetDocumentChanged(tabId, state, liveAfterError)) return { status: 'navigated' };
       if (!liveAfterError) {
         state.targetRemoved = true;
         return { status: 'removed' };
@@ -1047,7 +1095,8 @@ async function finalizePostCapture(tabId, mergedText, fragments) {
     tabId,
     mergedText,
     fragments: [...fragments],
-    promptSnapshot: state.operationPrompts
+    promptSnapshot: state.operationPrompts,
+    ...(state.captureUrl ? { captureUrl: state.captureUrl } : {})
   };
   await chrome.storage.local.set({ [`retryState:${tabId}`]: state.retryState });
   let finalText;
@@ -1087,20 +1136,33 @@ async function finalizeCapture(tabId, finalText, fragments) {
   state.retryStage = null;
   state.pendingText = '';
 
+  const isPartial = Boolean(state.partialReason);
+  let progress = 'Finished.';
+  if (state.partialReason === 'navigation') {
+    progress = `Partial capture: page navigation stopped capture after ${fragments.length} fragment${fragments.length === 1 ? '' : 's'}.`;
+  } else if (state.partialReason === 'stopped') {
+    progress = `Partial capture stopped after ${fragments.length} fragment${fragments.length === 1 ? '' : 's'}.`;
+  } else if (state.partialReason === 'tab_closed') {
+    progress = `Partial capture: the tab closed after ${fragments.length} fragment${fragments.length === 1 ? '' : 's'}.`;
+  } else if (state.partialReason === 'error') {
+    progress = `Partial capture ended after an error; saved ${fragments.length} fragment${fragments.length === 1 ? '' : 's'}.`;
+  }
+  const finalStatus = isPartial ? 'Partial' : 'Done';
+
   updateState(tabId, {
     active: false,
-    status: 'Done',
+    status: finalStatus,
     currentPage: fragments.length,
     fragmentsCollected: fragments.length,
-    progress: 'Finished.',
+    progress,
     fragments,
     mergedText: finalText
   });
   chrome.storage.local.set({ [`lastResult:${tabId}`]: finalText });
-  chrome.storage.local.set({ [`lastStatus:${tabId}`]: 'Done' });
+  chrome.storage.local.set({ [`lastStatus:${tabId}`]: finalStatus });
 
   // Run post-capture automation only for a normally completed capture.
-  if (!state.stopRequested && !state.targetRemoved) {
+  if (!isPartial) {
     await autoFormatIfEnabled(tabId, finalText, undefined, undefined, 'ocr');
     await autoTranslateIfEnabled(tabId, finalText);
   }
@@ -1382,6 +1444,11 @@ function resetState(tabId) {
     retryStage: null,
     pendingText: '',
     targetRemoved: false,
+    navigationChanged: false,
+    captureUrl: null,
+    collectionComplete: false,
+    partialReason: '',
+    partialError: '',
     operationPrompts: null
   });
   broadcastState(tabId);

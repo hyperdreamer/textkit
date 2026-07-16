@@ -47,6 +47,7 @@ function createBackgroundHarness(options = {}) {
   const tabs = new Map((options.tabs || [{ id: 1, windowId: 10, active: true }])
     .map((tab) => [tab.id, { ...tab }]));
   const onActivated = createEvent();
+  const onUpdated = createEvent();
   const onRemoved = createEvent();
   const onAttached = createEvent();
   const onDetached = createEvent();
@@ -70,6 +71,7 @@ function createBackgroundHarness(options = {}) {
     runtimeMessage: createEvent(),
     command: createEvent(),
     onActivated,
+    onUpdated,
     onRemoved,
     onAttached,
     onDetached,
@@ -118,6 +120,7 @@ function createBackgroundHarness(options = {}) {
     },
     tabs: {
       onActivated,
+      onUpdated,
       onRemoved,
       onAttached,
       onDetached,
@@ -231,6 +234,13 @@ function createBackgroundHarness(options = {}) {
     onRemoved.emit(tabId, { windowId: -1, isWindowClosing: false });
   }
 
+  function navigate(tabId, url) {
+    const tab = tabs.get(tabId);
+    assert(tab, `missing tab ${tabId}`);
+    tab.url = url;
+    onUpdated.emit(tabId, { url }, { ...tab });
+  }
+
   return {
     captureCalls,
     context,
@@ -239,6 +249,7 @@ function createBackgroundHarness(options = {}) {
     events,
     localData,
     messageCalls,
+    navigate,
     notifications,
     ocrCalls,
     originalFinalizeCapture,
@@ -345,6 +356,39 @@ test('A to B to A during capture rejects the frame by activation generation', as
   assert.equal(harness.captureCalls.length, 2);
   assert.equal(harness.cropCalls.length, 1);
   assert.deepEqual(harness.ocrCalls.map((call) => call.pageNumber), [1]);
+});
+
+test('same-tab navigation stops before a new document frame can be mixed in', async () => {
+  const secondFrame = deferred();
+  let scrollCalls = 0;
+  const harness = createBackgroundHarness({
+    tabs: [{ id: 1, windowId: 10, active: true, url: 'https://example.test/first' }],
+    syncValues: { ocrAutoscroll: true },
+    captureVisibleTab(_windowId, _captureOptions, callNumber) {
+      return callNumber === 2 ? secondFrame.promise : 'data:image/png;base64,first-page';
+    },
+    sendMessage(_tabId, message) {
+      if (message.type !== 'page:scroll-down') return { ok: true };
+      scrollCalls += 1;
+      return { changed: true, atBottom: false, scrollY: scrollCalls * 100 };
+    }
+  });
+  vm.runInContext('sleep = async () => {};', harness.context);
+
+  const capturePromise = harness.context.runCaptureLoop(
+    { id: 1, windowId: 10, active: true, url: 'https://example.test/first' },
+    REGION
+  );
+  await waitFor(() => harness.captureCalls.length === 2, 'second capture did not start');
+
+  harness.navigate(1, 'https://example.test/second');
+  secondFrame.resolve('data:image/png;base64,new-document');
+  await capturePromise;
+
+  assert.equal(harness.cropCalls.length, 1);
+  assert.deepEqual(harness.ocrCalls.map((call) => call.pageNumber), [1]);
+  assert.deepEqual(harness.finalized[0].fragments, ['page 1']);
+  assert.equal(harness.context.getState(1).partialReason, 'navigation');
 });
 
 test('a target moved to another window uses its live window id', async () => {
@@ -741,6 +785,20 @@ test('Stop cancels an in-progress selection', async () => {
     harness.messageCalls.filter((call) => call.message.type === 'selection:cancel').length,
     1
   );
+});
+
+test('stopped captures are persisted and displayed as partial', async () => {
+  const harness = createBackgroundHarness();
+  const state = harness.context.getState(1);
+  state.stopRequested = true;
+  state.partialReason = 'stopped';
+
+  await harness.originalFinalizeCapture(1, 'partial text', ['first', 'second']);
+
+  assert.equal(state.status, 'Partial');
+  assert.equal(state.progress, 'Partial capture stopped after 2 fragments.');
+  assert.equal(harness.localData['lastStatus:1'], 'Partial');
+  assert.equal(harness.localData['lastResult:1'], 'partial text');
 });
 
 test('manual translation substitutes every language placeholder in a custom prompt', async () => {

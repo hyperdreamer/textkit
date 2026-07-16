@@ -290,8 +290,10 @@ translatePrompt.addEventListener('input', () => {
 
 // ── Translation panel listeners ───────────────────────────────
 tl2Translate.addEventListener('click', doTranslation);
-tl2Copy.addEventListener('click', () => copyResult(tl2Result, tl2Copy));
-tl2Download.addEventListener('click', () => downloadAsFile(tl2Result.value.trim(), 'translate'));
+tl2Copy.addEventListener('click', () => copyResult(tl2Result, tl2Copy, setTl2Progress));
+tl2Download.addEventListener('click', () => downloadAsFile(
+  tl2Result.value.trim(), 'translate', tl2Download, setTl2Progress
+));
 tl2Save.addEventListener('click', saveTranslation);
 tl2Language.addEventListener('change', () => { saveTl2Language(); syncLanguage('translation'); });
 tl2AutocopyCheckbox.addEventListener('change', saveTl2Settings);
@@ -304,8 +306,10 @@ tl2AutosavePath.addEventListener('input', () => {
 
 // ── Format panel listeners ─────────────────────────────────────
 fmtFormat.addEventListener('click', doFormat);
-fmtCopy.addEventListener('click', () => copyResult(fmtResult, fmtCopy));
-fmtDownload.addEventListener('click', () => downloadAsFile(fmtResult.value.trim(), 'format'));
+fmtCopy.addEventListener('click', () => copyResult(fmtResult, fmtCopy, setFmtProgress));
+fmtDownload.addEventListener('click', () => downloadAsFile(
+  fmtResult.value.trim(), 'format', fmtDownload, setFmtProgress
+));
 fmtSave.addEventListener('click', saveFormatResult);
 formatPrompt.addEventListener('input', () => {
   handlePromptInput(PROMPT_CONFIGS.format);
@@ -809,13 +813,13 @@ function renderState(state) {
 }
 
 async function copyOcrText() {
-  const t = resultEl.value.trim(); if (!t) return;
-  try { await navigator.clipboard.writeText(t); copyButton.textContent = 'Copied!'; setTimeout(() => copyButton.textContent = 'Copy', 1500); }
-  catch { resultEl.select(); document.execCommand('copy'); }
+  return copyResult(resultEl, copyButton, (message) => { progressEl.textContent = message; });
 }
 function downloadOcrText() {
   const t = resultEl.value.trim(); if (!t) return;
-  downloadAsFile(t, 'textkit');
+  return downloadAsFile(t, 'textkit', downloadButton, (message) => {
+    progressEl.textContent = message;
+  });
 }
 
 // ── Translation panel actions ─────────────────────────────────
@@ -886,10 +890,23 @@ function stopTranslation() {
   setTl2Progress('Translation stopped.');
 }
 
-async function copyResult(textarea, button) {
+async function copyResult(textarea, button, setProgress = () => {}) {
   const t = textarea.value.trim(); if (!t) return;
-  try { await navigator.clipboard.writeText(t); button.textContent = 'Copied!'; setTimeout(() => button.textContent = 'Copy', 1500); }
-  catch { textarea.select(); document.execCommand('copy'); }
+  try {
+    try {
+      await navigator.clipboard.writeText(t);
+    } catch {
+      textarea.select();
+      if (!document.execCommand('copy')) throw new Error('Clipboard copy was rejected.');
+    }
+    button.textContent = 'Copied!';
+    setTimeout(() => { button.textContent = 'Copy'; }, 1500);
+    setProgress('Copied to clipboard.');
+    return true;
+  } catch (error) {
+    setProgress(`Copy failed: ${error.message || 'clipboard unavailable'}`);
+    return false;
+  }
 }
 
 function setTl2Progress(text) {
@@ -1070,13 +1087,38 @@ async function saveTranslation() {
   }
 }
 
-function downloadAsFile(text, prefix) {
-  if (!text) return;
+function downloadAsFile(text, prefix, button, setProgress = () => {}) {
+  if (!text) return Promise.resolve(false);
   const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  chrome.downloads.download({ url, filename: `${prefix}-${ts}.txt`, saveAs: true },
-    () => setTimeout(() => URL.revokeObjectURL(url), 30000));
+  return new Promise((resolve) => {
+    const finish = (downloadId) => {
+      const runtimeError = chrome.runtime.lastError;
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+      if (runtimeError || downloadId == null) {
+        setProgress(`Download failed: ${runtimeError?.message || 'browser rejected the download'}`);
+        resolve(false);
+        return;
+      }
+      if (button) {
+        button.textContent = 'Downloaded!';
+        setTimeout(() => { button.textContent = 'Download'; }, 1500);
+      }
+      setProgress('Download started.');
+      resolve(true);
+    };
+    try {
+      chrome.downloads.download(
+        { url, filename: `${prefix}-${ts}.txt`, saveAs: true },
+        finish
+      );
+    } catch (error) {
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+      setProgress(`Download failed: ${error.message || 'browser rejected the download'}`);
+      resolve(false);
+    }
+  });
 }
 
 // ── Translation tab settings ──────────────────────────────────
@@ -1095,13 +1137,15 @@ async function saveTl2Settings() {
 const PATH_HISTORY_KEY = 'tl2PathHistory';
 const MAX_PATH_HISTORY = 20;
 let _pathDebounceTimer = null;
+let _pathSuggestionGeneration = 0;
 
 function loadPathSuggestions() {
   // Initial load: fetch root-level paths from backend
-  fetchPathSuggestions('');
+  fetchPathSuggestions('', ++_pathSuggestionGeneration);
 }
 
-async function fetchPathSuggestions(prefix) {
+async function fetchPathSuggestions(prefix, generation = ++_pathSuggestionGeneration) {
+  if (generation > _pathSuggestionGeneration) _pathSuggestionGeneration = generation;
   try {
     const items = await chrome.storage.sync.get({
       fileBridgeHost: '',
@@ -1120,14 +1164,18 @@ async function fetchPathSuggestions(prefix) {
     // filtering matches. The backend returns paths relative to save_root;
     // we only need to restore the tilde the user typed.
     const tildePrefix = prefix.startsWith('~/') ? '~/' : (prefix === '~' ? '~/' : '');
+    if (generation !== _pathSuggestionGeneration) return false;
     populatePathSuggestions(paths.map((path) => tildePrefix + path));
+    return true;
   } catch {
     const stored = await chrome.storage.local.get(PATH_HISTORY_KEY);
+    if (generation !== _pathSuggestionGeneration) return false;
     const history = Array.isArray(stored[PATH_HISTORY_KEY]) ? stored[PATH_HISTORY_KEY] : [];
     const prefixLower = prefix.toLowerCase();
     populatePathSuggestions(history.filter((path) => (
       !prefixLower || String(path).toLowerCase().startsWith(prefixLower)
     )));
+    return true;
   }
 }
 
@@ -1140,18 +1188,20 @@ function populatePathSuggestions(paths) {
 }
 
 function updatePathSuggestions(current) {
-  if (!current) return;
+  const generation = ++_pathSuggestionGeneration;
   // Save to history for offline fallback
-  chrome.storage.local.get(PATH_HISTORY_KEY, (r) => {
-    let history = r[PATH_HISTORY_KEY] || [];
-    history = history.filter(p => p !== current);
-    history.unshift(current);
-    if (history.length > MAX_PATH_HISTORY) history = history.slice(0, MAX_PATH_HISTORY);
-    chrome.storage.local.set({ [PATH_HISTORY_KEY]: history });
-  });
+  if (current) {
+    chrome.storage.local.get(PATH_HISTORY_KEY, (r) => {
+      let history = r[PATH_HISTORY_KEY] || [];
+      history = history.filter(p => p !== current);
+      history.unshift(current);
+      if (history.length > MAX_PATH_HISTORY) history = history.slice(0, MAX_PATH_HISTORY);
+      chrome.storage.local.set({ [PATH_HISTORY_KEY]: history });
+    });
+  }
   // Debounce: fetch real filesystem paths after typing stops
   clearTimeout(_pathDebounceTimer);
-  _pathDebounceTimer = setTimeout(() => fetchPathSuggestions(current), 300);
+  _pathDebounceTimer = setTimeout(() => fetchPathSuggestions(current, generation), 300);
 }
 
 function normalizeBackendSettings(host, port) {

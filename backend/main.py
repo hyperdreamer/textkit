@@ -57,7 +57,10 @@ _DEFAULT_PROMPTS: dict[str, str] = {
         "Translate the following text to {language}. Return only the translation. "
         "Preserve paragraph structure and line breaks."
     ),
-    "format": "",
+    "format": (
+        "Format the following text for readability and clarity. Preserve its meaning "
+        "and all important details. Return only the formatted text."
+    ),
 }
 
 
@@ -385,29 +388,35 @@ async def _read_limited_upload(image: UploadFile, max_bytes: int) -> bytes:
     return image_bytes
 
 
-def _image_to_data_url(image_bytes: bytes, content_type: str | None) -> str:
-    """Validate image bytes and encode them as a base64 data URL."""
+def _image_to_data_url(image_bytes: bytes, _content_type: str | None) -> str:
+    """Validate image bytes and encode them using the detected image MIME type."""
 
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Missing image data")
 
     try:
-        image = Image.open(BytesIO(image_bytes))
-        image.verify()
-        inferred_format = (image.format or "").lower()
-    except UnidentifiedImageError as exc:
+        with Image.open(BytesIO(image_bytes)) as image:
+            inferred_format = (image.format or "").upper()
+            image.verify()
+        # ``verify`` checks container integrity but does not decode pixels. Reopen
+        # and load so truncated image data is rejected before it reaches the AI.
+        with Image.open(BytesIO(image_bytes)) as image:
+            image.load()
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="Uploaded file is not a valid image") from exc
-    finally:
-        try:
-            image.close()
-        except NameError:
-            pass
 
-    mime_type = content_type if content_type and content_type.startswith("image/") else None
-    if not mime_type and inferred_format:
-        mime_type = f"image/{'jpeg' if inferred_format == 'jpg' else inferred_format}"
+    # Pillow accepts a PNG with a missing IEND trailer, so enforce the required
+    # terminal chunk explicitly rather than treating a truncated PNG as valid.
+    if inferred_format == "PNG" and not image_bytes.endswith(
+        b"\x00\x00\x00\x00IEND\xaeB\x60\x82"
+    ):
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid image")
+
+    # Never trust the multipart Content-Type: derive the data URL type from the
+    # decoded bytes so a claimed image/png cannot disguise another format.
+    mime_type = Image.MIME.get(inferred_format)
     if not mime_type:
-        mime_type = "application/octet-stream"
+        raise HTTPException(status_code=400, detail="Unsupported image format")
 
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
@@ -949,17 +958,11 @@ def _fallback_prompt(name: str, language: str | None = None) -> tuple[str, str]:
 
 @app.get("/prompts")
 async def list_prompts() -> dict[str, dict[str, str]]:
-    """Return all available prompt templates."""
-    prompts: dict[str, str] = {}
-    if PROMPTS_DIR.is_dir():
-        for entry in sorted(PROMPTS_DIR.iterdir()):
-            if entry.suffix == ".txt":
-                name = entry.stem
-                content = _read_prompt_direct(name)
-                if content is not None:
-                    prompts[name] = content
-    for name, default in _DEFAULT_PROMPTS.items():
-        prompts.setdefault(name, default)
+    """Return the four canonical prompt templates."""
+    prompts = {
+        name: (_read_prompt_direct(name) or default)
+        for name, default in _DEFAULT_PROMPTS.items()
+    }
     return {"prompts": prompts}
 
 
