@@ -79,7 +79,7 @@ function createElement(id = '') {
 
 function createPopupHarness(options = {}) {
   const elements = new Map();
-  const localData = { fileBridgeToken: 'bridge-secret', ...(options.localData || {}) };
+  const localData = { ...(options.localData || {}) };
   const syncData = { ...(options.syncData || {}) };
   const runtimeMessages = [];
   const syncWrites = [];

@@ -62,16 +62,6 @@ async function getBackendHeaders(contentType, operationId = '') {
   return headers;
 }
 
-async function getFileBridgeHeaders(contentType = 'application/json') {
-  const { fileBridgeToken } = await chrome.storage.local.get({ fileBridgeToken: '' });
-  const token = String(fileBridgeToken || '').trim();
-  if (!token) throw new Error('File bridge token is required. Configure it in Settings.');
-  return {
-    ...(contentType ? { 'Content-Type': contentType } : {}),
-    'X-TextKit-Bridge-Token': token
-  };
-}
-
 function normalizeSavePath(value) {
   const raw = String(value || '').trim();
   if (!raw) throw new Error('Save path is required.');
@@ -758,7 +748,7 @@ async function handleSaveTranslation(msg) {
   const url = await getFileBridgeEndpoint('/save');
   const response = await fetchWithTimeout(url, {
     method: 'POST',
-    headers: await getFileBridgeHeaders(),
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text, path: normalizedPath })
   });
   let payload;

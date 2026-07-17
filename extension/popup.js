@@ -15,7 +15,6 @@ const portInput = document.getElementById('backend-port');
 const backendTokenInput = document.getElementById('backend-token');
 const fileBridgeHostInput = document.getElementById('file-bridge-host');
 const fileBridgePortInput = document.getElementById('file-bridge-port');
-const fileBridgeTokenInput = document.getElementById('file-bridge-token');
 const settingsGear = document.getElementById('settings-gear');
 const settingsPanel = document.getElementById('backend-settings-panel');
 const autoscrollCheckbox = document.getElementById('ocr-autoscroll');
@@ -278,7 +277,6 @@ portInput.addEventListener('change', saveSettings);
 backendTokenInput.addEventListener('change', saveSettings);
 fileBridgeHostInput.addEventListener('change', saveFileBridgeSettings);
 fileBridgePortInput.addEventListener('change', saveFileBridgeSettings);
-fileBridgeTokenInput.addEventListener('change', saveFileBridgeSettings);
 settingsGear.addEventListener('click', () => {
   const isOpen = !settingsPanel.classList.contains('hidden');
   settingsPanel.classList.toggle('hidden', isOpen);
@@ -431,9 +429,8 @@ async function init() {
   }
   fileBridgeHostInput.value = items.fileBridgeHost || '';
   fileBridgePortInput.value = items.fileBridgePort || FILE_BRIDGE_DEFAULT_PORT;
-  const secrets = await chrome.storage.local.get({ backendToken: '', fileBridgeToken: '' });
+  const secrets = await chrome.storage.local.get({ backendToken: '' });
   backendTokenInput.value = secrets.backendToken || '';
-  fileBridgeTokenInput.value = secrets.fileBridgeToken || '';
   tlLanguage.value = tlLanguage.value || 'original';
   tl2Language.value = tl2Language.value || 'original';
   autoscrollCheckbox.checked = items.ocrAutoscroll;
@@ -692,10 +689,7 @@ async function saveFileBridgeSettings() {
       progressEl.textContent = 'Permission to contact the file bridge was not granted.';
       return;
     }
-    await Promise.all([
-      chrome.storage.sync.set({ fileBridgeHost: '', fileBridgePort: port }),
-      chrome.storage.local.set({ fileBridgeToken: fileBridgeTokenInput.value.trim() })
-    ]);
+    await chrome.storage.sync.set({ fileBridgeHost: '', fileBridgePort: port });
     fileBridgeHostInput.value = '';
     fileBridgePortInput.value = port;
     return;
@@ -712,10 +706,7 @@ async function saveFileBridgeSettings() {
     progressEl.textContent = 'Permission to contact the file bridge was not granted.';
     return;
   }
-  await Promise.all([
-    chrome.storage.sync.set({ fileBridgeHost: fileBridge.host, fileBridgePort: fileBridge.port }),
-    chrome.storage.local.set({ fileBridgeToken: fileBridgeTokenInput.value.trim() })
-  ]);
+  await chrome.storage.sync.set({ fileBridgeHost: fileBridge.host, fileBridgePort: fileBridge.port });
   fileBridgeHostInput.value = fileBridge.host;
   fileBridgePortInput.value = fileBridge.port;
 }
@@ -725,12 +716,6 @@ async function ensureHostPermission(host) {
   const origins = [`http://${host}/*`];
   if (await chrome.permissions.contains({ origins })) return true;
   return chrome.permissions.request({ origins });
-}
-
-async function ensureConfiguredFileBridgePermission() {
-  const host = fileBridgeHostInput.value.trim() || 'localhost';
-  const bridge = normalizeBackendSettings(host, fileBridgePortInput.value || FILE_BRIDGE_DEFAULT_PORT);
-  return ensureHostPermission(bridge.host);
 }
 
 // ── OCR actions ───────────────────────────────────────────────
@@ -1096,13 +1081,12 @@ async function saveFormatResult() {
   }
 
   try {
-    if (!await ensureConfiguredFileBridgePermission()) throw new Error('File bridge permission was not granted.');
     const response = await chrome.runtime.sendMessage({
       type: 'save:translation',
       text,
       path
     });
-    if (!response?.ok) throw new Error(response?.error || 'Save failed');
+    if (!response || !response.ok) throw new Error(response?.error || 'Save failed');
 
     fmtSave.textContent = 'Saved!';
     setTimeout(() => fmtSave.textContent = 'Save', 1500);
@@ -1161,13 +1145,12 @@ async function saveTranslation() {
   }
 
   try {
-    if (!await ensureConfiguredFileBridgePermission()) throw new Error('File bridge permission was not granted.');
     const response = await chrome.runtime.sendMessage({
       type: 'save:translation',
       text,
       path
     });
-    if (!response?.ok) throw new Error(response?.error || 'Save failed');
+    if (!response || !response.ok) throw new Error(response?.error || 'Save failed');
 
     tl2Save.textContent = 'Saved!';
     setTimeout(() => tl2Save.textContent = 'Save', 1500);
@@ -1269,12 +1252,10 @@ async function fetchPathSuggestions(prefix, generation = ++_pathSuggestionGenera
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), PATH_REQUEST_TIMEOUT_MS);
   try {
-    const [items, secrets] = await Promise.all([
-      chrome.storage.sync.get({ fileBridgeHost: '', fileBridgePort: FILE_BRIDGE_DEFAULT_PORT }),
-      chrome.storage.local.get({ fileBridgeToken: '' })
-    ]);
-    const token = String(secrets.fileBridgeToken || '').trim();
-    if (!token) throw new Error('File bridge token is required.');
+    const items = await chrome.storage.sync.get({
+      fileBridgeHost: '',
+      fileBridgePort: FILE_BRIDGE_DEFAULT_PORT
+    });
     const safePrefix = normalizePathPrefix(prefix);
     const hasFileBridgeHost = String(items.fileBridgeHost || '').trim().length > 0;
     const fileBridge = normalizeBackendSettings(
@@ -1283,10 +1264,7 @@ async function fetchPathSuggestions(prefix, generation = ++_pathSuggestionGenera
     );
     const resp = await fetch(
       `http://${fileBridge.host}:${fileBridge.port}/paths?prefix=${encodeURIComponent(safePrefix)}`,
-      {
-        headers: { 'X-TextKit-Bridge-Token': token },
-        signal: controller.signal
-      }
+      { signal: controller.signal }
     );
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();

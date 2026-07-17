@@ -950,14 +950,11 @@ test('persisted translation resumes after a service worker restart', async () =>
   assert.equal(Object.hasOwn(harness.localData, 'operation:translate:1'), false);
 });
 
-test('file bridge saves require safe paths, authentication, and explicit success', async () => {
+test('file bridge saves require safe paths and explicit success', async () => {
   let fetchCalls = 0;
-  let requestHeaders;
   const harness = createBackgroundHarness({
-    localData: { fileBridgeToken: 'bridge-secret' },
     fetch: async (_url, options) => {
       fetchCalls += 1;
-      requestHeaders = options.headers;
       return { ok: true, text: async () => JSON.stringify({ success: true, path: '/ignored' }) };
     }
   });
@@ -967,7 +964,6 @@ test('file bridge saves require safe paths, authentication, and explicit success
 
   assert.equal(traversal.ok, false);
   assert.equal(fetchCalls, 1);
-  assert.equal(requestHeaders['X-TextKit-Bridge-Token'], 'bridge-secret');
   assert.equal(saved.ok, true);
   assert.equal(saved.path, 'notes/today.txt');
 });
@@ -975,7 +971,6 @@ test('file bridge saves require safe paths, authentication, and explicit success
 test('file bridge empty or implicit-success responses are rejected', async () => {
   let responseBody = '';
   const harness = createBackgroundHarness({
-    localData: { fileBridgeToken: 'bridge-secret' },
     fetch: async () => ({ ok: true, text: async () => responseBody })
   });
 
