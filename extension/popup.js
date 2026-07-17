@@ -311,7 +311,9 @@ tl2Download.addEventListener('click', () => downloadAsFile(
 tl2Save.addEventListener('click', saveTranslation);
 tl2Language.addEventListener('change', () => { saveTl2Language(); syncLanguage('translation'); });
 tl2AutocopyCheckbox.addEventListener('change', saveTl2Settings);
-tl2AutosaveCheckbox.addEventListener('change', saveTl2Settings);
+tl2AutosaveCheckbox.addEventListener('change', () => {
+  handleTl2AutosaveToggle().catch((error) => setTl2Progress(`Settings save failed: ${error.message}`));
+});
 tl2AutotranslateCheckbox.addEventListener('change', saveTl2Settings);
 tl2AutosavePath.addEventListener('input', () => {
   scheduleTl2SettingsSave();
@@ -347,7 +349,9 @@ fmtSavePath.addEventListener('input', () => {
 fmtSavePath.addEventListener('blur', flushFormatSettingsSave);
 fmtSavePath.addEventListener('change', flushFormatSettingsSave);
 fmtAutocopy.addEventListener('change', saveFormatSettings);
-fmtAutosave.addEventListener('change', saveFormatSettings);
+fmtAutosave.addEventListener('change', () => {
+  handleFormatAutosaveToggle().catch((error) => setFmtProgress(`Settings save failed: ${error.message}`));
+});
 fmtAutoformat.addEventListener('change', saveFormatSettings);
 fmtSource.addEventListener('change', () => { saveFormatSettings(); updateFormatButtons(); });
 
@@ -1155,6 +1159,21 @@ function saveFormatSettings() {
   });
 }
 
+async function handleFormatAutosaveToggle() {
+  if (fmtAutosave.checked) {
+    try {
+      if (!await ensureFileBridgePermission()) {
+        fmtAutosave.checked = false;
+        setFmtProgress('Auto-save was not enabled because file bridge permission was not granted.');
+      }
+    } catch (error) {
+      fmtAutosave.checked = false;
+      setFmtProgress(`Auto-save was not enabled: ${error.message}`);
+    }
+  }
+  await saveFormatSettings();
+}
+
 function scheduleFormatSettingsSave() {
   clearTimeout(_formatSettingsSaveTimer);
   _formatSettingsSaveTimer = setTimeout(() => {
@@ -1255,6 +1274,21 @@ async function saveTl2Settings() {
     tl2AutoSavePath: tl2AutosavePath.value.trim(),
     ocrAutoTranslate: tl2AutotranslateCheckbox.checked
   });
+}
+
+async function handleTl2AutosaveToggle() {
+  if (tl2AutosaveCheckbox.checked) {
+    try {
+      if (!await ensureFileBridgePermission()) {
+        tl2AutosaveCheckbox.checked = false;
+        setTl2Progress('Auto-save was not enabled because file bridge permission was not granted.');
+      }
+    } catch (error) {
+      tl2AutosaveCheckbox.checked = false;
+      setTl2Progress(`Auto-save was not enabled: ${error.message}`);
+    }
+  }
+  await saveTl2Settings();
 }
 
 function scheduleTl2SettingsSave() {

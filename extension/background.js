@@ -8,7 +8,7 @@ const DEFAULT_CAPTURE_INTERVAL_MS = 100;
 const BACKEND_TIMEOUT_MS = 12 * 60 * 1000;
 const MAX_CAPTURE_PAGES = 500;
 const MAX_SAVE_PATH_CHARS = 1024;
-const MAX_PERSISTED_TEXT_CHARS = 1_000_000;
+const MAX_PERSISTED_TEXT_BYTES = 1_000_000;
 const OPERATION_SCHEMA_VERSION = 1;
 const LOCAL_BACKEND_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 
@@ -51,6 +51,19 @@ async function getFileBridgeEndpoint(path) {
     _fileBridgeBaseUrlExpiry = Date.now() + 60_000;
   }
   return _fileBridgeBaseUrl + path;
+}
+
+async function hasFileBridgePermission() {
+  if (!chrome.permissions?.contains) return true;
+  const items = await chrome.storage.sync.get({
+    fileBridgeHost: '',
+    fileBridgePort: FILE_BRIDGE_DEFAULT_PORT
+  });
+  const fileBridge = normalizeBackendSettings(
+    items.fileBridgeHost || DEFAULT_HOST,
+    items.fileBridgePort || FILE_BRIDGE_DEFAULT_PORT
+  );
+  return chrome.permissions.contains({ origins: [`http://${fileBridge.host}/*`] });
 }
 
 async function getBackendHeaders(contentType, operationId = '') {
@@ -97,10 +110,14 @@ function requireTextPayload(payload, label) {
 }
 
 function requirePersistableText(text, label) {
-  if (String(text).length > MAX_PERSISTED_TEXT_CHARS) {
-    throw new Error(`${label} exceeds the ${MAX_PERSISTED_TEXT_CHARS}-character storage safety limit.`);
+  if (encodedTextByteLength(text) > MAX_PERSISTED_TEXT_BYTES) {
+    throw new Error(`${label} exceeds the ${MAX_PERSISTED_TEXT_BYTES}-byte storage safety limit.`);
   }
   return text;
+}
+
+function encodedTextByteLength(text) {
+  return new TextEncoder().encode(String(text)).length;
 }
 
 function buildBackendEndpoint(host, port, path) {
@@ -162,6 +179,7 @@ const targetTabWaiters = new Set();
 let targetTabChangeRevision = 0;
 const pendingOffscreenCopies = new Map();
 let nextOffscreenCopyId = 1;
+let offscreenDocumentCreationPromise = null;
 
 function getState(tabId) {
   if (!states.has(tabId)) {
@@ -377,10 +395,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch((error) => handleCaptureLoopFailure(tabId, error, 'Capture loop failed:'));
     return false;
   }
-  if (message?.type === 'popup:start-with-region') {
-    handleReuseRegion().then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
-    return true;
-  }
   if (message?.type === 'selection:cancelled') {
     const tabId = sender.tab?.id;
     const state = tabId ? getState(tabId) : null;
@@ -456,32 +470,6 @@ async function handlePopupStart(message = {}) {
     });
     throw error;
   }
-  return { ok: true };
-}
-
-async function handleReuseRegion() {
-  const tab = await getActiveTab();
-  const state = getState(tab.id);
-  if (state.active || state.captureInFlight || state.status === 'Selecting') {
-    throw new Error('A capture is already active for this tab.');
-  }
-  const region = state.lastRegion;
-  if (!region) throw new Error('No saved region. Select a region first.');
-  if (tab.windowId == null || tab.windowId < 0) throw new Error('Invalid windowId.');
-  await abortDownstreamOperations(tab.id);
-  await ensureContentScript(tab.id);
-  state.operationPrompts = await snapshotCapturePrompts();
-  // Get actual viewport dimensions from the content script
-  const vp = await chrome.tabs.sendMessage(tab.id, { type: 'get-viewport' });
-  const fullRegion = {
-    ...region,
-    viewportWidth: vp?.width || 1920,
-    viewportHeight: vp?.height || 1080,
-    devicePixelRatio: vp?.dpr || 1
-  };
-  // Run capture directly — no overlay needed
-  runCaptureLoop(tab, fullRegion)
-    .catch((error) => handleCaptureLoopFailure(tab.id, error, 'Reuse capture failed:'));
   return { ok: true };
 }
 
@@ -1500,12 +1488,40 @@ async function finalizePostCapture(tabId, mergedText, fragmentsOrCount) {
 
 async function finalizeCapture(tabId, finalText, fragmentsOrCount) {
   const state = getState(tabId);
-  requirePersistableText(finalText, 'Capture result');
   const fragmentCount = fragmentCountOf(fragmentsOrCount);
   state.retryStage = null;
   state.pendingText = '';
 
   const isPartial = Boolean(state.partialReason);
+  const isEmptyCancellation = !String(finalText || '').length
+    && ['stopped', 'navigation', 'tab_closed'].includes(state.partialReason);
+  if (isEmptyCancellation) {
+    let progress = 'Capture cancelled before any text was collected.';
+    if (state.partialReason === 'navigation') {
+      progress = 'Capture cancelled because the page navigated before any text was collected.';
+    } else if (state.partialReason === 'tab_closed') {
+      progress = 'Capture cancelled because the tab closed before any text was collected.';
+    }
+    updateState(tabId, {
+      active: false,
+      status: 'Cancelled',
+      currentPage: 0,
+      fragmentsCollected: 0,
+      progress,
+      fragments: [],
+      checkpointText: '',
+      mergedText: ''
+    });
+    await chrome.storage.local.remove(`lastResult:${tabId}`);
+    await clearRetryState(tabId, state);
+    await chrome.storage.local.set({ [`lastStatus:${tabId}`]: 'Cancelled' });
+    if (state.captureOperationId) {
+      await clearOperation('capture', tabId, state.captureOperationId);
+    }
+    return '';
+  }
+
+  requirePersistableText(finalText, 'Capture result');
   let progress = 'Finished.';
   if (state.partialReason === 'navigation') {
     progress = `Partial capture: page navigation stopped capture after ${fragmentCount} fragment${fragmentCount === 1 ? '' : 's'}.`;
@@ -1516,7 +1532,7 @@ async function finalizeCapture(tabId, finalText, fragmentsOrCount) {
   } else if (state.partialReason === 'error') {
     progress = `Partial capture ended after an error; saved ${fragmentCount} fragment${fragmentCount === 1 ? '' : 's'}.`;
   } else if (state.partialReason === 'text_limit') {
-    progress = `Partial capture stopped at the ${MAX_PERSISTED_TEXT_CHARS}-character safety limit after ${fragmentCount} fragment${fragmentCount === 1 ? '' : 's'}.`;
+    progress = `Partial capture stopped at the ${MAX_PERSISTED_TEXT_BYTES}-byte safety limit after ${fragmentCount} fragment${fragmentCount === 1 ? '' : 's'}.`;
   }
   const finalStatus = isPartial ? 'Partial' : 'Done';
 
@@ -1542,6 +1558,11 @@ async function finalizeCapture(tabId, finalText, fragmentsOrCount) {
       progress: 'Capture finished, but its result could not be saved.'
     });
     throw error;
+  }
+
+  await clearRetryState(tabId, state);
+  if (state.captureOperationId) {
+    await clearOperation('capture', tabId, state.captureOperationId);
   }
 
   // Run post-capture automation only for a normally completed capture.
@@ -1656,6 +1677,7 @@ class IncrementalFragmentMerger {
   constructor(initialText = '') {
     this.text = normalizeText(initialText);
     this.lines = this.text ? this.text.split('\n') : [];
+    this.byteLength = encodedTextByteLength(this.text);
   }
 
   append(fragment) {
@@ -1665,14 +1687,15 @@ class IncrementalFragmentMerger {
     const appendedLines = nextLines.slice(overlap);
     if (!appendedLines.length) return;
     const appendedText = appendedLines.join('\n');
-    const candidateLength = this.text.length + (this.text ? 1 : 0) + appendedText.length;
-    if (candidateLength > MAX_PERSISTED_TEXT_CHARS) {
-      const error = new Error(`Capture text exceeded the ${MAX_PERSISTED_TEXT_CHARS}-character checkpoint limit.`);
+    const candidateByteLength = this.byteLength + (this.text ? 1 : 0) + encodedTextByteLength(appendedText);
+    if (candidateByteLength > MAX_PERSISTED_TEXT_BYTES) {
+      const error = new Error(`Capture text exceeded the ${MAX_PERSISTED_TEXT_BYTES}-byte checkpoint limit.`);
       error.code = 'TEXT_LIMIT';
       throw error;
     }
     this.lines.push(...appendedLines);
     this.text = this.text ? `${this.text}\n${appendedText}` : appendedText;
+    this.byteLength = candidateByteLength;
   }
 }
 
@@ -1680,14 +1703,6 @@ function mergeFragments(fragments) {
   const merger = new IncrementalFragmentMerger();
   for (const fragment of fragments || []) merger.append(fragment);
   return merger.text;
-}
-
-function mergeTwoFragments(prev, next) {
-  if (!next) return prev;
-  const pLines = splitLines(prev);
-  const nLines = splitLines(next);
-  const overlap = findLineOverlap(pLines, nLines);
-  return pLines.concat(nLines.slice(overlap)).join('\n');
 }
 
 function findLineOverlap(pLines, nLines) {
@@ -1821,23 +1836,7 @@ function resetState(tabId) {
 
 async function copyToClipboard(text) {
   if (!text) return false;
-  let hasDocument = false;
-  if (typeof chrome.offscreen.hasDocument === 'function') {
-    hasDocument = await chrome.offscreen.hasDocument();
-  } else if (typeof chrome.runtime.getContexts === 'function' && typeof chrome.runtime.getURL === 'function') {
-    const contexts = await chrome.runtime.getContexts({
-      contextTypes: ['OFFSCREEN_DOCUMENT'],
-      documentUrls: [chrome.runtime.getURL('offscreen.html')]
-    });
-    hasDocument = contexts.length > 0;
-  }
-  if (!hasDocument) {
-    await chrome.offscreen.createDocument({
-      url: 'offscreen.html',
-      reasons: ['CLIPBOARD'],
-      justification: 'Clipboard access for TextKit results'
-    });
-  }
+  await ensureOffscreenDocument();
   const copyId = nextOffscreenCopyId++;
   return new Promise((resolve, reject) => {
     const timeoutId = setTimeout(() => {
@@ -1848,6 +1847,34 @@ async function copyToClipboard(text) {
       finishOffscreenCopy(copyId, error);
     });
   });
+}
+
+async function hasOffscreenDocument() {
+  let hasDocument = false;
+  if (typeof chrome.offscreen.hasDocument === 'function') {
+    hasDocument = await chrome.offscreen.hasDocument();
+  } else if (typeof chrome.runtime.getContexts === 'function' && typeof chrome.runtime.getURL === 'function') {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: ['OFFSCREEN_DOCUMENT'],
+      documentUrls: [chrome.runtime.getURL('offscreen.html')]
+    });
+    hasDocument = contexts.length > 0;
+  }
+  return hasDocument;
+}
+
+async function ensureOffscreenDocument() {
+  if (await hasOffscreenDocument()) return;
+  if (!offscreenDocumentCreationPromise) {
+    offscreenDocumentCreationPromise = chrome.offscreen.createDocument({
+      url: 'offscreen.html',
+      reasons: ['CLIPBOARD'],
+      justification: 'Clipboard access for TextKit results'
+    }).finally(() => {
+      offscreenDocumentCreationPromise = null;
+    });
+  }
+  await offscreenDocumentCreationPromise;
 }
 
 function handleOffscreenCopyResult(message) {
@@ -1928,6 +1955,9 @@ async function autoSaveIfEnabled(text) {
   });
   if (!tl2AutoSave || !tl2AutoSavePath || !text) return;
   try {
+    if (!await hasFileBridgePermission()) {
+      throw new Error('File bridge permission is missing or was revoked.');
+    }
     const result = await handleSaveTranslation({ text, path: tl2AutoSavePath });
     if (!result.ok) throw new Error(result.error || 'Save failed');
     chrome.notifications.create('auto-save', {
@@ -1981,6 +2011,9 @@ async function fmtAutoSaveIfEnabled(text) {
   });
   if (!fmtAutoSave || !fmtSavePath || !text) return;
   try {
+    if (!await hasFileBridgePermission()) {
+      throw new Error('File bridge permission is missing or was revoked.');
+    }
     const result = await handleSaveTranslation({ text, path: fmtSavePath });
     if (!result.ok) throw new Error(result.error || 'Save failed');
     chrome.notifications.create('fmt-auto-save', {

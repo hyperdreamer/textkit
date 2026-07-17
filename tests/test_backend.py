@@ -315,6 +315,11 @@ def test_request_and_model_fields_are_bounded(
     assert unsupported_language.status_code == 400
 
 
+def test_translate_request_canonicalizes_language_casing() -> None:
+    assert main.TranslateRequest(text="hello", language="fReNcH").language == "French"
+    assert main.TranslateRequest(text="hello", language=" original ").language == "original"
+
+
 def test_chunked_request_body_is_limited_without_content_length(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

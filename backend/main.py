@@ -228,7 +228,7 @@ class TranslateRequest(BaseModel):
         cleaned = value.strip()
         if cleaned.lower() not in SUPPORTED_LANGUAGES:
             raise ValueError(f"language must be one of: {', '.join(sorted(SUPPORTED_LANGUAGES))}")
-        return cleaned
+        return cleaned if cleaned.lower() == "original" else cleaned.title()
 
 
 class FormatRequest(BaseModel):
@@ -637,7 +637,6 @@ def _error_payload(error: str) -> dict[str, str | int | None]:
 
 
 _AI_ENDPOINTS = {"/ocr", "/dedup", "/translate", "/format"}
-_LIMITED_ENDPOINTS = _AI_ENDPOINTS | {"/prompts"}
 
 
 async def _acquire_request_slot(request: Request, config: AppConfig) -> JSONResponse | None:

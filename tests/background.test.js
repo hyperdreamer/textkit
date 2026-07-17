@@ -61,6 +61,7 @@ function createBackgroundHarness(options = {}) {
   const notifications = [];
   const permissionContainsCalls = [];
   const permissionRequestCalls = [];
+  let offscreenCreateCalls = 0;
   let offscreenCloseCalls = 0;
   const localData = { ...(options.localData || {}) };
   const syncValues = {
@@ -178,7 +179,13 @@ function createBackgroundHarness(options = {}) {
       insertCSS() { return Promise.resolve(); }
     },
     offscreen: {
-      createDocument() { return Promise.resolve(); },
+      hasDocument() {
+        return options.offscreenHasDocument ? options.offscreenHasDocument() : Promise.resolve(false);
+      },
+      createDocument() {
+        offscreenCreateCalls += 1;
+        return options.offscreenCreateDocument ? options.offscreenCreateDocument() : Promise.resolve();
+      },
       closeDocument() { offscreenCloseCalls += 1; return Promise.resolve(); }
     },
     notifications: {
@@ -191,6 +198,7 @@ function createBackgroundHarness(options = {}) {
     AbortController,
     Blob,
     FormData,
+    TextEncoder,
     URL,
     chrome,
     clearInterval,
@@ -272,6 +280,7 @@ function createBackgroundHarness(options = {}) {
     originalFinalizePostCapture,
     permissionContainsCalls,
     permissionRequestCalls,
+    get offscreenCreateCalls() { return offscreenCreateCalls; },
     get offscreenCloseCalls() { return offscreenCloseCalls; },
     removeTab,
     runtimeMessages,
@@ -914,6 +923,78 @@ test('stopped captures are persisted and displayed as partial', async () => {
   assert.equal(harness.localData['lastResult:1'], 'partial text');
 });
 
+test('stopped captures with no fragments are cancelled without persisting empty text', async () => {
+  const harness = createBackgroundHarness({
+    localData: { 'lastResult:1': 'stale result' }
+  });
+  const state = harness.context.getState(1);
+  state.stopRequested = true;
+  state.partialReason = 'stopped';
+  state.captureOperationId = 'capture:1:test';
+  harness.localData['operation:capture:1'] = { operationId: state.captureOperationId };
+  harness.context.__persistableChecks = 0;
+  vm.runInContext(`
+    requirePersistableText = () => {
+      __persistableChecks += 1;
+      throw new Error('empty text must not be checked');
+    };
+  `, harness.context);
+
+  const result = await harness.originalFinalizeCapture(1, '', 0);
+
+  assert.equal(result, '');
+  assert.equal(state.status, 'Cancelled');
+  assert.equal(state.progress, 'Capture cancelled before any text was collected.');
+  assert.equal(harness.context.__persistableChecks, 0);
+  assert.equal(harness.localData['lastStatus:1'], 'Cancelled');
+  assert.equal(Object.hasOwn(harness.localData, 'lastResult:1'), false);
+  assert.equal(Object.hasOwn(harness.localData, 'operation:capture:1'), false);
+});
+
+test('persisted text limits use UTF-8 byte size', () => {
+  const harness = createBackgroundHarness();
+
+  assert.equal(harness.context.requirePersistableText('a'.repeat(1_000_000), 'ASCII'), 'a'.repeat(1_000_000));
+  assert.throws(
+    () => harness.context.requirePersistableText('汉'.repeat(333_334), 'CJK'),
+    /1000000-byte storage safety limit/
+  );
+  assert.throws(
+    () => vm.runInContext("new IncrementalFragmentMerger().append('汉'.repeat(333334))", harness.context),
+    /1000000-byte checkpoint limit/
+  );
+});
+
+test('capture checkpoints are cleared before downstream automation', async () => {
+  const operationId = 'capture:1:test';
+  const harness = createBackgroundHarness({
+    localData: {
+      'retryState:1': { stage: 'dedup', mergedText: 'final text' },
+      'operation:capture:1': { operationId, input: { mergedText: 'final text' } }
+    }
+  });
+  const state = harness.context.getState(1);
+  state.captureOperationId = operationId;
+  harness.context.__checkpointStateDuringAutomation = null;
+  vm.runInContext(`
+    autoFormatIfEnabled = async () => {
+      __checkpointStateDuringAutomation = {
+        retry: Object.hasOwn(__localData, 'retryState:1'),
+        operation: Object.hasOwn(__localData, 'operation:capture:1')
+      };
+    };
+    autoTranslateIfEnabled = async () => {};
+  `, harness.context);
+  harness.context.__localData = harness.localData;
+
+  await harness.originalFinalizeCapture(1, 'final text', 1);
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(harness.context.__checkpointStateDuringAutomation)),
+    { retry: false, operation: false }
+  );
+});
+
 test('manual translation substitutes every language placeholder in a custom prompt', async () => {
   let requestBody;
   const harness = createBackgroundHarness({
@@ -1118,6 +1199,53 @@ test('offscreen creation failures are surfaced', async () => {
   };
 
   await assert.rejects(harness.context.copyToClipboard('text'), /offscreen unavailable/);
+});
+
+test('concurrent clipboard copies share one offscreen document creation', async () => {
+  const creation = deferred();
+  const harness = createBackgroundHarness({
+    offscreenCreateDocument: () => creation.promise
+  });
+
+  const first = harness.context.copyToClipboard('first');
+  const second = harness.context.copyToClipboard('second');
+  await waitFor(() => harness.offscreenCreateCalls === 1, 'offscreen creation did not start');
+  creation.resolve();
+  await waitFor(
+    () => harness.runtimeMessages.filter((message) => message.type === 'offscreen:copy').length === 2,
+    'clipboard requests were not sent'
+  );
+  const requests = harness.runtimeMessages.filter((message) => message.type === 'offscreen:copy');
+  for (const request of requests) {
+    harness.events.runtimeMessage.emit({ type: 'offscreen:copied', copyId: request.copyId }, {}, () => {});
+  }
+
+  assert.deepEqual(await Promise.all([first, second]), [true, true]);
+  assert.equal(harness.offscreenCreateCalls, 1);
+  assert.equal(harness.offscreenCloseCalls, 1);
+});
+
+test('auto-save logs a user-visible failure when file bridge permission was revoked', async () => {
+  let fetchCalls = 0;
+  const harness = createBackgroundHarness({
+    syncValues: {
+      tl2AutoSave: true,
+      tl2AutoSavePath: 'notes/translation.txt',
+      fileBridgeHost: '127.0.0.1',
+      fileBridgePort: 8766
+    },
+    permissionContains: async () => false,
+    fetch: async () => {
+      fetchCalls += 1;
+      return { ok: true, text: async () => JSON.stringify({ success: true }) };
+    }
+  });
+
+  await harness.context.autoSaveIfEnabled('translated text');
+
+  assert.equal(fetchCalls, 0);
+  assert.deepEqual(harness.notifications.map(({ id }) => id), ['auto-save-failed']);
+  assert.match(harness.notifications[0].options.message, /missing or was revoked/);
 });
 
 test('state broadcasts omit fragment arrays and private retry payloads', () => {

@@ -628,6 +628,30 @@ test('manual file bridge saves request configured host permission', async () => 
   assert.match(harness.elements.get('fmt-status-text').textContent, /permission was not granted/);
 });
 
+test('auto-save toggles refuse to enable without file bridge permission', async () => {
+  const harness = createPopupHarness({
+    syncData: { fileBridgeHost: '127.0.0.1', fileBridgePort: 8766 },
+    permissionContains: async () => false,
+    permissionRequest: async () => false
+  });
+  const translationAutoSave = harness.elements.get('tl2-autosave');
+  const formatAutoSave = harness.elements.get('fmt-autosave');
+
+  translationAutoSave.checked = true;
+  translationAutoSave.dispatch('change');
+  formatAutoSave.checked = true;
+  formatAutoSave.dispatch('change');
+  await waitFor(() => harness.syncWrites.length === 2, 'auto-save settings were not persisted');
+
+  assert.equal(translationAutoSave.checked, false);
+  assert.equal(formatAutoSave.checked, false);
+  assert.equal(harness.syncData.tl2AutoSave, false);
+  assert.equal(harness.syncData.fmtAutoSave, false);
+  assert.equal(harness.permissionRequestCalls.length, 2);
+  assert.match(harness.elements.get('tl2-status-text').textContent, /was not enabled/);
+  assert.match(harness.elements.get('fmt-status-text').textContent, /was not enabled/);
+});
+
 test('language switch does not save server fallback as a custom prompt', async () => {
   const harness = createPopupHarness({
     localData: {},
