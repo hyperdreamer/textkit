@@ -120,7 +120,6 @@ let currentTabId = null;
 let userEditedResult = false;
 let lastStoredStatus = '';
 let promptEditorLanguage = 'original';
-let _tlSaveTimer = null;
 let _ocrTextSaveTimer = null;
 let _tl2SettingsSaveTimer = null;
 let _formatSettingsSaveTimer = null;
@@ -510,15 +509,7 @@ async function init() {
   const tl2 = await chrome.storage.local.get([...tl2Keys, 'tl2Language']);
   if (tl2.tl2Language) tl2Language.value = tl2.tl2Language;
   if (tl2[tl2k('tl2Result')]) { tl2Result.value = tl2[tl2k('tl2Result')]; tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = false; }
-  if (tl2[tl2k('tl2Status')]) {
-    // Clear stale "Translating..." state from previous session
-    const p = tl2[tl2k('tl2Status')];
-    if (p === 'Translating...') {
-      tl2StatusText.textContent = 'Ready';
-    } else {
-      tl2StatusText.textContent = p;
-    }
-  }
+  const storedTl2Status = tl2[tl2k('tl2Status')];
   // Restore translating state from the same atomic load
   const wasTranslating = !!tl2[tl2k('tl2Translating')];
   const hasTl2Result = !!tl2[tl2k('tl2Result')];
@@ -538,7 +529,7 @@ async function init() {
   } else {
     tl2Translate.textContent = 'Translate';
     tl2Translate.classList.remove('danger');
-    tl2StatusText.textContent = 'Ready';
+    tl2StatusText.textContent = storedTl2Status || 'Ready';
   }
   updateTranslationButtons();
 
@@ -565,14 +556,7 @@ async function init() {
   const fmt = await chrome.storage.local.get(fmtKeys);
   if (fmt['formatPrompt']) formatPrompt.value = fmt['formatPrompt'];
   if (fmt[fmtk('fmtResult')]) { fmtResult.value = fmt[fmtk('fmtResult')]; fmtCopy.disabled = fmtSave.disabled = fmtDownload.disabled = false; }
-  if (fmt[fmtk('fmtStatus')]) {
-    const p = fmt[fmtk('fmtStatus')];
-    if (p === 'Formatting...') {
-      fmtStatusText.textContent = 'Ready';
-    } else {
-      fmtStatusText.textContent = p;
-    }
-  }
+  const storedFmtStatus = fmt[fmtk('fmtStatus')];
   // Restore formatting state from the same atomic load
   const wasFormatting = !!fmt[fmtk('fmtFormatting')];
   const hasFmtResult = !!fmt[fmtk('fmtResult')];
@@ -592,7 +576,7 @@ async function init() {
   } else {
     fmtFormat.textContent = 'Format';
     fmtFormat.classList.remove('danger');
-    fmtStatusText.textContent = 'Ready';
+    fmtStatusText.textContent = storedFmtStatus || 'Ready';
   }
   updateFormatButtons();
 
@@ -658,7 +642,6 @@ function syncLanguage(source) {
 }
 
 async function onTlLanguageChange() {
-  clearTimeout(_tlSaveTimer);
   // Save the current textarea content to the language it actually belongs to
   // (tracked by promptEditorLanguage), not the stale value from storage.
   // Using oldLang from storage is racy: a pending loadPromptForLanguage (fired

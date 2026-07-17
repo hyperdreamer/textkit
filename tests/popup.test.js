@@ -359,6 +359,24 @@ test('popup restores persisted OCR status before rendering Idle state', async ()
   assert.equal(harness.elements.get('result').value, 'restored result');
 });
 
+test('popup preserves terminal translation and format errors when no operation is active', async () => {
+  const harness = createPopupHarness({
+    localData: {
+      'tl2Status:1': 'Translation provider unavailable',
+      'fmtStatus:1': 'Formatting provider unavailable'
+    },
+    runtimeSendMessage: async (message) => message.type === 'popup:get-state'
+      ? { ok: true, tabId: 1, state: { status: 'Idle', active: false, progress: 'Ready' } }
+      : { ok: true },
+    fetch: async () => ({ ok: false, status: 503 })
+  });
+
+  await harness.context.init();
+
+  assert.equal(harness.elements.get('tl2-status-text').textContent, 'Translation provider unavailable');
+  assert.equal(harness.elements.get('fmt-status-text').textContent, 'Formatting provider unavailable');
+});
+
 test('successful host permission refreshes fallback previews', async () => {
   let fetchCalls = 0;
   let granted = false;

@@ -209,13 +209,37 @@ function createBackgroundHarness(options = {}) {
     AbortController,
     Blob,
     FormData,
+    OffscreenCanvas: class {
+      constructor(width, height) {
+        this.width = width;
+        this.height = height;
+        this.record = { width, height, drawImage: null };
+        cropCalls.push(this.record);
+      }
+      getContext(type) {
+        if (type !== '2d') return null;
+        return {
+          drawImage: (_bitmap, ...args) => { this.record.drawImage = args; }
+        };
+      }
+      convertToBlob() {
+        return Promise.resolve(new Blob([`${this.width}x${this.height}`], { type: 'image/png' }));
+      }
+    },
     TextEncoder,
     URL,
     chrome,
     clearInterval,
     clearTimeout,
     console,
-    fetch: options.fetch || fetch,
+    createImageBitmap: async () => ({
+      width: options.imageBitmapSize?.width || 100,
+      height: options.imageBitmapSize?.height || 100,
+      close() {}
+    }),
+    fetch: (url, ...args) => String(url).startsWith('data:')
+      ? fetch(url, ...args)
+      : (options.fetch || fetch)(url, ...args),
     setInterval: () => 1,
     setTimeout
   };
@@ -227,7 +251,14 @@ function createBackgroundHarness(options = {}) {
       vm.runInContext(fs.readFileSync(absolutePath, 'utf8'), context, { filename: absolutePath });
     }
   };
-  vm.runInContext(fs.readFileSync(BACKGROUND_PATH, 'utf8'), context, { filename: BACKGROUND_PATH });
+  let backgroundSource = fs.readFileSync(BACKGROUND_PATH, 'utf8');
+  if (options.maxCapturePages) {
+    backgroundSource = backgroundSource.replace(
+      'const MAX_CAPTURE_PAGES = 500;',
+      `const MAX_CAPTURE_PAGES = ${options.maxCapturePages};`
+    );
+  }
+  vm.runInContext(backgroundSource, context, { filename: BACKGROUND_PATH });
   const originalFinalizeCapture = vm.runInContext('finalizeCapture', context);
   const originalFinalizePostCapture = vm.runInContext('finalizePostCapture', context);
 
@@ -247,7 +278,9 @@ function createBackgroundHarness(options = {}) {
     });
     return text;
   };
-  vm.runInContext('cropVisibleCapture = (...args) => __testCrop(...args);', context);
+  if (!options.useRealPipeline) {
+    vm.runInContext('cropVisibleCapture = (...args) => __testCrop(...args);', context);
+  }
   if (!options.useRealPipeline) {
     vm.runInContext(`
       postImageForOcr = (...args) => __testOcr(...args);
@@ -319,6 +352,48 @@ test('safe capture accepts a frame when the target stays active', async () => {
   assert.equal(harness.captureCalls[0].windowId, 10);
   assert.equal(harness.cropCalls.length, 1);
   assert.deepEqual(harness.ocrCalls.map((call) => call.pageNumber), [1]);
+});
+
+test('page limit is partial only when more content remains', async () => {
+  let scrollCalls = 0;
+  const harness = createBackgroundHarness({
+    maxCapturePages: 2,
+    syncValues: { ocrAutoscroll: true },
+    sendMessage(_tabId, message) {
+      if (message.type !== 'page:scroll-down') return { ok: true };
+      scrollCalls += 1;
+      return { changed: true, atBottom: false, scrollY: scrollCalls * 100 };
+    }
+  });
+  vm.runInContext('sleep = async () => {};', harness.context);
+
+  await harness.context.runCaptureLoop({ id: 1, windowId: 10, active: true }, REGION);
+
+  assert.equal(harness.captureCalls.length, 2);
+  assert.equal(harness.context.getState(1).partialReason, 'page_limit');
+  assert.equal(harness.context.getState(1).partialError, 'Capture truncated at the 2-page limit.');
+});
+
+test('page limit remains complete when the last allowed page is actually the bottom', async () => {
+  let scrollCalls = 0;
+  const harness = createBackgroundHarness({
+    maxCapturePages: 2,
+    syncValues: { ocrAutoscroll: true },
+    sendMessage(_tabId, message) {
+      if (message.type !== 'page:scroll-down') return { ok: true };
+      scrollCalls += 1;
+      return scrollCalls === 1
+        ? { changed: true, atBottom: false, scrollY: 100 }
+        : { changed: false, atBottom: true, scrollY: 100 };
+    }
+  });
+  vm.runInContext('sleep = async () => {};', harness.context);
+
+  await harness.context.runCaptureLoop({ id: 1, windowId: 10, active: true }, REGION);
+
+  assert.equal(harness.captureCalls.length, 2);
+  assert.equal(harness.context.getState(1).partialReason, '');
+  assert.equal(harness.finalized[0].text, 'page 1\npage 2');
 });
 
 test('inactive target pauses without capture, OCR, or scroll, then resumes the same page', async () => {
@@ -1119,6 +1194,39 @@ test('capture checkpoints are cleared before downstream automation', async () =>
   );
 });
 
+test('terminal capture failure clears its persisted operation checkpoint', async () => {
+  const operationId = 'capture:1:terminal-error';
+  const harness = createBackgroundHarness({
+    localData: { 'operation:capture:1': { operationId } }
+  });
+  const state = harness.context.getState(1);
+  state.captureOperationId = operationId;
+
+  await harness.context.handleCaptureLoopFailure(1, new Error('crop failed'), 'Capture failed:');
+
+  assert.equal(state.status, 'Error');
+  assert.equal(Object.hasOwn(harness.localData, 'operation:capture:1'), false);
+  assert.equal(state.captureOperationId, null);
+});
+
+test('auto-translation failure preserves a completed OCR result', async () => {
+  const harness = createBackgroundHarness({
+    localData: { tl2Language: 'French' },
+    syncValues: { ocrAutoTranslate: true },
+    fetch: async () => jsonResponse({ error: 'translation provider unavailable' }, 503)
+  });
+  const state = harness.context.getState(1);
+  state.operationBackend = { host: '127.0.0.1', port: 9876 };
+
+  await harness.originalFinalizeCapture(1, 'completed OCR text', 1);
+
+  assert.equal(state.status, 'Done');
+  assert.equal(state.partialReason, '');
+  assert.equal(harness.localData['lastResult:1'], 'completed OCR text');
+  assert.equal(harness.localData['lastStatus:1'], 'Done');
+  assert.equal(harness.localData['tl2Status:1'], 'translation provider unavailable');
+});
+
 test('manual translation substitutes every language placeholder in a custom prompt', async () => {
   let requestBody;
   const harness = createBackgroundHarness({
@@ -1597,8 +1705,11 @@ test('OCR-source auto-format runs once even when auto-translate also completes',
 
 test('fake backend workflow covers selection, capture, dedup, automation, Stop, and recovery', async () => {
   const routes = [];
+  const origins = [];
   const harness = createBackgroundHarness({
     useRealPipeline: true,
+    imageBitmapSize: { width: 200, height: 300 },
+    captureVisibleTab: async () => 'data:image/png;base64,c2NyZWVuc2hvdA==',
     localData: {
       tl2Language: 'French',
       formatPrompt: 'Format clearly.'
@@ -1610,8 +1721,10 @@ test('fake backend workflow covers selection, capture, dedup, automation, Stop, 
       fmtSourceVal: 'translation'
     },
     fetch: async (url) => {
-      const route = new URL(String(url)).pathname;
+      const parsed = new URL(String(url));
+      const route = parsed.pathname;
       routes.push(route);
+      origins.push(parsed.origin);
       if (route === '/ocr') return jsonResponse({ text: 'raw OCR text' });
       if (route === '/dedup') return jsonResponse({ text: 'deduplicated text' });
       if (route === '/translate') return jsonResponse({ text: 'translated text' });
@@ -1626,11 +1739,19 @@ test('fake backend workflow covers selection, capture, dedup, automation, Stop, 
     status: 'Selecting',
     selectionToken: 'workflow-selection',
     operationPrompts: {},
-    operationBackend: { host: 'localhost', port: 8765 }
+    operationBackend: { host: '127.0.0.1', port: 9876 }
   });
+  const workflowRegion = {
+    x: 10,
+    y: 20,
+    width: 50,
+    height: 40,
+    viewportWidth: 100,
+    viewportHeight: 100
+  };
   let selectionResponse;
   harness.events.runtimeMessage.emit(
-    { type: 'selection:complete', region: REGION, selectionToken: 'workflow-selection' },
+    { type: 'selection:complete', region: workflowRegion, selectionToken: 'workflow-selection' },
     { tab: { id: 1, windowId: 10, active: true, url: 'https://example.test/' } },
     (response) => { selectionResponse = response; }
   );
@@ -1638,8 +1759,16 @@ test('fake backend workflow covers selection, capture, dedup, automation, Stop, 
   assert.deepEqual({ ...selectionResponse }, { ok: true });
   await waitFor(() => harness.localData['fmtResult:1'] === 'formatted text', 'automation workflow did not finish');
   assert.deepEqual(routes, ['/ocr', '/dedup', '/translate', '/format']);
+  assert.deepEqual(origins, Array(4).fill('http://127.0.0.1:9876'));
+  assert.deepEqual(harness.cropCalls, [{
+    width: 100,
+    height: 120,
+    drawImage: [20, 60, 100, 120, 0, 0, 100, 120]
+  }]);
   assert.equal(harness.localData['lastResult:1'], 'deduplicated text');
   assert.equal(harness.localData['tl2Result:1'], 'translated text');
+  assert.equal(harness.localData['tl2Status:1'], 'Complete');
+  assert.equal(harness.localData['fmtStatus:1'], 'Complete');
 
   let recoveryRequestStarted = false;
   const recoveredOperationId = 'capture:1:recovered-stop';

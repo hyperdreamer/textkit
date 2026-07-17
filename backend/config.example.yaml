@@ -25,7 +25,11 @@ requests_per_minute: 60
 # Valid range: 0-100; 0 disables the concurrent request limit.
 max_concurrent_requests: 4
 
-# Enable debug logging to stderr for OCR / dedup / translate requests.
+# Enable debug logging to stderr for OCR / dedup / translate requests. This also
+# writes sensitive last_screenshot.png, last_ocr.txt, pre_dedup.txt, and
+# after_dedup.txt files to a mode-0700 textkit-debug-* directory under the OS
+# temporary directory. Files are overwritten by later requests but the private
+# directory persists after backend exit until manually removed or temp cleanup.
 # debug: false
 
 # AI API settings — uses an OpenAI-compatible chat completions API.
@@ -52,7 +56,7 @@ ai:
   # ocr:                    # OCR-specific overrides
   #   model: "gpt-4.1"      # vision-capable model for OCR
   #
-  # text:                   # text-processing overrides (dedup + translate)
+  # text:                   # text-processing overrides (dedup + translate + format)
   #   api_base: "https://other-proxy.example.com"
   #   api_key: "$OTHER_PROXY_API_KEY"
   #   model: "claude-sonnet-4-20250514"

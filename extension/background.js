@@ -510,6 +510,13 @@ async function handleCaptureLoopFailure(tabId, error, logPrefix) {
     error: error.message,
     progress: 'Failed.'
   });
+  const operationId = state.captureOperationId;
+  if (operationId) {
+    await clearOperation('capture', tabId, operationId).catch((clearError) => {
+      console.error('Failed to clear terminal capture checkpoint:', clearError);
+    });
+    if (state.captureOperationId === operationId) state.captureOperationId = null;
+  }
 }
 
 async function handleStop() {
@@ -733,7 +740,10 @@ async function handleTranslateStart(msg) {
         const translated = text;
         const committed = await commitCurrentOperation(
           'translate', translateOperationIds, tabId, operationId, async () => {
-            await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
+            await chrome.storage.local.set({
+              [`tl2Result:${tabId}`]: translated,
+              [`tl2Status:${tabId}`]: 'Complete'
+            });
             await clearOperation('translate', tabId, operationId);
             chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
             if (translated) {
@@ -761,7 +771,10 @@ async function handleTranslateStart(msg) {
       requirePersistableText(translated, 'Translation result');
       const committed = await commitCurrentOperation(
         'translate', translateOperationIds, tabId, operationId, async () => {
-          await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
+          await chrome.storage.local.set({
+            [`tl2Result:${tabId}`]: translated,
+            [`tl2Status:${tabId}`]: 'Complete'
+          });
           await clearOperation('translate', tabId, operationId);
           chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
           if (translated) {
@@ -922,7 +935,10 @@ async function handleFormatStart(msg) {
       requirePersistableText(formatted, 'Format result');
       const committed = await commitCurrentOperation(
         'format', formatOperationIds, tabId, operationId, async () => {
-          await chrome.storage.local.set({ [`fmtResult:${tabId}`]: formatted });
+          await chrome.storage.local.set({
+            [`fmtResult:${tabId}`]: formatted,
+            [`fmtStatus:${tabId}`]: 'Complete'
+          });
           await clearOperation('format', tabId, operationId);
           chrome.runtime.sendMessage({ type: 'format:update', tabId, text: formatted }).catch(() => {});
           if (formatted) {
@@ -1248,11 +1264,6 @@ async function executeCaptureLoop({
 
       if (!ocrAutoscroll) break;
 
-      if (fragmentCount >= MAX_CAPTURE_PAGES) {
-        updateState(tabId, { progress: `Reached page limit (${MAX_CAPTURE_PAGES}). Stopping.` });
-        break;
-      }
-
       if (atBottom) {
         await sleep(500);
         const recheckResult = await sendMessageToActiveTarget(tabId, state, controller.signal, {
@@ -1264,6 +1275,12 @@ async function executeCaptureLoop({
         if (recheck?.changed) {
           atBottom = false;
           scrollY = recheck.scrollY;
+          if (fragmentCount >= MAX_CAPTURE_PAGES) {
+            state.partialReason = 'page_limit';
+            state.partialError = `Capture truncated at the ${MAX_CAPTURE_PAGES}-page limit.`;
+            updateState(tabId, { progress: state.partialError });
+            break;
+          }
           await sleep(captureIntervalMs);
           continue;
         }
@@ -1280,10 +1297,22 @@ async function executeCaptureLoop({
       if (scrollResult?.atBottom) {
         if (!scrollResult.changed && fragmentCount > 0) break;
         atBottom = true;
+        if (fragmentCount >= MAX_CAPTURE_PAGES) {
+          state.partialReason = 'page_limit';
+          state.partialError = `Capture truncated at the ${MAX_CAPTURE_PAGES}-page limit.`;
+          updateState(tabId, { progress: state.partialError });
+          break;
+        }
         await sleep(captureIntervalMs);
         continue;
       }
       scrollY = scrollResult.scrollY;
+      if (fragmentCount >= MAX_CAPTURE_PAGES) {
+        state.partialReason = 'page_limit';
+        state.partialError = `Capture truncated at the ${MAX_CAPTURE_PAGES}-page limit.`;
+        updateState(tabId, { progress: state.partialError });
+        break;
+      }
       await sleep(captureIntervalMs);
     }
 
@@ -1593,6 +1622,8 @@ async function finalizeCapture(tabId, finalText, fragmentsOrCount) {
     progress = `Partial capture ended after an error; saved ${fragmentCount} fragment${fragmentCount === 1 ? '' : 's'}.`;
   } else if (state.partialReason === 'text_limit') {
     progress = `Partial capture stopped at the ${MAX_PERSISTED_TEXT_BYTES}-byte safety limit after ${fragmentCount} fragment${fragmentCount === 1 ? '' : 's'}.`;
+  } else if (state.partialReason === 'page_limit') {
+    progress = `Partial capture truncated at the ${MAX_CAPTURE_PAGES}-page limit; more page content remains.`;
   }
   const finalStatus = isPartial ? 'Partial' : 'Done';
 
@@ -1628,7 +1659,15 @@ async function finalizeCapture(tabId, finalText, fragmentsOrCount) {
   // Run post-capture automation only for a normally completed capture.
   if (!isPartial) {
     await autoFormatIfEnabled(tabId, finalText, undefined, undefined, 'ocr');
-    await autoTranslateIfEnabled(tabId, finalText);
+    try {
+      await autoTranslateIfEnabled(tabId, finalText);
+    } catch (error) {
+      const message = error?.message || 'Auto-translation failed.';
+      await chrome.storage.local.set({ [`tl2Status:${tabId}`]: message }).catch((storageError) => {
+        console.error('Failed to persist auto-translation error:', storageError);
+      });
+      console.error('Auto-translation failed after capture completed:', error);
+    }
   }
 
   return finalText;
@@ -1642,7 +1681,15 @@ async function autoTranslateIfEnabled(tabId, originalText) {
 
   const tl2Lang = await chrome.storage.local.get('tl2Language');
   const language = tl2Lang.tl2Language || 'original';
-  const result = await handleTranslateStart({ tabId, text: originalText, language });
+  const state = getState(tabId);
+  const backend = state.operationBackend || await snapshotBackendSettings();
+  const result = await handleTranslateStart({
+    tabId,
+    text: originalText,
+    language,
+    host: backend.host,
+    port: backend.port
+  });
   if (!result?.ok) throw new Error(result?.error || 'Auto-translation failed.');
 }
 

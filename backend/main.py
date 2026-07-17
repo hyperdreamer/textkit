@@ -48,6 +48,7 @@ DEFAULT_MAX_IMAGE_PIXELS = 40_000_000
 DEFAULT_MAX_TEXT_CHARS = 200_000
 DEFAULT_MAX_PROMPT_CHARS = 20_000
 DEFAULT_MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
+MULTIPART_HEADER_OVERHEAD_BYTES = 8 * 1024
 MAX_LANGUAGE_CHARS = 32
 MIN_DETECT_CHARS = 20
 SUPPORTED_LANGUAGES = frozenset(
@@ -139,6 +140,13 @@ def _validate_api_base_value(value: str) -> str:
         raise ValueError("api_base must be a valid absolute HTTP(S) URL") from exc
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("api_base must be a valid absolute HTTP(S) URL")
+    if (
+        "?" in normalized
+        or "#" in normalized
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError("api_base must not include query, fragment, or user-info components")
     loopback = parsed.hostname.lower().strip("[]") in {"localhost", "127.0.0.1", "::1"}
     if parsed.scheme != "https" and not loopback:
         raise ValueError("api_base must use HTTPS unless it targets a loopback provider")
@@ -711,7 +719,13 @@ async def lifespan(_app: FastAPI):
 
 def _request_body_limit(config: AppConfig, path: str) -> int:
     if path == "/ocr":
-        return config.max_upload_bytes + 64 * 1024 if config.max_upload_bytes else 0
+        if not config.max_upload_bytes or not config.max_prompt_chars:
+            return 0
+        return (
+            config.max_upload_bytes
+            + config.max_prompt_chars * 4
+            + MULTIPART_HEADER_OVERHEAD_BYTES
+        )
     return config.max_request_body_bytes
 
 
