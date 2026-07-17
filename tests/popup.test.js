@@ -627,3 +627,37 @@ test('manual file bridge saves request configured host permission', async () => 
   assert.match(harness.elements.get('tl2-status-text').textContent, /permission was not granted/);
   assert.match(harness.elements.get('fmt-status-text').textContent, /permission was not granted/);
 });
+
+test('language switch does not save server fallback as a custom prompt', async () => {
+  const harness = createPopupHarness({
+    localData: {},
+    runtimeSendMessage: async (message) => message.type === 'popup:get-state'
+      ? { ok: true, tabId: 1, state: { status: 'Idle', active: false, progress: 'Ready' } }
+      : { ok: true },
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ template: 'Server fallback for {language}', source: 'file', version: 'v1' })
+    })
+  });
+  await harness.context.init();
+
+  // Simulate: user was on 'original', server fallback is shown, never customized.
+  const promptEl = harness.elements.get('translate-prompt');
+  promptEl.value = 'Server fallback for {language}';
+  promptEl.classList.add('server-default');
+  vm.runInContext('promptEditorLanguage = "original"', harness.context);
+  vm.runInContext('tlLanguage.value = "English"', harness.context);
+
+  // Switch language to English
+  await harness.context.onTlLanguageChange();
+
+  // The server fallback should NOT have been saved under translatePrompt:original
+  assert.equal(Object.hasOwn(harness.localData, 'translatePrompt:original'), false);
+
+  // The async refreshFallback re-applies server-default after fetch completes.
+  // Wait for the fallback to land (fetch mock resolves immediately, but it's async).
+  await delay();
+  assert.ok(promptEl.classList.contains('server-default'));
+  assert.ok(promptEl.value.includes('Server fallback'));
+});

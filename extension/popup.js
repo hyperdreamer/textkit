@@ -654,7 +654,10 @@ async function onTlLanguageChange() {
     ? promptEditorLanguage
     : null;
   if (langToSave) {
-    await chrome.storage.local.set({ [`translatePrompt:${langToSave}`]: translatePrompt.value });
+    const state = _getPromptRefreshState(translatePrompt);
+    if (state.hasPersistedOverride && translatePrompt.value.trim()) {
+      await chrome.storage.local.set({ [`translatePrompt:${langToSave}`]: translatePrompt.value });
+    }
   }
   await chrome.storage.local.set({ tlLanguage: tlLanguage.value });
   await loadPromptForLanguage();
