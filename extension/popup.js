@@ -12,7 +12,6 @@ const copyButton = document.getElementById('copy');
 const downloadButton = document.getElementById('download');
 const hostInput = document.getElementById('backend-host');
 const portInput = document.getElementById('backend-port');
-const backendTokenInput = document.getElementById('backend-token');
 const fileBridgeHostInput = document.getElementById('file-bridge-host');
 const fileBridgePortInput = document.getElementById('file-bridge-port');
 const settingsGear = document.getElementById('settings-gear');
@@ -35,7 +34,11 @@ const _promptRefreshState = new WeakMap();
 
 function _getPromptRefreshState(el) {
   if (!_promptRefreshState.has(el)) {
-    _promptRefreshState.set(el, { generation: 0, dirty: false });
+    _promptRefreshState.set(el, {
+      generation: 0,
+      dirty: false,
+      hasPersistedOverride: false
+    });
   }
   return _promptRefreshState.get(el);
 }
@@ -50,7 +53,13 @@ function _beginPromptRefresh(el, { resetDirty = false } = {}) {
 function _markPromptDirty(el) {
   const state = _getPromptRefreshState(el);
   state.dirty = true;
+  state.hasPersistedOverride = el.value.trim().length > 0;
   state.generation += 1;
+}
+
+function _setPersistedPromptOverride(el, value) {
+  const state = _getPromptRefreshState(el);
+  state.hasPersistedOverride = typeof value === 'string' && value.trim().length > 0;
 }
 
 function _applyIfDifferent(el, newValue, generation) {
@@ -120,8 +129,7 @@ const FILE_BRIDGE_DEFAULT_PORT = 8766;
 
 function fallbackElements(config) {
   return {
-    reset: document.getElementById(`${config.name}-reset-default`),
-    preview: document.getElementById(`${config.name}-fallback-preview`)
+    reset: document.getElementById(`${config.name}-reset-default`)
   };
 }
 
@@ -135,14 +143,19 @@ function fallbackStorageKey(identity) {
 }
 
 function updatePromptUi(config) {
+  const state = _getPromptRefreshState(config.element);
   let backend;
   try { backend = normalizeBackendSettings(hostInput.value, portInput.value); } catch { backend = null; }
   const fallback = backend ? _fallbackData.get(fallbackIdentity(config, backend)) : null;
   const elements = fallbackElements(config);
-  const hasCustom = config.element.value.trim().length > 0;
+  const hasCustom = state.hasPersistedOverride && config.element.value.trim().length > 0;
   elements.reset.disabled = !hasCustom;
-  elements.preview.textContent = fallback?.template || 'Server default unavailable.';
-  config.element.classList.remove('server-default');
+  if (!hasCustom && !state.dirty && fallback) {
+    if (config.element.value !== fallback.template) config.element.value = fallback.template;
+    config.element.classList.add('server-default');
+  } else {
+    config.element.classList.remove('server-default');
+  }
   if (config.name === 'translate') updateTranslateHintFromValue();
 }
 
@@ -166,7 +179,7 @@ function handlePromptInput(config) {
 
 async function refreshFallback(config, { force = false } = {}) {
   const state = _getPromptRefreshState(config.element);
-  if (state.dirty && config.element.value.trim()) {
+  if (state.hasPersistedOverride && config.element.value.trim()) {
     updatePromptUi(config);
     return;
   }
@@ -188,8 +201,6 @@ async function refreshFallback(config, { force = false } = {}) {
     ? `?language=${encodeURIComponent(tlLanguage.value)}`
     : '';
   const headers = cached?.version ? { 'If-None-Match': `"${cached.version}"` } : {};
-  const backendToken = backendTokenInput.value.trim();
-  if (backendToken) headers['X-TextKit-Token'] = backendToken;
   const request = (async () => {
     const ctrl = new AbortController();
     const timeoutId = setTimeout(() => ctrl.abort(), 3000);
@@ -224,6 +235,7 @@ function refreshAllFallbacks(options = {}) {
 
 async function resetPromptToFallback(config) {
   _beginPromptRefresh(config.element, { resetDirty: true });
+  _setPersistedPromptOverride(config.element, '');
   await chrome.storage.local.remove(config.storageKey());
   config.element.value = '';
   updatePromptUi(config);
@@ -274,7 +286,6 @@ resultEl.addEventListener('blur', flushOcrTextSave);
 resultEl.addEventListener('change', flushOcrTextSave);
 hostInput.addEventListener('change', saveSettings);
 portInput.addEventListener('change', saveSettings);
-backendTokenInput.addEventListener('change', saveSettings);
 fileBridgeHostInput.addEventListener('change', saveFileBridgeSettings);
 fileBridgePortInput.addEventListener('change', saveFileBridgeSettings);
 settingsGear.addEventListener('click', () => {
@@ -429,8 +440,6 @@ async function init() {
   }
   fileBridgeHostInput.value = items.fileBridgeHost || '';
   fileBridgePortInput.value = items.fileBridgePort || FILE_BRIDGE_DEFAULT_PORT;
-  const secrets = await chrome.storage.local.get({ backendToken: '' });
-  backendTokenInput.value = secrets.backendToken || '';
   tlLanguage.value = tlLanguage.value || 'original';
   tl2Language.value = tl2Language.value || 'original';
   autoscrollCheckbox.checked = items.ocrAutoscroll;
@@ -468,6 +477,10 @@ async function init() {
     chrome.storage.local.get(tlLangKey),
     chrome.storage.local.get('formatPrompt')
   ]);
+  _setPersistedPromptOverride(ocrPromptEl, ocrStored.ocrPrompt);
+  _setPersistedPromptOverride(dedupPromptEl, dedupStored.dedupPrompt);
+  _setPersistedPromptOverride(translatePrompt, tlStored[tlLangKey]);
+  _setPersistedPromptOverride(formatPrompt, fmtStored.formatPrompt);
   _applyIfDifferent(ocrPromptEl, ocrStored.ocrPrompt || '', ocrLocalGeneration);
   _applyIfDifferent(dedupPromptEl, dedupStored.dedupPrompt || '', dedupLocalGeneration);
   _applyIfDifferent(translatePrompt, tlStored[tlLangKey] || '', tlLocalGeneration);
@@ -602,6 +615,7 @@ async function loadPromptForLanguage() {
   // If another loadPromptForLanguage call started while we were awaiting,
   // abort — the newer call has the authority.
   if (seq !== _loadPromptSeq) return;
+  _setPersistedPromptOverride(translatePrompt, stored[key]);
   if (!_applyIfDifferent(translatePrompt, stored[key] || '', localGeneration)) return;
   promptEditorLanguage = lang;
   updateTranslateHintFromValue();
@@ -661,15 +675,12 @@ async function saveSettings() {
     progressEl.textContent = 'Permission to contact the backend was not granted.';
     return;
   }
-  await Promise.all([
-    chrome.storage.sync.set({
-      backendHost: backend.host,
-      backendPort: backend.port,
-      ocrAutoscroll: autoscrollCheckbox.checked,
-      captureIntervalMs
-    }),
-    chrome.storage.local.set({ backendToken: backendTokenInput.value.trim() })
-  ]);
+  await chrome.storage.sync.set({
+    backendHost: backend.host,
+    backendPort: backend.port,
+    ocrAutoscroll: autoscrollCheckbox.checked,
+    captureIntervalMs
+  });
   hostInput.value = backend.host;
   portInput.value = backend.port;
   await refreshAllFallbacks({ force: true });
@@ -716,6 +727,18 @@ async function ensureHostPermission(host) {
   const origins = [`http://${host}/*`];
   if (await chrome.permissions.contains({ origins })) return true;
   return chrome.permissions.request({ origins });
+}
+
+async function ensureFileBridgePermission() {
+  const settings = await chrome.storage.sync.get({
+    fileBridgeHost: '',
+    fileBridgePort: FILE_BRIDGE_DEFAULT_PORT
+  });
+  const fileBridge = normalizeBackendSettings(
+    settings.fileBridgeHost || 'localhost',
+    settings.fileBridgePort || FILE_BRIDGE_DEFAULT_PORT
+  );
+  return ensureHostPermission(fileBridge.host);
 }
 
 // ── OCR actions ───────────────────────────────────────────────
@@ -787,8 +810,10 @@ async function startCapture() {
   progressEl.textContent = 'Starting region selection.';
   try {
     const prompts = {};
-    if (ocrPromptEl.value.trim()) prompts.ocr = ocrPromptEl.value;
-    if (dedupPromptEl.value.trim()) prompts.dedup = dedupPromptEl.value;
+    const ocrState = _getPromptRefreshState(ocrPromptEl);
+    if (ocrState.hasPersistedOverride && ocrPromptEl.value.trim()) prompts.ocr = ocrPromptEl.value;
+    const dedupState = _getPromptRefreshState(dedupPromptEl);
+    if (dedupState.hasPersistedOverride && dedupPromptEl.value.trim()) prompts.dedup = dedupPromptEl.value;
     const response = await chrome.runtime.sendMessage({
       type: 'popup:start',
       ...(Object.keys(prompts).length ? { prompts } : {})
@@ -902,11 +927,13 @@ async function doTranslation() {
   const text = resultEl.value.trim();
   if (!text || !currentTabId) return;
   const language = tl2Language.value;
-  let prompt = translatePrompt.value;
+  let prompt = _getPromptRefreshState(translatePrompt).hasPersistedOverride
+    ? translatePrompt.value
+    : '';
   if (promptEditorLanguage !== language) {
     const key = `translatePrompt:${language}`;
     const stored = await chrome.storage.local.get(key);
-    prompt = stored[key] || '';
+    prompt = typeof stored[key] === 'string' && stored[key].trim() ? stored[key] : '';
   }
   let backend;
   try {
@@ -1006,7 +1033,9 @@ async function doFormat() {
 
   const text = (fmtSource.value === 'ocr' ? resultEl : tl2Result).value.trim();
   if (!text || !currentTabId) return;
-  const prompt = formatPrompt.value;
+  const prompt = _getPromptRefreshState(formatPrompt).hasPersistedOverride
+    ? formatPrompt.value
+    : '';
   let backend;
   try {
     backend = normalizeBackendSettings(hostInput.value, portInput.value);
@@ -1081,6 +1110,9 @@ async function saveFormatResult() {
   }
 
   try {
+    if (!await ensureFileBridgePermission()) {
+      throw new Error('File bridge permission was not granted.');
+    }
     const response = await chrome.runtime.sendMessage({
       type: 'save:translation',
       text,
@@ -1145,6 +1177,9 @@ async function saveTranslation() {
   }
 
   try {
+    if (!await ensureFileBridgePermission()) {
+      throw new Error('File bridge permission was not granted.');
+    }
     const response = await chrome.runtime.sendMessage({
       type: 'save:translation',
       text,

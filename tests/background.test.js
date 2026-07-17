@@ -59,6 +59,8 @@ function createBackgroundHarness(options = {}) {
   const finalized = [];
   const runtimeMessages = [];
   const notifications = [];
+  const permissionContainsCalls = [];
+  const permissionRequestCalls = [];
   let offscreenCloseCalls = 0;
   const localData = { ...(options.localData || {}) };
   const syncValues = {
@@ -152,6 +154,16 @@ function createBackgroundHarness(options = {}) {
       }
     },
     commands: { onCommand: events.command },
+    permissions: {
+      async contains(details) {
+        permissionContainsCalls.push(details);
+        return options.permissionContains ? options.permissionContains(details) : true;
+      },
+      async request(details) {
+        permissionRequestCalls.push(details);
+        return options.permissionRequest ? options.permissionRequest(details) : true;
+      }
+    },
     runtime: {
       onMessage: events.runtimeMessage,
       sendMessage(message) {
@@ -258,6 +270,8 @@ function createBackgroundHarness(options = {}) {
     ocrCalls,
     originalFinalizeCapture,
     originalFinalizePostCapture,
+    permissionContainsCalls,
+    permissionRequestCalls,
     get offscreenCloseCalls() { return offscreenCloseCalls; },
     removeTab,
     runtimeMessages,
@@ -682,6 +696,19 @@ test('blank file bridge host uses localhost and the configured file bridge port'
   assert.equal(await harness.context.getFileBridgeEndpoint('/save'), 'http://localhost:9777/save');
 });
 
+test('backend headers forward operation IDs without adding authentication', async () => {
+  const harness = createBackgroundHarness();
+
+  assert.deepEqual(
+    { ...await harness.context.getBackendHeaders('application/json', 'translate:1:stable') },
+    {
+      'Content-Type': 'application/json',
+      'X-TextKit-Operation-Id': 'translate:1:stable'
+    }
+  );
+  assert.deepEqual({ ...await harness.context.getBackendHeaders() }, {});
+});
+
 test('OCR retry snapshot is persisted before the infinite retry loop', async () => {
   const retryDelay = deferred();
   const harness = createBackgroundHarness({ syncValues: { ocrAutoscroll: true } });
@@ -838,6 +865,27 @@ test('keyboard capture command does not mutate an active capture', async () => {
   );
 });
 
+test('keyboard capture requests backend permission before starting selection', async () => {
+  const harness = createBackgroundHarness({
+    permissionContains: async () => false,
+    permissionRequest: async () => false
+  });
+
+  harness.events.command.emit('start-region-capture');
+  await waitFor(() => harness.context.getState(1).status === 'Error', 'permission denial was not reported');
+
+  assert.equal(harness.permissionContainsCalls.length, 1);
+  assert.equal(harness.permissionContainsCalls[0].origins.length, 1);
+  assert.equal(harness.permissionContainsCalls[0].origins[0], 'http://localhost/*');
+  assert.equal(harness.permissionRequestCalls.length, 1);
+  assert.equal(harness.permissionRequestCalls[0].origins.length, 1);
+  assert.equal(harness.permissionRequestCalls[0].origins[0], 'http://localhost/*');
+  assert.equal(
+    harness.messageCalls.filter(({ message }) => message.type === 'selection:start').length,
+    0
+  );
+});
+
 test('Stop cancels an in-progress selection', async () => {
   const harness = createBackgroundHarness();
   harness.context.updateState(1, { active: true, status: 'Selecting' });
@@ -928,6 +976,59 @@ test('superseded translation cannot overwrite a newer result', async () => {
   assert.equal(second.ok, true);
   assert.equal(firstResult.ok, false);
   assert.equal(harness.localData['tl2Result:1'], 'new result');
+});
+
+test('starting a capture aborts translation and format work from the previous capture', async () => {
+  const translationResponse = deferred();
+  const formatResponse = deferred();
+  const signals = [];
+  const harness = createBackgroundHarness({
+    fetch: async (url, options) => {
+      signals.push({ url: String(url), signal: options.signal });
+      return String(url).includes('/translate') ? translationResponse.promise : formatResponse.promise;
+    }
+  });
+
+  const translation = harness.context.handleTranslateStart({ tabId: 1, text: 'old', language: 'French' });
+  const format = harness.context.handleFormatStart({ tabId: 1, text: 'old' });
+  await waitFor(() => signals.length === 2, 'downstream requests did not start');
+
+  await harness.context.handlePopupStart();
+  assert.ok(signals.every(({ signal }) => signal.aborted));
+
+  translationResponse.resolve({ ok: true, text: async () => JSON.stringify({ text: 'stale translation' }) });
+  formatResponse.resolve({ ok: true, text: async () => JSON.stringify({ text: 'stale format' }) });
+  assert.equal((await translation).ok, false);
+  assert.equal((await format).ok, false);
+  assert.equal(Object.hasOwn(harness.localData, 'tl2Result:1'), false);
+  assert.equal(Object.hasOwn(harness.localData, 'fmtResult:1'), false);
+});
+
+test('checkpoint clear and replacement are atomic per tab', async () => {
+  const harness = createBackgroundHarness();
+  const key = 'operation:translate:1';
+  harness.localData[key] = { operationId: 'old' };
+  const readOldCheckpoint = deferred();
+  const releaseOldClear = deferred();
+  const originalGet = harness.context.chrome.storage.local.get.bind(harness.context.chrome.storage.local);
+  let delayed = false;
+  harness.context.chrome.storage.local.get = async (keys, callback) => {
+    if (callback || keys !== key || delayed) return originalGet(keys, callback);
+    delayed = true;
+    const snapshot = await originalGet(keys);
+    readOldCheckpoint.resolve();
+    await releaseOldClear.promise;
+    return snapshot;
+  };
+
+  const clearing = harness.context.clearOperation('translate', 1, 'old');
+  await readOldCheckpoint.promise;
+  const replacing = harness.context.persistOperation('translate', 1, 'new', { text: 'new' });
+  releaseOldClear.resolve();
+  await Promise.all([clearing, replacing]);
+
+  assert.equal(harness.localData[key].operationId, 'new');
+  assert.equal(harness.localData[key].input.text, 'new');
 });
 
 test('persisted translation resumes after a service worker restart', async () => {

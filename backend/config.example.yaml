@@ -25,16 +25,6 @@ requests_per_minute: 60
 # Valid range: 0-100; 0 disables the concurrent request limit.
 max_concurrent_requests: 4
 
-# Chrome-extension origins must either appear in this exact allowlist or send
-# X-TextKit-Token with this shared secret. Environment references are resolved
-# lazily, so the server can still start before the secret is provisioned.
-extension_token: "$TEXTKIT_EXTENSION_TOKEN"
-# allowed_extension_ids: ["abcdefghijklmnopqrstuvwxyzabcdef"]
-
-# Required for PUT /prompts/{name}; send as X-TextKit-Admin-Token or Bearer.
-# Prompt administration remains disabled if this secret is unavailable.
-admin_token: "$TEXTKIT_ADMIN_TOKEN"
-
 # Enable debug logging to stderr for OCR / dedup / translate requests.
 # debug: false
 

@@ -16,7 +16,7 @@ from backend import main
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setattr(main, "load_config", lambda: _app_config())
-    return TestClient(main.app, headers={"X-TextKit-Admin-Token": "test-admin"})
+    return TestClient(main.app)
 
 
 @pytest.fixture(autouse=True)
@@ -38,8 +38,6 @@ def _app_config(*, host: str = "localhost", debug: bool = False) -> main.AppConf
     return main.AppConfig(
         host=host,
         debug=debug,
-        extension_token="test-extension",
-        admin_token="test-admin",
         ai=_ai_config(),
     )
 
@@ -68,68 +66,6 @@ def test_image_data_url_rejects_truncated_png() -> None:
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "Uploaded file is not a valid image"
-
-
-@pytest.mark.parametrize("path", ["/ocr", "/dedup", "/translate", "/format"])
-def test_ai_endpoints_reject_untrusted_web_origins(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch, path: str
-) -> None:
-    monkeypatch.setattr(main, "load_config", lambda: _app_config())
-
-    response = client.post(path, headers={"Origin": "https://malicious.example"})
-
-    assert response.status_code == 403
-    assert response.json()["error"] == "Extension origin is not authorized"
-
-
-@pytest.mark.parametrize(
-    "origin",
-    [None, "http://localhost:3000"],
-)
-def test_ai_endpoints_allow_curl_extension_and_configured_host_origins(
-    client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
-    origin: str | None,
-) -> None:
-    monkeypatch.setattr(main, "load_config", lambda: _app_config(host="localhost"))
-
-    async def fake_format(
-        _config: main.AIConfig, _text: str, _prompt: str | None = None
-    ) -> main.OCRResponse:
-        return main.OCRResponse(text="formatted", model="test-model", tokens_used=1)
-
-    monkeypatch.setattr(main, "format_text", fake_format)
-    headers = {"Origin": origin} if origin else {}
-
-    response = client.post(
-        "/format", json={"text": "source", "prompt": "format it"}, headers=headers
-    )
-
-    assert response.status_code == 200
-    assert response.json()["text"] == "formatted"
-
-
-def test_extension_origin_requires_shared_secret(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(main, "load_config", lambda: _app_config())
-    origin = "chrome-extension://abcdefghijklmnopqrstuvwxyzabcdef"
-
-    rejected = client.post("/format", json={"text": "source"}, headers={"Origin": origin})
-    assert rejected.status_code == 403
-
-    async def fake_format(
-        _config: main.AIConfig, _text: str, _prompt: str | None = None
-    ) -> main.OCRResponse:
-        return main.OCRResponse(text="formatted", model="test-model", tokens_used=1)
-
-    monkeypatch.setattr(main, "format_text", fake_format)
-    accepted = client.post(
-        "/format",
-        json={"text": "source"},
-        headers={"Origin": origin, "X-TextKit-Token": "test-extension"},
-    )
-    assert accepted.status_code == 200
 
 
 def test_debug_artifacts_are_written_only_when_debug_is_enabled(
@@ -186,22 +122,6 @@ def test_debug_artifacts_are_written_only_when_debug_is_enabled(
     ]
 
 
-def test_put_base_prompt_invalidates_language_fallback_cache(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(main, "PROMPTS_DIR", tmp_path)
-    main._prompt_cache.clear()
-    (tmp_path / "translate.txt").write_text("old {language}", encoding="utf-8")
-    assert main._load_prompt("translate", "French") == "old {language}"
-
-    response = client.put(
-        "/prompts/translate", json={"template": "new {language}"}
-    )
-
-    assert response.status_code == 200
-    assert main._load_prompt("translate", "French") == "new {language}"
-
-
 def test_prompt_fallback_reports_file_source_and_version(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -241,6 +161,18 @@ def test_prompt_fallback_reports_hardcoded_source_and_supports_etag(
     assert cached.content == b""
 
 
+def test_translate_prompt_get_falls_back_to_base_language_file(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(main, "PROMPTS_DIR", tmp_path)
+    (tmp_path / "translate.txt").write_text("Base translation {language}", encoding="utf-8")
+
+    response = client.get("/prompts/translate?language=French")
+
+    assert response.status_code == 200
+    assert response.json()["template"] == "Base translation {language}"
+
+
 def test_list_prompts_returns_only_canonical_keys(
     client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -270,37 +202,16 @@ def test_fresh_install_has_nonempty_format_prompt(
     assert main._render_prompt("format").strip()
 
 
-def test_prompt_put_returns_400_for_malformed_json(client: TestClient) -> None:
-    response = client.put(
-        "/prompts/ocr",
-        content="{",
-        headers={"Content-Type": "application/json"},
-    )
-
-    assert response.status_code == 400
-    assert response.json()["error"] == "Malformed JSON request body"
-
-
-def test_prompt_put_returns_422_for_invalid_model(client: TestClient) -> None:
-    response = client.put("/prompts/ocr", json={"wrong": "field"})
-
-    assert response.status_code == 422
-    assert "template" in response.json()["error"]
-
-
-@pytest.mark.parametrize("method", ["get", "put"])
 @pytest.mark.parametrize("name", ["ocr", "dedup", "format"])
 def test_language_parameter_is_rejected_for_non_translation_prompts(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    method: str,
     name: str,
 ) -> None:
     monkeypatch.setattr(main, "PROMPTS_DIR", tmp_path)
-    kwargs = {"json": {"template": "custom prompt"}} if method == "put" else {}
 
-    response = getattr(client, method)(f"/prompts/{name}?language=French", **kwargs)
+    response = client.get(f"/prompts/{name}?language=French")
 
     assert response.status_code == 400
     assert response.json()["error"] == (
@@ -384,35 +295,6 @@ def test_prompt_render_preserves_unrelated_braces(
     assert main._render_prompt("translate", language="French") == (
         'Translate French; preserve JSON like {"key": true}.'
     )
-
-
-def test_prompt_put_requires_admin_authentication(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(main, "load_config", lambda: _app_config())
-    monkeypatch.setattr(main, "PROMPTS_DIR", tmp_path)
-    unauthenticated = TestClient(main.app)
-
-    response = unauthenticated.put("/prompts/ocr", json={"template": "safe"})
-
-    assert response.status_code == 401
-    assert not (tmp_path / "ocr.txt").exists()
-
-
-def test_prompt_put_is_atomic_private_and_versioned(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setattr(main, "load_config", lambda: _app_config())
-    monkeypatch.setattr(main, "PROMPTS_DIR", tmp_path)
-
-    response = client.put("/prompts/ocr", json={"template": "new template"})
-
-    assert response.status_code == 200
-    prompt_path = tmp_path / "ocr.txt"
-    assert prompt_path.read_text(encoding="utf-8") == "new template"
-    assert os.stat(prompt_path).st_mode & 0o777 == 0o600
-    assert response.json()["version"] == hashlib.sha256(b"new template").hexdigest()
-    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_request_and_model_fields_are_bounded(

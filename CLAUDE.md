@@ -20,7 +20,8 @@
 ## Code Standards
 - Vanilla JS (no framework), ES2020+
 - chrome.storage.sync for settings; chrome.storage.local for per-tab state and plugin prompt overrides
-- Prompt precedence is extension request prompt > backend prompt file > hardcoded failsafe. The extension never writes canonical prompt files.
+- Prompt precedence is extension request prompt > backend prompt file > hardcoded failsafe. Extension never writes canonical prompt files; server fallback previews stay separate from custom values.
 - Long-running operations are owned by the service worker rather than the popup; OCR/dedup retry state is persisted for worker restart recovery
-- Capture is bound to the starting tab URL; navigation stops the operation with a partial result
-- Backend: FastAPI, Python 3.10+, type hints
+- Capture is bound to the starting tab URL; navigation stops the operation with a partial result. Same-URL reload is detected via document identity.
+- Backend: FastAPI, Python 3.10+, type hints. Binds 127.0.0.1 by default, trusts localhost (no auth tokens).
+- Config limits (max_upload_bytes, requests_per_minute, etc.) accept 0 to disable. /healthz returns {"status":"ok"}.

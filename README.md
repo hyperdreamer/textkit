@@ -39,9 +39,7 @@ Edit `config.yaml` for your provider, model, and API key.
 
 ```sh
 export OCR_API_KEY="your-api-key"
-export TEXTKIT_EXTENSION_TOKEN="a-long-random-shared-secret"
-export TEXTKIT_ADMIN_TOKEN="a-different-admin-secret"
-pip install --require-hashes -r requirements.lock
+pip install -r requirements.txt
 python main.py
 ```
 
@@ -53,7 +51,7 @@ By default, the server binds to `127.0.0.1:8765`. Keep the loopback bind unless 
 2. Enable Developer mode.
 3. Click Load unpacked.
 4. Select the `extension/` directory.
-5. Open the extension popup, confirm the backend host and port, paste the same extension token configured by `TEXTKIT_EXTENSION_TOKEN`, and grant the requested optional localhost access.
+5. Open the extension popup and confirm the backend host and port, usually `localhost` and `8765`.
 
 ## Backend API
 
@@ -185,13 +183,9 @@ curl "http://localhost:8765/prompts/translate/fallback?language=French"
 
 `source` is `file` for a language-specific or base prompt file and `hardcoded` for `_DEFAULT_PROMPTS`.
 
-### `GET /prompts/{name}` · `PUT /prompts/{name}`
+### `GET /prompts/{name}`
 
-Read or update a canonical server prompt template by name (`ocr`, `dedup`, `translate`, or `format`). These endpoints remain available for server administrators and external administration tools; the extension does not call `PUT`.
-
-The `translate` prompt supports per-language variants via the `?language=` query parameter (e.g. `?language=French` writes `translate.French.txt`). Supplying `?language=` for any other prompt returns HTTP 400.
-
-Both GET and successful PUT return `{"name":"translate","template":"...","has_language_param":true}` and add `"language":"French"` when the query parameter is present.
+Returns the stored or hardcoded prompt template for a given prompt name (`ocr`, `dedup`, `translate`, or `format`). The `translate` prompt supports per-language variants via the `?language=` query parameter (e.g. `?language=French`).
 
 ```sh
 # Read
@@ -199,15 +193,9 @@ curl "http://localhost:8765/prompts/translate"
 
 # Read per-language
 curl "http://localhost:8765/prompts/translate?language=French"
-
-# Administrative write
-curl -X PUT "http://localhost:8765/prompts/ocr" \
-  -H "Content-Type: application/json" \
-  -H "X-TextKit-Admin-Token: $TEXTKIT_ADMIN_TOKEN" \
-  -d '{"template": "Transcribe all visible text in Japanese"}'
 ```
 
-Administrative PUTs require the configured admin token, are atomically persisted to `backend/prompts/*.txt`, and survive backend restarts. Extension-local prompt overrides remain in Chrome storage and are sent only with individual AI requests.
+Prompt templates are edited directly on disk in `backend/prompts/*.txt`. There is no write API — open the file in a text editor, save it, and the backend picks up changes on the next request.
 
 ### Configuration
 
@@ -223,8 +211,15 @@ Example:
 ```yaml
 host: "127.0.0.1"
 port: 8765
-extension_token: "$TEXTKIT_EXTENSION_TOKEN"
-admin_token: "$TEXTKIT_ADMIN_TOKEN"
+
+# Request limits — set to 0 to disable.
+max_upload_bytes: 15728640
+max_image_pixels: 40000000
+max_text_chars: 200000
+max_prompt_chars: 20000
+max_request_body_bytes: 2097152
+requests_per_minute: 60
+max_concurrent_requests: 4
 
 ai:
   api_base: "https://api.openai.com"
@@ -262,7 +257,7 @@ python main.py
 
 `main.py` reads `config.yaml` and starts Uvicorn with the configured `host` and `port`.
 
-`GET /healthz` returns `{"status":"ok"}` for local health checks. Logs are emitted as structured JSON. Production installs should use the hash-locked `requirements.lock`; `requirements.txt` records the pinned direct dependencies used to generate it.
+`GET /healthz` returns `{"status":"ok"}` for local health checks. Logs are emitted as structured JSON.
 
 ## Extension
 
@@ -276,7 +271,7 @@ Main files:
 - `content.js`: selection overlay, saved-region editing, viewport reporting, and page scrolling.
 - `overlay.css`: region selection overlay styling.
 
-Backend and file-bridge hosts are optional permissions requested when the user confirms settings or starts an operation. The backend token is sent as `X-TextKit-Token`. The separate file bridge must require `X-TextKit-Bridge-Token`, constrain all relative paths to its configured root, and return an explicit `{"success":true,"path":"..."}` save response; paste that bridge secret into the popup's File bridge token field.
+Backend and file-bridge host/port are stored in Chrome sync storage. The file-bridge is a separate localhost service; a blank host defaults to `localhost` with the configured file-bridge port.
 
 ### Popup tabs
 
@@ -348,7 +343,6 @@ Settings persisted to Chrome sync storage:
 Settings persisted to Chrome local storage:
 
 - Last region size and position.
-- Backend and file-bridge shared tokens (kept local rather than Chrome Sync).
 - Per-tab: OCR result, translation result, format result, status messages.
 - OCR prompt and dedup prompt (extension-local user overrides).
 - Format prompt (extension-local user override).
@@ -365,7 +359,7 @@ Install backend dependencies with:
 
 ```sh
 cd backend
-pip install --require-hashes -r requirements.lock
+pip install -r requirements.txt
 ```
 
 The backend dependencies are:
@@ -402,12 +396,12 @@ export OCR_API_KEY="your-api-key"
 
 ### Extension cannot reach the backend
 
-Check the popup Host, Port, and Backend token fields. For the default backend config, use:
+Check the popup Host and Port fields. For the default backend config, use:
 
 - Host: `localhost`
 - Port: `8765`
 
-The token must match `TEXTKIT_EXTENSION_TOKEN`. Confirm that optional localhost access was granted when Chrome prompted, and that the backend is running on the configured loopback port.
+Also confirm that the backend is running and listening on the configured port.
 
 ### Region selection does not open
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -54,8 +53,6 @@ MIN_DETECT_CHARS = 20
 SUPPORTED_LANGUAGES = frozenset(
     {"original", "chinese", "english", "japanese", "korean", "french", "german", "spanish"}
 )
-ADMIN_HEADER = "x-textkit-admin-token"
-EXTENSION_HEADER = "x-textkit-token"
 
 # Enforce the configurable pixel limit ourselves after Pillow parses the image
 # header, so max_image_pixels=0 can explicitly disable the check.
@@ -192,9 +189,6 @@ class AppConfig(FrozenModel):
     requests_per_minute: int = Field(default=60, ge=0, le=10_000)
     max_concurrent_requests: int = Field(default=4, ge=0, le=100)
     debug: bool = False
-    extension_token: str = ""
-    admin_token: str = ""
-    allowed_extension_ids: tuple[str, ...] = ()
     ai: AIConfig | None = Field(default_factory=AIConfig)
 
     @field_validator("host")
@@ -204,15 +198,6 @@ class AppConfig(FrozenModel):
         if not host or any(char.isspace() for char in host):
             raise ValueError("host must be a valid bind address")
         return host
-
-    @field_validator("allowed_extension_ids")
-    @classmethod
-    def validate_extension_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
-        pattern = re.compile(r"^[a-p]{32}$")
-        normalized = tuple(dict.fromkeys(value.strip().lower() for value in values if value.strip()))
-        if any(not pattern.fullmatch(value) for value in normalized):
-            raise ValueError("allowed_extension_ids entries must be 32-character Chrome extension IDs")
-        return normalized
 
 
 BoundedText = Annotated[str, Field(min_length=1)]
@@ -244,11 +229,6 @@ class TranslateRequest(BaseModel):
         if cleaned.lower() not in SUPPORTED_LANGUAGES:
             raise ValueError(f"language must be one of: {', '.join(sorted(SUPPORTED_LANGUAGES))}")
         return cleaned
-
-
-class PromptUpdate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    template: Annotated[str, Field(min_length=1)]
 
 
 class FormatRequest(BaseModel):
@@ -398,40 +378,6 @@ def _render_prompt(name: str, **kwargs: str) -> str:
     language = kwargs.get("language")
     template = _load_prompt(name, language)
     return template.replace("{language}", language or "")
-
-
-def _validate_prompt_template(name: str, template: str, max_chars: int) -> None:
-    if not template.strip():
-        raise HTTPException(status_code=422, detail="Prompt template must not be empty")
-    if max_chars and len(template) > max_chars:
-        raise HTTPException(status_code=413, detail=f"Prompt exceeds configured limit of {max_chars} characters")
-    if "\x00" in template:
-        raise HTTPException(status_code=422, detail="Prompt template contains a NUL character")
-    placeholders = set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", template))
-    unsupported = placeholders - ({"language"} if name == "translate" else set())
-    if unsupported:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Unsupported prompt placeholder(s): {', '.join(sorted(unsupported))}",
-        )
-
-
-def _atomic_write_prompt(path: Path, template: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
-            temp_file.write(template)
-            temp_file.flush()
-            os.fsync(temp_file.fileno())
-        os.replace(temp_name, path)
-    except Exception:
-        try:
-            os.unlink(temp_name)
-        except FileNotFoundError:
-            pass
-        raise
 
 
 def _read_prompt_direct(name: str, language: str | None = None) -> str | None:
@@ -694,39 +640,6 @@ _AI_ENDPOINTS = {"/ocr", "/dedup", "/translate", "/format"}
 _LIMITED_ENDPOINTS = _AI_ENDPOINTS | {"/prompts"}
 
 
-def _origin_matches_configured_host(origin: str, configured_host: str) -> bool:
-    try:
-        parsed = urlsplit(origin)
-    except ValueError:
-        return False
-    return bool(
-        parsed.scheme in {"http", "https"}
-        and parsed.hostname
-        and parsed.hostname.lower() == configured_host.strip().strip("[]").lower()
-    )
-
-
-def _constant_time_token_matches(supplied: str | None, configured: str) -> bool:
-    return bool(configured and supplied and hmac.compare_digest(supplied, configured))
-
-
-async def _authorize_extension_origin(request: Request, config: AppConfig) -> bool:
-    origin = request.headers.get("origin")
-    if not origin:
-        return True
-    try:
-        parsed = urlsplit(origin)
-    except ValueError:
-        return False
-    if parsed.scheme == "chrome-extension" and parsed.netloc:
-        extension_id = parsed.netloc.lower()
-        if extension_id in config.allowed_extension_ids:
-            return True
-        token = _resolve_secret(config.extension_token)
-        return _constant_time_token_matches(request.headers.get(EXTENSION_HEADER), token)
-    return _origin_matches_configured_host(origin, config.host)
-
-
 async def _acquire_request_slot(request: Request, config: AppConfig) -> JSONResponse | None:
     global _active_requests
     key = request.client.host if request.client else "unknown"
@@ -876,22 +789,7 @@ async def security_and_limits(request: Request, call_next: Any) -> Response:
             if too_large:
                 return JSONResponse(status_code=413, content=_error_payload("Request body is too large"))
 
-    if request.url.path in _AI_ENDPOINTS and not await _authorize_extension_origin(request, config):
-        return JSONResponse(status_code=403, content=_error_payload("Extension origin is not authorized"))
-
-    is_prompt_put = request.method == "PUT" and request.url.path.startswith("/prompts/")
-    if is_prompt_put:
-        configured = _resolve_secret(config.admin_token)
-        supplied = request.headers.get(ADMIN_HEADER)
-        authorization = request.headers.get("authorization", "")
-        if not supplied and authorization.lower().startswith("bearer "):
-            supplied = authorization[7:].strip()
-        if not configured:
-            return JSONResponse(status_code=503, content=_error_payload("Prompt administration is disabled until admin_token is configured"))
-        if not _constant_time_token_matches(supplied, configured):
-            return JSONResponse(status_code=401, content=_error_payload("Prompt administrator authentication required"))
-
-    limited = request.url.path in _AI_ENDPOINTS or is_prompt_put
+    limited = request.url.path in _AI_ENDPOINTS
     if not limited:
         return await call_next(request)
     limiter_enabled = bool(config.requests_per_minute or config.max_concurrent_requests)
@@ -1036,31 +934,12 @@ async def get_prompt_fallback(name: str, request: Request) -> Response:
     return JSONResponse(content={"template": template, "source": source, "version": version}, headers={"ETag": etag})
 
 
-@app.api_route("/prompts/{name}", methods=["GET", "PUT"])
+@app.get("/prompts/{name}")
 async def get_prompt(name: str, request: Request) -> dict[str, object]:
     language = _validate_prompt_request(name, request.query_params.get("language"))
-    if request.method == "PUT":
-        try:
-            body = await request.json()
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail="Malformed JSON request body") from exc
-        try:
-            update = PromptUpdate.model_validate(body)
-        except ValidationError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        config = await _get_config()
-        _validate_prompt_template(name, update.template, config.max_prompt_chars)
-        path = _prompt_path(name, language)
-        try:
-            await asyncio.to_thread(_atomic_write_prompt, path, update.template)
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"Failed to save prompt: {exc.strerror or exc}") from exc
-        _prompt_cache.clear()
-        template = await asyncio.to_thread(_load_prompt, name, language)
-    else:
-        template = await asyncio.to_thread(_read_prompt_direct, name, language)
-        if template is None:
-            template = _DEFAULT_PROMPTS.get(name, "")
+    template, _source = await asyncio.to_thread(
+        _fallback_prompt, name, language if name == "translate" else None
+    )
     result: dict[str, object] = {
         "name": name,
         "template": template,

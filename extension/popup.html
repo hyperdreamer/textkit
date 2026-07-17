@@ -323,26 +323,6 @@
       .prompt-editor textarea.server-default {
         color: #94a3b8;
       }
-      .prompt-fallback {
-        min-height: 34px;
-        margin-top: 7px;
-        padding: 7px 8px;
-        border: 1px dashed #cbd5e1;
-        border-radius: 5px;
-        color: #64748b;
-        background: #f8fafc;
-        font: 10px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        white-space: pre-wrap;
-      }
-      .prompt-fallback::before {
-        display: block;
-        margin-bottom: 3px;
-        color: #94a3b8;
-        content: "Server default preview";
-        font-family: system-ui, sans-serif;
-        font-weight: 600;
-        text-transform: uppercase;
-      }
       .hidden { display: none; }
     </style>
   </head>
@@ -357,9 +337,6 @@
       <div class="backend-row">
         <label>Backend host <input id="backend-host" type="text" placeholder="localhost"></label>
         <label>Backend port <input id="backend-port" type="number" placeholder="8765"></label>
-      </div>
-      <div class="backend-row">
-        <label>Backend token <input id="backend-token" type="password" autocomplete="off" placeholder="Shared extension token"></label>
       </div>
       <div class="backend-row">
         <label>File bridge host <input id="file-bridge-host" type="text" placeholder="localhost"></label>
@@ -409,7 +386,6 @@
           <summary>OCR</summary>
           <div class="prompt-editor">
             <textarea id="ocr-prompt" placeholder="Optional custom OCR prompt"></textarea>
-            <div id="ocr-fallback-preview" class="prompt-fallback"></div>
             <div class="prompt-controls"><button id="ocr-reset-default" type="button" class="secondary">Reset to server default</button></div>
           </div>
         </details>
@@ -417,7 +393,6 @@
           <summary>Dedup</summary>
           <div class="prompt-editor">
             <textarea id="dedup-prompt" placeholder="Optional custom dedup prompt"></textarea>
-            <div id="dedup-fallback-preview" class="prompt-fallback"></div>
             <div class="prompt-controls"><button id="dedup-reset-default" type="button" class="secondary">Reset to server default</button></div>
           </div>
         </details>
@@ -439,7 +414,6 @@
               </label>
             </div>
             <textarea id="translate-prompt" placeholder="Optional custom translation prompt for this language"></textarea>
-            <div id="translate-fallback-preview" class="prompt-fallback"></div>
             <span id="translate-prompt-hint" class="hint hidden"></span>
             <div class="prompt-controls"><button id="translate-reset-default" type="button" class="secondary">Reset to server default</button></div>
           </div>
@@ -448,7 +422,6 @@
           <summary>Format</summary>
           <div class="prompt-editor">
             <textarea id="format-prompt" placeholder="Optional custom formatting prompt"></textarea>
-            <div id="format-fallback-preview" class="prompt-fallback"></div>
             <div class="prompt-controls"><button id="format-reset-default" type="button" class="secondary">Reset to server default</button></div>
           </div>
         </details>

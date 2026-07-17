@@ -83,6 +83,8 @@ function createPopupHarness(options = {}) {
   const syncData = { ...(options.syncData || {}) };
   const runtimeMessages = [];
   const syncWrites = [];
+  const permissionContainsCalls = [];
+  const permissionRequestCalls = [];
   let timerId = 0;
   const timers = new Map();
 
@@ -147,6 +149,16 @@ function createPopupHarness(options = {}) {
         }
       }
     },
+    permissions: {
+      async contains(details) {
+        permissionContainsCalls.push(details);
+        return options.permissionContains ? options.permissionContains(details) : true;
+      },
+      async request(details) {
+        permissionRequestCalls.push(details);
+        return options.permissionRequest ? options.permissionRequest(details) : true;
+      }
+    },
     tabs: { query: async () => [{ id: 1, windowId: 10, active: true }] },
     downloads: {
       download(downloadOptions, callback) {
@@ -188,7 +200,18 @@ function createPopupHarness(options = {}) {
     await Promise.all(callbacks.map((callback) => callback()));
   }
 
-  return { context, elements, localData, runTimers, runtimeMessage, runtimeMessages, syncData, syncWrites };
+  return {
+    context,
+    elements,
+    localData,
+    permissionContainsCalls,
+    permissionRequestCalls,
+    runTimers,
+    runtimeMessage,
+    runtimeMessages,
+    syncData,
+    syncWrites
+  };
 }
 
 test('prompt refresh rejects stale generations and dirty textareas', () => {
@@ -234,7 +257,7 @@ test('fallback refresh does not clobber an edit made while fetch is pending', as
   assert.equal(prompt.value, 'user edit');
 });
 
-test('fallback preview stays separate and can be copied or reset', async () => {
+test('server fallback shown inline in textarea, reset clears custom', async () => {
   const harness = createPopupHarness({
     fetch: async () => ({
       ok: true,
@@ -244,20 +267,22 @@ test('fallback preview stays separate and can be copied or reset', async () => {
   });
   const config = vm.runInContext('PROMPT_CONFIGS.ocr', harness.context);
   const prompt = harness.elements.get('ocr-prompt');
-  const preview = harness.elements.get('ocr-fallback-preview');
 
   await harness.context.refreshFallback(config, { force: true });
-  assert.equal(prompt.value, '');
-  assert.equal(preview.textContent, 'Server OCR default');
+  // Fallback shown inline in textarea, grayed out
+  assert.equal(prompt.value, 'Server OCR default');
+  assert.ok(prompt.classList.contains('server-default'));
 
-  // Simulate user edit: typing marks dirty and saves to localStorage
+  // User types a custom prompt — dirty flag set, class removed
   prompt.value = 'Custom OCR prompt';
   prompt.dispatch('input');
   assert.equal(harness.localData.ocrPrompt, 'Custom OCR prompt');
+  assert.ok(!prompt.classList.contains('server-default'));
 
+  // Reset to server default
   await harness.context.resetPromptToFallback(config);
-  assert.equal(prompt.value, '');
-  assert.equal(preview.textContent, 'Server OCR default');
+  assert.equal(prompt.value, 'Server OCR default');
+  assert.ok(prompt.classList.contains('server-default'));
   assert.equal(Object.hasOwn(harness.localData, 'ocrPrompt'), false);
 });
 
@@ -277,7 +302,7 @@ test('prompt edits save immediately without writing backend prompts', async () =
   assert.equal(fetchCalls.length, 0);
 });
 
-test('server fallback previews are never sent as custom prompts', async () => {
+test('unedited server default in textarea is not sent as custom prompt', async () => {
   const harness = createPopupHarness({
     fetch: async () => ({
       ok: true,
@@ -288,15 +313,75 @@ test('server fallback previews are never sent as custom prompts', async () => {
   const config = vm.runInContext('PROMPT_CONFIGS.ocr', harness.context);
   await harness.context.refreshFallback(config, { force: true });
 
+  // Fallback shown inline but dirty=false — not sent
   await harness.context.startCapture();
   const first = harness.runtimeMessages.find((message) => message.type === 'popup:start');
   assert.equal(Object.hasOwn(first, 'prompts'), false);
 
-  harness.elements.get('ocr-prompt').value = 'Explicit override';
+  // User explicitly edits — now it's a custom prompt
+  const promptEl = harness.elements.get('ocr-prompt');
+  promptEl.value = 'Explicit override';
+  promptEl.dispatch('input');  // sets dirty flag
   await harness.context.startCapture();
   const starts = harness.runtimeMessages.filter((message) => message.type === 'popup:start');
   assert.equal(starts.at(-1).prompts.ocr, 'Explicit override');
   assert.equal(Object.hasOwn(starts.at(-1).prompts, 'dedup'), false);
+});
+
+test('persisted prompt overrides survive fallback refresh and are sent as custom', async () => {
+  const harness = createPopupHarness({
+    localData: { ocrPrompt: 'Persisted OCR override' },
+    runtimeSendMessage: async (message) => message.type === 'popup:get-state'
+      ? { ok: true, tabId: 1, state: { status: 'Idle', active: false, progress: 'Ready' } }
+      : { ok: true },
+    fetch: async (url) => ({
+      ok: true,
+      status: 200,
+      json: async () => String(url).includes('/fallback')
+        ? { template: 'Server fallback', source: 'file', version: 'v1' }
+        : { paths: [] }
+    })
+  });
+
+  await harness.context.init();
+  await delay();
+  const prompt = harness.elements.get('ocr-prompt');
+  assert.equal(prompt.value, 'Persisted OCR override');
+  assert.ok(!prompt.classList.contains('server-default'));
+
+  await harness.context.startCapture();
+  const start = harness.runtimeMessages.find((message) => message.type === 'popup:start');
+  assert.equal(start.prompts.ocr, 'Persisted OCR override');
+});
+
+test('inline translation and format fallbacks are not sent as overrides', async () => {
+  const harness = createPopupHarness({
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ template: 'Inline server fallback', source: 'file', version: 'v1' })
+    }),
+    runtimeSendMessage: async (message) => message.type === 'popup:get-state'
+      ? { ok: true, tabId: 1, state: { status: 'Idle', active: false, progress: 'Ready' } }
+      : { ok: true }
+  });
+  await harness.context.init();
+  harness.elements.get('result').value = 'source text';
+  harness.elements.get('tl2-result').value = 'translated text';
+
+  await harness.context.refreshFallback(vm.runInContext('PROMPT_CONFIGS.translate', harness.context), { force: true });
+  await harness.context.refreshFallback(vm.runInContext('PROMPT_CONFIGS.format', harness.context), { force: true });
+  await harness.context.doTranslation();
+  harness.elements.get('tl2-result').value = 'translated text';
+  harness.elements.get('fmt-result').value = 'formatted text';
+  await harness.context.doFormat();
+
+  const translate = harness.runtimeMessages.find((message) => message.type === 'translate:start');
+  const format = harness.runtimeMessages.find((message) => message.type === 'format:start');
+  assert.ok(translate, 'translate:start message was not sent');
+  assert.ok(format, 'format:start message was not sent');
+  assert.equal(Object.hasOwn(translate, 'prompt'), false);
+  assert.equal(Object.hasOwn(format, 'prompt'), false);
 });
 
 test('stale forced fallback response cannot overwrite the current cache', async () => {
@@ -332,8 +417,8 @@ test('stale forced fallback response cannot overwrite the current cache', async 
 
   const cacheKey = 'promptFallback:localhost:8765:ocr:';
   assert.equal(harness.localData[cacheKey].template, 'new prompt');
-  assert.equal(prompt.value, '');
-  assert.equal(harness.elements.get('ocr-fallback-preview').textContent, 'new prompt');
+  // Fallback shown inline in textarea
+  assert.equal(prompt.value, 'new prompt');
 });
 
 test('path suggestions fall back to local history when the backend fails', async () => {
@@ -508,4 +593,37 @@ test('manual download failure is reported instead of silently succeeding', async
   assert.equal(downloaded, false);
   assert.equal(harness.elements.get('progress').textContent, 'Download failed: downloads blocked');
   assert.equal(harness.elements.get('download').textContent, '');
+});
+
+test('manual file bridge saves request configured host permission', async () => {
+  const harness = createPopupHarness({
+    syncData: { fileBridgeHost: '127.0.0.1', fileBridgePort: 8766 },
+    permissionContains: async () => false,
+    permissionRequest: async () => false
+  });
+  vm.runInContext('currentTabId = 1', harness.context);
+  harness.elements.get('tl2-result').value = 'translation';
+  harness.elements.get('tl2-autosave-path').value = 'notes/translation.txt';
+  harness.elements.get('fmt-result').value = 'formatted';
+  harness.elements.get('fmt-save-path').value = 'notes/formatted.txt';
+
+  await harness.context.saveTranslation();
+  await harness.context.saveFormatResult();
+
+  assert.equal(harness.permissionContainsCalls.length, 2);
+  assert.equal(harness.permissionContainsCalls[0].origins.length, 1);
+  assert.equal(harness.permissionContainsCalls[0].origins[0], 'http://127.0.0.1/*');
+  assert.equal(harness.permissionContainsCalls[1].origins.length, 1);
+  assert.equal(harness.permissionContainsCalls[1].origins[0], 'http://127.0.0.1/*');
+  assert.equal(harness.permissionRequestCalls.length, 2);
+  assert.equal(harness.permissionRequestCalls[0].origins.length, 1);
+  assert.equal(harness.permissionRequestCalls[0].origins[0], 'http://127.0.0.1/*');
+  assert.equal(harness.permissionRequestCalls[1].origins.length, 1);
+  assert.equal(harness.permissionRequestCalls[1].origins[0], 'http://127.0.0.1/*');
+  assert.equal(
+    harness.runtimeMessages.filter((message) => message.type === 'save:translation').length,
+    0
+  );
+  assert.match(harness.elements.get('tl2-status-text').textContent, /permission was not granted/);
+  assert.match(harness.elements.get('fmt-status-text').textContent, /permission was not granted/);
 });

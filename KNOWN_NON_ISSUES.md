@@ -105,4 +105,22 @@ viewport height. Future audits should not report this as a defect.
 
 ---
 
-*Last updated: 2026-07-16 — retry serialization, clipboard/download reporting, navigation isolation, and partial-capture status*
+*Last updated: 2026-07-17 — no auth tokens, 0=unlimited limits, same-URL reload detection, prompt fallback separation*
+
+---
+
+## 13. No backend auth (extension_token, admin_token) — stripped by design
+
+**Decision:** Removed. The backend binds 127.0.0.1 by default. For a single-user localhost tool, extension/auth tokens add configuration burden without meaningful security — any local process or installed extension can already hit the port. Prompt templates are edited directly in `backend/prompts/*.txt` (no write API). File-bridge likewise runs on localhost with no token.
+
+---
+
+## 14. PUT /prompts/{name} removed
+
+**Decision:** Removed. The endpoint mutated prompt files on disk but served no real workflow — per-request custom prompts come from the extension, and persistent templates are edited in a text editor. Removing it eliminates auth, validation, and file-write attack surface.
+
+---
+
+## 15. Config limits accept 0 to mean "unlimited"
+
+**Decision:** All `max_*` and rate/currency settings (`requests_per_minute`, `max_concurrent_requests`) accept 0 to disable the check entirely. Defaults are conservative; run with limits at 0 for unrestricted local use.

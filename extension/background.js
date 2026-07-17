@@ -54,10 +54,8 @@ async function getFileBridgeEndpoint(path) {
 }
 
 async function getBackendHeaders(contentType, operationId = '') {
-  const { backendToken } = await chrome.storage.local.get({ backendToken: '' });
   const headers = {};
   if (contentType) headers['Content-Type'] = contentType;
-  if (String(backendToken || '').trim()) headers['X-TextKit-Token'] = String(backendToken).trim();
   if (operationId) headers['X-TextKit-Operation-Id'] = operationId;
   return headers;
 }
@@ -254,8 +252,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
   else states.delete(tabId);
   notifyTargetTabChange();
-  handleTranslateStop(tabId);
-  handleFormatStop(tabId);
+  handleTranslateStop(tabId).catch(() => {});
+  handleFormatStop(tabId).catch(() => {});
   captureControllers.get(tabId)?.abort();
   if (captureInFlight) return;
   cleanupClosedTab(tabId).catch(() => {});
@@ -285,6 +283,15 @@ async function cleanupClosedTab(tabId) {
 }
 // ── keyboard shortcut ──────────────────────────────────────────
 
+async function ensureBackendPermission() {
+  if (!chrome.permissions?.contains || !chrome.permissions?.request) return true;
+  const settings = await chrome.storage.sync.get({ backendHost: DEFAULT_HOST, backendPort: DEFAULT_PORT });
+  const backend = normalizeBackendSettings(settings.backendHost, settings.backendPort);
+  const origins = [`http://${backend.host}/*`];
+  if (await chrome.permissions.contains({ origins })) return true;
+  return chrome.permissions.request({ origins });
+}
+
 chrome.commands.onCommand.addListener(async (command) => {
   if (command !== 'start-region-capture') return;
   try {
@@ -297,6 +304,8 @@ chrome.commands.onCommand.addListener(async (command) => {
       console.warn('A capture is already active for this tab.');
       return;
     }
+    if (!await ensureBackendPermission()) throw new Error('Backend permission was not granted.');
+    await abortDownstreamOperations(tab.id);
     await ensureContentScript(tab.id);
     state.operationPrompts = await snapshotCapturePrompts();
     state.selectionToken = createSelectionToken();
@@ -394,9 +403,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === 'translate:stop') {
-    handleTranslateStop(message.tabId);
-    sendResponse({ ok: true });
-    return false;
+    handleTranslateStop(message.tabId)
+      .then(() => sendResponse({ ok: true }))
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
   }
   if (message?.type === 'save:translation') {
     handleSaveTranslation(message).then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
@@ -407,9 +417,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === 'format:stop') {
-    handleFormatStop(message.tabId);
-    sendResponse({ ok: true });
-    return false;
+    handleFormatStop(message.tabId)
+      .then(() => sendResponse({ ok: true }))
+      .catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
   }
   return false;
 });
@@ -422,6 +433,7 @@ async function handlePopupStart(message = {}) {
   if (state.active || state.captureInFlight || state.status === 'Selecting') {
     throw new Error('A capture is already active for this tab.');
   }
+  await abortDownstreamOperations(tab.id);
   await ensureContentScript(tab.id);
   state.operationPrompts = message.prompts
     ? normalizeCapturePrompts(message.prompts)
@@ -456,6 +468,7 @@ async function handleReuseRegion() {
   const region = state.lastRegion;
   if (!region) throw new Error('No saved region. Select a region first.');
   if (tab.windowId == null || tab.windowId < 0) throw new Error('Invalid windowId.');
+  await abortDownstreamOperations(tab.id);
   await ensureContentScript(tab.id);
   state.operationPrompts = await snapshotCapturePrompts();
   // Get actual viewport dimensions from the content script
@@ -511,8 +524,7 @@ async function handleStop() {
   }
   // Abort in-flight OCR AND translation so Stop responds immediately
   captureControllers.get(tab.id)?.abort();
-  handleTranslateStop(tab.id);
-  handleFormatStop(tab.id);
+  await Promise.all([handleTranslateStop(tab.id), handleFormatStop(tab.id)]);
   // If in error state
   // If in error state (waiting for retry), finalize collected fragments now
   if (state.status === 'Error' && state.fragmentsCollected > 0 && state.checkpointText) {
@@ -561,6 +573,8 @@ const captureControllers = new Map();
 const translateOperationIds = new Map();
 const formatOperationIds = new Map();
 const captureOperationIds = new Map();
+const operationCheckpointQueues = new Map();
+const operationMutationQueues = new Map();
 let keepAliveIntervalId = null;
 
 function createOperationId(type, tabId) {
@@ -575,24 +589,52 @@ function operationStorageKey(type, tabId) {
   return `operation:${type}:${tabId}`;
 }
 
-async function persistOperation(type, tabId, operationId, input, status = 'running') {
-  await chrome.storage.local.set({
-    [operationStorageKey(type, tabId)]: {
-      version: OPERATION_SCHEMA_VERSION,
-      type,
-      tabId,
-      operationId,
-      status,
-      input,
-      updatedAt: Date.now()
-    }
+function serializeQueuedOperation(queues, key, task) {
+  const previous = queues.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(task);
+  queues.set(key, current);
+  const cleanup = () => {
+    if (queues.get(key) === current) queues.delete(key);
+  };
+  current.then(cleanup, cleanup);
+  return current;
+}
+
+function serializeOperationMutation(type, tabId, task) {
+  return serializeQueuedOperation(operationMutationQueues, `${type}:${tabId}`, task);
+}
+
+function commitCurrentOperation(type, operationMap, tabId, operationId, task) {
+  return serializeOperationMutation(type, tabId, async () => {
+    if (!isCurrentOperation(operationMap, tabId, operationId)) return false;
+    await task();
+    return isCurrentOperation(operationMap, tabId, operationId);
   });
 }
 
-async function clearOperation(type, tabId, operationId) {
+function persistOperation(type, tabId, operationId, input, status = 'running') {
   const key = operationStorageKey(type, tabId);
-  const stored = await chrome.storage.local.get(key);
-  if (stored[key]?.operationId === operationId) await chrome.storage.local.remove(key);
+  return serializeQueuedOperation(operationCheckpointQueues, key, () => {
+    return chrome.storage.local.set({
+      [key]: {
+        version: OPERATION_SCHEMA_VERSION,
+        type,
+        tabId,
+        operationId,
+        status,
+        input,
+        updatedAt: Date.now()
+      }
+    });
+  });
+}
+
+function clearOperation(type, tabId, operationId) {
+  const key = operationStorageKey(type, tabId);
+  return serializeQueuedOperation(operationCheckpointQueues, key, async () => {
+    const stored = await chrome.storage.local.get(key);
+    if (stored[key]?.operationId === operationId) await chrome.storage.local.remove(key);
+  });
 }
 
 function startKeepAlive() {
@@ -606,6 +648,16 @@ function stopKeepAlive() {
   if (!keepAliveIntervalId) return;
   clearInterval(keepAliveIntervalId);
   keepAliveIntervalId = null;
+}
+
+function maybeStopKeepAlive() {
+  if (captureControllers.size === 0 && translateControllers.size === 0 && formatControllers.size === 0) {
+    stopKeepAlive();
+  }
+}
+
+async function abortDownstreamOperations(tabId) {
+  await Promise.all([handleTranslateStop(tabId), handleFormatStop(tabId)]);
 }
 
 async function handleTranslateStart(msg) {
@@ -625,48 +677,51 @@ async function handleTranslateStart(msg) {
     promptSnapshot = normalizeCustomPrompt(stored[key]);
   }
 
-  // Abort any in-flight translation for this tab
-  handleTranslateStop(tabId);
-
   const controller = new AbortController();
   let timedOut = false;
   let timeoutId = null;
 
   try {
-    translateControllers.set(tabId, controller);
-    translateOperationIds.set(tabId, operationId);
-    startKeepAlive();
-    timeoutId = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, BACKEND_TIMEOUT_MS);
+    await serializeOperationMutation('translate', tabId, async () => {
+      await stopTranslateOperation(tabId);
+      translateControllers.set(tabId, controller);
+      translateOperationIds.set(tabId, operationId);
+      startKeepAlive();
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, BACKEND_TIMEOUT_MS);
 
-    // Persist state so popup reopen shows "Stop" button.
-    // Clear any stale result so init() doesn't mistake an old result
-    // for a just-completed translation.
-    await persistOperation('translate', tabId, operationId, {
-      text, language, host: host || DEFAULT_HOST, port: port || DEFAULT_PORT,
-      prompt: promptSnapshot
+      // Replace the previous checkpoint and visible state as one per-tab
+      // mutation, so old cleanup cannot remove the new operation.
+      await persistOperation('translate', tabId, operationId, {
+        text, language, host: host || DEFAULT_HOST, port: port || DEFAULT_PORT,
+        prompt: promptSnapshot
+      });
+      await chrome.storage.local.set({
+        [`tl2Translating:${tabId}`]: true,
+        [`tl2Status:${tabId}`]: `Translating to ${language}...`
+      });
+      await chrome.storage.local.remove(`tl2Result:${tabId}`);
+      chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: true }).catch(() => {});
     });
-    await chrome.storage.local.set({
-      [`tl2Translating:${tabId}`]: true,
-      [`tl2Status:${tabId}`]: `Translating to ${language}...`
-    });
-    await chrome.storage.local.remove(`tl2Result:${tabId}`);
-    chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: true }).catch(() => {});
 
     try {
       const customPrompt = renderTranslationPrompt(promptSnapshot, language);
       // "Original" with no custom prompt → pass through unchanged
       if (language === 'original' && !promptSnapshot) {
         const translated = text;
-        if (!isCurrentOperation(translateOperationIds, tabId, operationId)) return { ok: false, error: 'Translation superseded.' };
-        await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
-        await clearOperation('translate', tabId, operationId);
-        chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
-        if (translated) autoCopyIfEnabled(translated);
-        if (translated) autoSaveIfEnabled(translated);
-        if (translated) autoFormatIfEnabled(tabId, translated, host, port);
+        const committed = await commitCurrentOperation(
+          'translate', translateOperationIds, tabId, operationId, async () => {
+            await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
+            await clearOperation('translate', tabId, operationId);
+            chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
+            if (translated) autoCopyIfEnabled(translated);
+            if (translated) autoSaveIfEnabled(translated);
+            if (translated) autoFormatIfEnabled(tabId, translated, host, port);
+          }
+        );
+        if (!committed) return { ok: false, error: 'Translation superseded.' };
         return { ok: true };
       }
       const url = buildBackendEndpoint(host || DEFAULT_HOST, port || DEFAULT_PORT, `/translate?_=${Date.now()}`);
@@ -680,60 +735,79 @@ async function handleTranslateStart(msg) {
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
       const translated = requireTextPayload(payload, 'Translation backend');
       requirePersistableText(translated, 'Translation result');
-      if (!isCurrentOperation(translateOperationIds, tabId, operationId)) {
-        return { ok: false, error: 'Translation superseded.' };
-      }
-      await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
-      await clearOperation('translate', tabId, operationId);
-      chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
-      // Auto-copy / auto-save translated text
-      if (translated) autoCopyIfEnabled(translated);
-      if (translated) autoSaveIfEnabled(translated);
-      // Auto-format: trigger from background so it survives popup close
-      if (translated) autoFormatIfEnabled(tabId, translated, host, port);
+      const committed = await commitCurrentOperation(
+        'translate', translateOperationIds, tabId, operationId, async () => {
+          await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
+          await clearOperation('translate', tabId, operationId);
+          chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
+          // Auto-copy / auto-save translated text
+          if (translated) autoCopyIfEnabled(translated);
+          if (translated) autoSaveIfEnabled(translated);
+          // Auto-format: trigger from background so it survives popup close
+          if (translated) autoFormatIfEnabled(tabId, translated, host, port);
+        }
+      );
+      if (!committed) return { ok: false, error: 'Translation superseded.' };
     } catch (e) {
       if (!isCurrentOperation(translateOperationIds, tabId, operationId)) {
         return { ok: false, error: 'Translation superseded.' };
       }
-      await clearOperation('translate', tabId, operationId).catch(() => {});
       if (e.name === 'AbortError') {
         const message = timedOut ? 'Translation timed out.' : 'Translation stopped.';
-        await chrome.storage.local.set({ [`tl2Status:${tabId}`]: message });
-        if (timedOut) chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: '', error: message }).catch(() => {});
+        const committed = await commitCurrentOperation(
+          'translate', translateOperationIds, tabId, operationId, async () => {
+            await clearOperation('translate', tabId, operationId).catch(() => {});
+            await chrome.storage.local.set({ [`tl2Status:${tabId}`]: message });
+            if (timedOut) chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: '', error: message }).catch(() => {});
+          }
+        );
+        if (!committed) return { ok: false, error: 'Translation superseded.' };
         return { ok: !timedOut, error: timedOut ? message : undefined };
       }
       const errorMessage = e.message || 'Translation failed.';
-      await chrome.storage.local.set({ [`tl2Status:${tabId}`]: errorMessage });
-      chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: '', error: errorMessage }).catch(() => {});
+      const committed = await commitCurrentOperation(
+        'translate', translateOperationIds, tabId, operationId, async () => {
+          await clearOperation('translate', tabId, operationId).catch(() => {});
+          await chrome.storage.local.set({ [`tl2Status:${tabId}`]: errorMessage });
+          chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: '', error: errorMessage }).catch(() => {});
+        }
+      );
+      if (!committed) return { ok: false, error: 'Translation superseded.' };
       return { ok: false, error: errorMessage };
     }
   } finally {
     clearTimeout(timeoutId);
-    if (controller && translateControllers.get(tabId) === controller
-        && isCurrentOperation(translateOperationIds, tabId, operationId)) {
+    await serializeOperationMutation('translate', tabId, async () => {
+      if (translateControllers.get(tabId) !== controller
+          || !isCurrentOperation(translateOperationIds, tabId, operationId)) return;
       translateControllers.delete(tabId);
       translateOperationIds.delete(tabId);
       await chrome.storage.local.remove(`tl2Translating:${tabId}`).catch((error) => {
         console.error('Failed to clear translation state:', error);
       });
       chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: false }).catch(() => {});
-    }
-    if (captureControllers.size === 0 && translateControllers.size === 0 && formatControllers.size === 0) stopKeepAlive();
+    });
+    maybeStopKeepAlive();
   }
 
   return { ok: true };
 }
 
-function handleTranslateStop(tabId) {
+async function stopTranslateOperation(tabId) {
   const controller = translateControllers.get(tabId);
   const operationId = translateOperationIds.get(tabId);
-  if (controller) {
-    controller.abort();
-    translateControllers.delete(tabId);
-    chrome.storage.local.remove(`tl2Translating:${tabId}`);
-  }
+  controller?.abort();
+  translateControllers.delete(tabId);
   translateOperationIds.delete(tabId);
-  if (operationId) clearOperation('translate', tabId, operationId).catch(() => {});
+  await Promise.all([
+    chrome.storage.local.remove(`tl2Translating:${tabId}`),
+    operationId ? clearOperation('translate', tabId, operationId) : Promise.resolve()
+  ]);
+}
+
+async function handleTranslateStop(tabId) {
+  await serializeOperationMutation('translate', tabId, () => stopTranslateOperation(tabId));
+  maybeStopKeepAlive();
 }
 
 async function handleSaveTranslation(msg) {
@@ -781,32 +855,31 @@ async function handleFormatStart(msg) {
     prompt = normalizeCustomPrompt(stored.formatPrompt);
   }
 
-  // Abort any in-flight formatting for this tab
-  handleFormatStop(tabId);
-
   const controller = new AbortController();
   let timedOut = false;
   let timeoutId = null;
 
   try {
-    formatControllers.set(tabId, controller);
-    formatOperationIds.set(tabId, operationId);
-    startKeepAlive();
-    timeoutId = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, BACKEND_TIMEOUT_MS);
+    await serializeOperationMutation('format', tabId, async () => {
+      await stopFormatOperation(tabId);
+      formatControllers.set(tabId, controller);
+      formatOperationIds.set(tabId, operationId);
+      startKeepAlive();
+      timeoutId = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, BACKEND_TIMEOUT_MS);
 
-    // Persist state so popup reopen shows "Stop" button.
-    await persistOperation('format', tabId, operationId, {
-      text, host: host || DEFAULT_HOST, port: port || DEFAULT_PORT, prompt
+      await persistOperation('format', tabId, operationId, {
+        text, host: host || DEFAULT_HOST, port: port || DEFAULT_PORT, prompt
+      });
+      await chrome.storage.local.set({
+        [`fmtFormatting:${tabId}`]: true,
+        [`fmtStatus:${tabId}`]: 'Formatting...'
+      });
+      await chrome.storage.local.remove(`fmtResult:${tabId}`);
+      chrome.runtime.sendMessage({ type: 'fmt:formatting', tabId, value: true }).catch(() => {});
     });
-    await chrome.storage.local.set({
-      [`fmtFormatting:${tabId}`]: true,
-      [`fmtStatus:${tabId}`]: 'Formatting...'
-    });
-    await chrome.storage.local.remove(`fmtResult:${tabId}`);
-    chrome.runtime.sendMessage({ type: 'fmt:formatting', tabId, value: true }).catch(() => {});
 
     try {
       const url = buildBackendEndpoint(host || DEFAULT_HOST, port || DEFAULT_PORT, `/format?_=${Date.now()}`);
@@ -820,58 +893,77 @@ async function handleFormatStart(msg) {
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
       const formatted = requireTextPayload(payload, 'Format backend');
       requirePersistableText(formatted, 'Format result');
-      if (!isCurrentOperation(formatOperationIds, tabId, operationId)) {
-        return { ok: false, error: 'Formatting superseded.' };
-      }
-      await chrome.storage.local.set({ [`fmtResult:${tabId}`]: formatted });
-      await clearOperation('format', tabId, operationId);
-      chrome.runtime.sendMessage({ type: 'format:update', tabId, text: formatted }).catch(() => {});
-      // Auto-copy / auto-save formatted text (background-side, survives popup close)
-      if (formatted) fmtAutoCopyIfEnabled(formatted);
-      if (formatted) fmtAutoSaveIfEnabled(formatted);
+      const committed = await commitCurrentOperation(
+        'format', formatOperationIds, tabId, operationId, async () => {
+          await chrome.storage.local.set({ [`fmtResult:${tabId}`]: formatted });
+          await clearOperation('format', tabId, operationId);
+          chrome.runtime.sendMessage({ type: 'format:update', tabId, text: formatted }).catch(() => {});
+          // Auto-copy / auto-save formatted text (background-side, survives popup close)
+          if (formatted) fmtAutoCopyIfEnabled(formatted);
+          if (formatted) fmtAutoSaveIfEnabled(formatted);
+        }
+      );
+      if (!committed) return { ok: false, error: 'Formatting superseded.' };
     } catch (e) {
       if (!isCurrentOperation(formatOperationIds, tabId, operationId)) {
         return { ok: false, error: 'Formatting superseded.' };
       }
-      await clearOperation('format', tabId, operationId).catch(() => {});
       if (e.name === 'AbortError') {
         const message = timedOut ? 'Formatting timed out.' : 'Formatting stopped.';
-        await chrome.storage.local.set({ [`fmtStatus:${tabId}`]: message });
-        if (timedOut) chrome.runtime.sendMessage({ type: 'format:update', tabId, text: '', error: message }).catch(() => {});
+        const committed = await commitCurrentOperation(
+          'format', formatOperationIds, tabId, operationId, async () => {
+            await clearOperation('format', tabId, operationId).catch(() => {});
+            await chrome.storage.local.set({ [`fmtStatus:${tabId}`]: message });
+            if (timedOut) chrome.runtime.sendMessage({ type: 'format:update', tabId, text: '', error: message }).catch(() => {});
+          }
+        );
+        if (!committed) return { ok: false, error: 'Formatting superseded.' };
         return { ok: !timedOut, error: timedOut ? message : undefined };
       }
       const errorMessage = e.message || 'Formatting failed.';
-      await chrome.storage.local.set({ [`fmtStatus:${tabId}`]: errorMessage });
-      chrome.runtime.sendMessage({ type: 'format:update', tabId, text: '', error: errorMessage }).catch(() => {});
+      const committed = await commitCurrentOperation(
+        'format', formatOperationIds, tabId, operationId, async () => {
+          await clearOperation('format', tabId, operationId).catch(() => {});
+          await chrome.storage.local.set({ [`fmtStatus:${tabId}`]: errorMessage });
+          chrome.runtime.sendMessage({ type: 'format:update', tabId, text: '', error: errorMessage }).catch(() => {});
+        }
+      );
+      if (!committed) return { ok: false, error: 'Formatting superseded.' };
       return { ok: false, error: errorMessage };
     }
   } finally {
     clearTimeout(timeoutId);
-    if (formatControllers.get(tabId) === controller
-        && isCurrentOperation(formatOperationIds, tabId, operationId)) {
+    await serializeOperationMutation('format', tabId, async () => {
+      if (formatControllers.get(tabId) !== controller
+          || !isCurrentOperation(formatOperationIds, tabId, operationId)) return;
       formatControllers.delete(tabId);
       formatOperationIds.delete(tabId);
       await chrome.storage.local.remove(`fmtFormatting:${tabId}`).catch((error) => {
         console.error('Failed to clear format state:', error);
       });
       chrome.runtime.sendMessage({ type: 'fmt:formatting', tabId, value: false }).catch(() => {});
-    }
-    if (captureControllers.size === 0 && translateControllers.size === 0 && formatControllers.size === 0) stopKeepAlive();
+    });
+    maybeStopKeepAlive();
   }
 
   return { ok: true };
 }
 
-function handleFormatStop(tabId) {
+async function stopFormatOperation(tabId) {
   const controller = formatControllers.get(tabId);
   const operationId = formatOperationIds.get(tabId);
-  if (controller) {
-    controller.abort();
-    formatControllers.delete(tabId);
-    chrome.storage.local.remove(`fmtFormatting:${tabId}`);
-  }
+  controller?.abort();
+  formatControllers.delete(tabId);
   formatOperationIds.delete(tabId);
-  if (operationId) clearOperation('format', tabId, operationId).catch(() => {});
+  await Promise.all([
+    chrome.storage.local.remove(`fmtFormatting:${tabId}`),
+    operationId ? clearOperation('format', tabId, operationId) : Promise.resolve()
+  ]);
+}
+
+async function handleFormatStop(tabId) {
+  await serializeOperationMutation('format', tabId, () => stopFormatOperation(tabId));
+  maybeStopKeepAlive();
 }
 
 async function autoFormatIfEnabled(tabId, text, host, port, source = 'translation') {
@@ -1174,7 +1266,7 @@ async function executeCaptureLoop({
     if (captureControllers.get(tabId) === controller) captureControllers.delete(tabId);
     if (isCurrentOperation(captureOperationIds, tabId, operationId)) captureOperationIds.delete(tabId);
     if (completed) await clearOperation('capture', tabId, operationId).catch(() => {});
-    if (captureControllers.size === 0 && translateControllers.size === 0 && formatControllers.size === 0) stopKeepAlive();
+    maybeStopKeepAlive();
     // Unlock page scroll
     if (scrollLocked) chrome.tabs.sendMessage(tabId, { type: 'page:unlock-scroll' }).catch(() => {});
     if (state.targetRemoved) await cleanupClosedTab(tabId).catch(() => {});
@@ -1974,6 +2066,7 @@ async function recoverPersistedOperations() {
             if (isCurrentOperation(captureOperationIds, operation.tabId, operation.operationId)) {
               captureOperationIds.delete(operation.tabId);
             }
+            maybeStopKeepAlive();
           });
       } else {
         resumeCaptureLoop({ ...input, tabId: operation.tabId, operationId: operation.operationId })
