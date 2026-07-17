@@ -81,14 +81,30 @@ test('unpacked MV3 extension loads in Chromium and survives a worker restart', {
     `--user-data-dir=${profile}`,
     '--no-first-run',
     'about:blank'
-  ], { stdio: 'ignore' });
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let browserLog = '';
+  browser.stdout.on('data', (chunk) => { browserLog += chunk; });
+  browser.stderr.on('data', (chunk) => { browserLog += chunk; });
   t.after(() => {
     browser.kill('SIGTERM');
     fs.rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
 
+  try {
   const portFile = path.join(profile, 'DevToolsActivePort');
-  await waitFor(() => fs.existsSync(portFile), 'Chromium did not expose a DevTools port');
+  await waitFor(
+    () => fs.existsSync(portFile)
+      || browser.exitCode !== null
+      || (browserLog.includes('crashpad') && browserLog.includes('Operation not permitted')),
+    'Chromium did not expose a DevTools port'
+  );
+  if (!fs.existsSync(portFile)) {
+    const logPath = path.join(os.tmpdir(), `textkit-chromium-${Date.now()}.log`);
+    fs.writeFileSync(logPath, browserLog || '(Chromium produced no stdout/stderr output.)\n');
+    t.diagnostic(`Chromium launch log preserved at ${logPath}`);
+    t.skip(`Chromium could not start in this environment (exit ${browser.exitCode})`);
+    return;
+  }
   const [port, browserPath] = fs.readFileSync(portFile, 'utf8').trim().split(/\r?\n/);
   const base = `http://127.0.0.1:${port}`;
   const id = extensionId(EXTENSION);
@@ -148,4 +164,10 @@ test('unpacked MV3 extension loads in Chromium and survives a worker restart', {
     const items = await fetch(`${base}/json/list`).then((response) => response.json());
     return items.some((item) => item.type === 'service_worker' && item.url.startsWith(`chrome-extension://${id}/`));
   }, 'TextKit service worker did not restart');
+  } catch (error) {
+    const logPath = path.join(os.tmpdir(), `textkit-chromium-${Date.now()}.log`);
+    fs.writeFileSync(logPath, browserLog || '(Chromium produced no stdout/stderr output.)\n');
+    t.diagnostic(`Chromium log preserved at ${logPath}`);
+    throw error;
+  }
 });

@@ -18,7 +18,7 @@ max_prompt_chars: 20000
 # Valid range: 0-20971520 bytes; 0 disables the request body limit.
 max_request_body_bytes: 2097152
 
-# In-process abuse controls for AI calls and prompt updates. For multi-worker
+# In-process abuse controls for AI calls. For multi-worker
 # deployments, put an equivalent shared limiter at the reverse proxy as well.
 # Valid range: 0-10000; 0 disables the per-minute request limit.
 requests_per_minute: 60

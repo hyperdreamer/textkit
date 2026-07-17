@@ -23,6 +23,16 @@ function delay(ms = 0) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function jsonResponse(payload, status = 200) {
+  const body = JSON.stringify(payload);
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: (name) => String(name).toLowerCase() === 'content-type' ? 'application/json' : null },
+    text: async () => body
+  };
+}
+
 async function waitFor(predicate, message, timeoutMs = 250) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -128,6 +138,7 @@ function createBackgroundHarness(options = {}) {
       onAttached,
       onDetached,
       async get(tabId) {
+        if (options.getTab) return options.getTab(tabId, tabs);
         const tab = tabs.get(tabId);
         if (!tab) throw new Error(`No tab with id: ${tabId}`);
         return { ...tab };
@@ -236,12 +247,14 @@ function createBackgroundHarness(options = {}) {
     });
     return text;
   };
-  vm.runInContext(`
-    cropVisibleCapture = (...args) => __testCrop(...args);
-    postImageForOcr = (...args) => __testOcr(...args);
-    finalizePostCapture = (...args) => __testFinalize(...args);
-    finalizeCapture = (...args) => __testFinalize(...args);
-  `, context);
+  vm.runInContext('cropVisibleCapture = (...args) => __testCrop(...args);', context);
+  if (!options.useRealPipeline) {
+    vm.runInContext(`
+      postImageForOcr = (...args) => __testOcr(...args);
+      finalizePostCapture = (...args) => __testFinalize(...args);
+      finalizeCapture = (...args) => __testFinalize(...args);
+    `, context);
+  }
 
   function setActive(tabId) {
     const target = tabs.get(tabId);
@@ -668,6 +681,76 @@ test('worker startup broadcasts scroll unlock to every open tab', async () => {
   );
 });
 
+test('startup recovery waits for stale scroll-lock cleanup', async () => {
+  const unlock = deferred();
+  let fetchCalls = 0;
+  const operationId = 'translate:1:recovered';
+  const harness = createBackgroundHarness({
+    localData: {
+      'operation:translate:1': {
+        version: 1,
+        type: 'translate',
+        tabId: 1,
+        operationId,
+        status: 'running',
+        updatedAt: 1,
+        input: { text: 'source', language: 'French', host: 'localhost', port: 8765 }
+      }
+    },
+    sendMessage(_tabId, message) {
+      if (message.type === 'page:unlock-scroll') return unlock.promise;
+      return { ok: true };
+    },
+    fetch: async () => {
+      fetchCalls += 1;
+      return jsonResponse({ text: 'translated' });
+    }
+  });
+
+  await delay(5);
+  assert.equal(fetchCalls, 0);
+  unlock.resolve({ ok: true });
+  await waitFor(() => fetchCalls === 1, 'persisted operation did not recover after unlock cleanup');
+  await waitFor(() => harness.localData['tl2Result:1'] === 'translated', 'recovered translation did not finish');
+});
+
+test('startup recovery re-reads a checkpoint and ignores a superseding operation', async () => {
+  const tabLookup = deferred();
+  let fetchCalls = 0;
+  const oldOperation = {
+    version: 1,
+    type: 'translate',
+    tabId: 1,
+    operationId: 'translate:1:old',
+    status: 'running',
+    updatedAt: 1,
+    input: { text: 'old', language: 'French' }
+  };
+  const harness = createBackgroundHarness({
+    localData: { 'operation:translate:1': oldOperation },
+    getTab: async (tabId, tabs) => {
+      await tabLookup.promise;
+      return { ...tabs.get(tabId) };
+    },
+    fetch: async () => {
+      fetchCalls += 1;
+      return jsonResponse({ text: 'stale' });
+    }
+  });
+  await delay(5);
+  harness.localData['operation:translate:1'] = {
+    ...oldOperation,
+    operationId: 'translate:1:new',
+    updatedAt: 2,
+    input: { text: 'new', language: 'German' }
+  };
+  tabLookup.resolve();
+  await harness.context.startupReadiness;
+
+  assert.equal(fetchCalls, 0);
+  assert.equal(harness.localData['operation:translate:1'].operationId, 'translate:1:new');
+});
+
 test('backend endpoint cache is invalidated when host settings change', async () => {
   const harness = createBackgroundHarness({ syncValues: { backendPort: 8765 } });
   assert.equal(await harness.context.getBackendEndpoint('/ocr'), 'http://localhost:8765/ocr');
@@ -751,6 +834,7 @@ test('OCR retry snapshot is persisted before the infinite retry loop', async () 
       lastScrollY: 100,
       captureUrl: null,
       captureDocumentId: null,
+      backendSnapshot: { host: 'localhost', port: 8765 },
       operationId: harness.localData['retryState:1'].operationId,
       promptSnapshot: { ocr: 'OCR prompt', dedup: 'Dedup prompt' }
     }
@@ -820,6 +904,46 @@ test('stored retry state becomes actionable after a service worker restart', asy
     JSON.parse(JSON.stringify(harness.context.__resumedRetry)),
     storedRetry
   );
+});
+
+test('Retry acknowledges after validation without holding the popup channel open', async () => {
+  const resumed = deferred();
+  const harness = createBackgroundHarness();
+  const state = harness.context.getState(1);
+  state.retryStage = 'dedup';
+  state.pendingText = 'checkpoint';
+  state.fragmentsCollected = 1;
+  harness.context.__resumedDedup = resumed.promise;
+  vm.runInContext('finalizePostCapture = () => __resumedDedup;', harness.context);
+
+  const result = await Promise.race([
+    harness.context.handleRetry(),
+    delay(50).then(() => ({ timeout: true }))
+  ]);
+
+  assert.deepEqual({ ...result }, { ok: true });
+  resumed.resolve();
+});
+
+test('Stop finalizes a recovered retry checkpoint without another dedup request', async () => {
+  let dedupCalls = 0;
+  const harness = createBackgroundHarness();
+  const state = harness.context.getState(1);
+  Object.assign(state, {
+    active: true,
+    status: 'Error',
+    retryStage: 'dedup',
+    checkpointText: 'raw recovered text',
+    fragmentsCollected: 2
+  });
+  harness.context.__testDedup = async () => { dedupCalls += 1; return 'unexpected'; };
+  vm.runInContext('postTextForDedup = (...args) => __testDedup(...args);', harness.context);
+
+  const result = await harness.context.handleStop();
+
+  assert.equal(result.ok, true);
+  assert.equal(dedupCalls, 0);
+  assert.equal(harness.finalized.at(-1).text, 'raw recovered text');
 });
 
 test('a non-OCR capture failure finalizes fragments already collected', async () => {
@@ -1037,6 +1161,32 @@ test('manual translation rejects invalid JSON instead of storing an empty succes
   assert.equal(Object.hasOwn(harness.localData, 'tl2Result:1'), false);
 });
 
+test('translation liveness remains registered until automation settles', async () => {
+  const automation = deferred();
+  const harness = createBackgroundHarness({
+    fetch: async () => jsonResponse({ text: 'translated' })
+  });
+  harness.context.__automation = automation.promise;
+  vm.runInContext(`
+    autoCopyIfEnabled = () => __automation;
+    autoSaveIfEnabled = () => __automation;
+    autoFormatIfEnabled = () => __automation;
+  `, harness.context);
+
+  const operation = harness.context.handleTranslateStart({
+    tabId: 1,
+    text: 'source',
+    language: 'French'
+  });
+  await waitFor(() => harness.localData['tl2Result:1'] === 'translated', 'translation did not reach automation');
+
+  assert.equal(vm.runInContext('translateControllers.has(1)', harness.context), true);
+  assert.equal(await Promise.race([operation.then(() => 'done'), delay(20).then(() => 'pending')]), 'pending');
+  automation.resolve();
+  assert.equal((await operation).ok, true);
+  assert.equal(vm.runInContext('translateControllers.has(1)', harness.context), false);
+});
+
 test('superseded translation cannot overwrite a newer result', async () => {
   const firstResponse = deferred();
   let call = 0;
@@ -1148,6 +1298,20 @@ test('file bridge saves require safe paths and explicit success', async () => {
   assert.equal(fetchCalls, 1);
   assert.equal(saved.ok, true);
   assert.equal(saved.path, 'notes/today.txt');
+});
+
+test('save paths reject Windows drive-relative, UNC, device, and colon forms', () => {
+  const harness = createBackgroundHarness();
+  for (const unsafe of [
+    'C:relative.txt',
+    'C:/absolute.txt',
+    '\\\\server\\share\\file.txt',
+    '\\\\?\\C:\\device.txt',
+    'notes/name:stream.txt'
+  ]) {
+    assert.throws(() => harness.context.normalizeSavePath(unsafe), /relative|traversal/);
+  }
+  assert.equal(harness.context.normalizeSavePath('notes/safe.txt'), 'notes/safe.txt');
 });
 
 test('file bridge empty or implicit-success responses are rejected', async () => {
@@ -1365,6 +1529,27 @@ test('manual format reads the stored prompt once when the operation starts', asy
   assert.equal(requestBody.prompt, 'Initial format prompt');
 });
 
+test('format liveness remains registered until copy/save automation settles', async () => {
+  const automation = deferred();
+  const harness = createBackgroundHarness({
+    fetch: async () => jsonResponse({ text: 'formatted' })
+  });
+  harness.context.__automation = automation.promise;
+  vm.runInContext(`
+    fmtAutoCopyIfEnabled = () => __automation;
+    fmtAutoSaveIfEnabled = () => __automation;
+  `, harness.context);
+
+  const operation = harness.context.handleFormatStart({ tabId: 1, text: 'source' });
+  await waitFor(() => harness.localData['fmtResult:1'] === 'formatted', 'format did not reach automation');
+
+  assert.equal(vm.runInContext('formatControllers.has(1)', harness.context), true);
+  assert.equal(await Promise.race([operation.then(() => 'done'), delay(20).then(() => 'pending')]), 'pending');
+  automation.resolve();
+  assert.equal((await operation).ok, true);
+  assert.equal(vm.runInContext('formatControllers.has(1)', harness.context), false);
+});
+
 test('superseded format operation cannot overwrite a newer result', async () => {
   const firstResponse = deferred();
   let call = 0;
@@ -1408,4 +1593,94 @@ test('OCR-source auto-format runs once even when auto-translate also completes',
 
   assert.equal(harness.context.__formatCalls.length, 1);
   assert.equal(harness.context.__formatCalls[0].text, 'ocr text');
+});
+
+test('fake backend workflow covers selection, capture, dedup, automation, Stop, and recovery', async () => {
+  const routes = [];
+  const harness = createBackgroundHarness({
+    useRealPipeline: true,
+    localData: {
+      tl2Language: 'French',
+      formatPrompt: 'Format clearly.'
+    },
+    syncValues: {
+      ocrAutoscroll: false,
+      ocrAutoTranslate: true,
+      fmtAutoFormat: true,
+      fmtSourceVal: 'translation'
+    },
+    fetch: async (url) => {
+      const route = new URL(String(url)).pathname;
+      routes.push(route);
+      if (route === '/ocr') return jsonResponse({ text: 'raw OCR text' });
+      if (route === '/dedup') return jsonResponse({ text: 'deduplicated text' });
+      if (route === '/translate') return jsonResponse({ text: 'translated text' });
+      if (route === '/format') return jsonResponse({ text: 'formatted text' });
+      throw new Error(`Unexpected fake backend route: ${route}`);
+    }
+  });
+  await harness.context.startupReadiness;
+  const state = harness.context.getState(1);
+  Object.assign(state, {
+    active: true,
+    status: 'Selecting',
+    selectionToken: 'workflow-selection',
+    operationPrompts: {},
+    operationBackend: { host: 'localhost', port: 8765 }
+  });
+  let selectionResponse;
+  harness.events.runtimeMessage.emit(
+    { type: 'selection:complete', region: REGION, selectionToken: 'workflow-selection' },
+    { tab: { id: 1, windowId: 10, active: true, url: 'https://example.test/' } },
+    (response) => { selectionResponse = response; }
+  );
+
+  assert.deepEqual({ ...selectionResponse }, { ok: true });
+  await waitFor(() => harness.localData['fmtResult:1'] === 'formatted text', 'automation workflow did not finish');
+  assert.deepEqual(routes, ['/ocr', '/dedup', '/translate', '/format']);
+  assert.equal(harness.localData['lastResult:1'], 'deduplicated text');
+  assert.equal(harness.localData['tl2Result:1'], 'translated text');
+
+  let recoveryRequestStarted = false;
+  const recoveredOperationId = 'capture:1:recovered-stop';
+  const recoveryHarness = createBackgroundHarness({
+    useRealPipeline: true,
+    localData: {
+      'operation:capture:1': {
+        version: 1,
+        type: 'capture',
+        tabId: 1,
+        operationId: recoveredOperationId,
+        status: 'running',
+        updatedAt: 1,
+        input: {
+          stage: 'dedup',
+          mergedText: 'raw recovery checkpoint',
+          fragmentsCollected: 1,
+          promptSnapshot: {},
+          backendSnapshot: { host: 'localhost', port: 8765 }
+        }
+      }
+    },
+    fetch: async (_url, options) => {
+      recoveryRequestStarted = true;
+      return new Promise((_resolve, reject) => {
+        const abort = () => {
+          const error = new Error('aborted');
+          error.name = 'AbortError';
+          reject(error);
+        };
+        if (options.signal.aborted) abort();
+        else options.signal.addEventListener('abort', abort, { once: true });
+      });
+    }
+  });
+  await waitFor(() => recoveryRequestStarted, 'dedup recovery did not contact the fake backend');
+  const stopResult = await recoveryHarness.context.handleStop();
+  assert.equal(stopResult.ok, true);
+  await waitFor(
+    () => recoveryHarness.localData['lastResult:1'] === 'raw recovery checkpoint',
+    'Stop did not finalize the recovered raw checkpoint'
+  );
+  assert.equal(recoveryHarness.context.getState(1).status, 'Partial');
 });

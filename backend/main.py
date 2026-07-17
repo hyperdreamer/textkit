@@ -426,6 +426,8 @@ def _image_to_data_url(
         with Image.open(BytesIO(image_bytes)) as image:
             inferred_format = (image.format or "").upper()
             width, height = image.size
+            if getattr(image, "n_frames", 1) > 1:
+                raise HTTPException(status_code=400, detail="Animated images are not supported for OCR")
             if width <= 0 or height <= 0 or (max_pixels and width * height > max_pixels):
                 raise HTTPException(status_code=413, detail=f"Image exceeds configured pixel limit of {max_pixels}")
             image.verify()

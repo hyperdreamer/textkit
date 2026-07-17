@@ -38,6 +38,16 @@ async function getBackendEndpoint(path) {
   return _backendBaseUrl + path;
 }
 
+function invalidateBackendEndpointCache() {
+  _backendBaseUrl = null;
+  _backendBaseUrlExpiry = 0;
+}
+
+async function snapshotBackendSettings() {
+  const items = await chrome.storage.sync.get({ backendHost: DEFAULT_HOST, backendPort: DEFAULT_PORT });
+  return normalizeBackendSettings(items.backendHost, items.backendPort);
+}
+
 async function getFileBridgeEndpoint(path) {
   if (!_fileBridgeBaseUrl || Date.now() > _fileBridgeBaseUrlExpiry) {
     const items = await chrome.storage.sync.get({
@@ -78,11 +88,11 @@ function normalizeSavePath(value) {
   if (!raw) throw new Error('Save path is required.');
   if (raw.length > MAX_SAVE_PATH_CHARS || raw.includes('\0')) throw new Error('Save path is invalid or too long.');
   const slashPath = raw.replace(/\\/g, '/');
-  if (slashPath.startsWith('/') || /^[A-Za-z]:\//.test(slashPath)) {
+  if (slashPath.startsWith('/') || /^[A-Za-z]:/.test(slashPath)) {
     throw new Error('Save path must be relative to the file bridge root.');
   }
   const parts = slashPath.split('/').filter((part) => part && part !== '.');
-  if (!parts.length || parts.some((part) => part === '..')) {
+  if (!parts.length || parts.some((part) => part === '..' || part.includes(':'))) {
     throw new Error('Save path must not contain traversal segments.');
   }
   return parts.join('/');
@@ -190,6 +200,7 @@ function getState(tabId) {
       retryStage: null, pendingText: '', captureInFlight: false,
       targetRemoved: false, navigationChanged: false, captureUrl: null,
       collectionComplete: false, partialReason: '', partialError: '', operationPrompts: null,
+      operationBackend: null,
       selectionToken: null, checkpointText: '', captureDocumentGeneration: 0,
       captureOperationId: null, captureDocumentId: null
     });
@@ -236,7 +247,7 @@ async function recoverScrollLocks() {
     .map((tab) => chrome.tabs.sendMessage(tab.id, { type: 'page:unlock-scroll' })));
 }
 
-recoverScrollLocks().catch(() => {});
+let startupReadiness = Promise.resolve();
 
 function notifyTargetTabChange() {
   targetTabChangeRevision += 1;
@@ -313,6 +324,7 @@ async function ensureBackendPermission() {
 chrome.commands.onCommand.addListener(async (command) => {
   if (command !== 'start-region-capture') return;
   try {
+    await startupReadiness;
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) {
       return;
@@ -348,7 +360,7 @@ chrome.commands.onCommand.addListener(async (command) => {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === 'popup:start') {
-    handlePopupStart(message).then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
+    startupReadiness.then(() => handlePopupStart(message)).then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
   }
   if (message?.type === 'popup:get-state') {
@@ -405,19 +417,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
   if (message?.type === 'popup:stop') {
-    handleStop().then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
+    startupReadiness.then(() => handleStop()).then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
   }
   if (message?.type === 'popup:retry') {
-    handleRetry().then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
+    startupReadiness.then(() => handleRetry()).then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
   }
   if (message?.type === 'translate:start') {
-    handleTranslateStart(message).then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
+    startupReadiness.then(() => handleTranslateStart(message)).then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
   }
   if (message?.type === 'translate:stop') {
-    handleTranslateStop(message.tabId)
+    startupReadiness.then(() => handleTranslateStop(message.tabId))
       .then(() => sendResponse({ ok: true }))
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
@@ -427,11 +439,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === 'format:start') {
-    handleFormatStart(message).then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
+    startupReadiness.then(() => handleFormatStart(message)).then((r) => sendResponse(r)).catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
   }
   if (message?.type === 'format:stop') {
-    handleFormatStop(message.tabId)
+    startupReadiness.then(() => handleFormatStop(message.tabId))
       .then(() => sendResponse({ ok: true }))
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
@@ -449,6 +461,10 @@ async function handlePopupStart(message = {}) {
   }
   await abortDownstreamOperations(tab.id);
   await ensureContentScript(tab.id);
+  state.operationBackend = message.backend
+    ? normalizeBackendSettings(message.backend.host, message.backend.port)
+    : await snapshotBackendSettings();
+  invalidateBackendEndpointCache();
   state.operationPrompts = message.prompts
     ? normalizeCapturePrompts(message.prompts)
     : await snapshotCapturePrompts();
@@ -516,7 +532,8 @@ async function handleStop() {
   // If in error state
   // If in error state (waiting for retry), finalize collected fragments now
   if (state.status === 'Error' && state.fragmentsCollected > 0 && state.checkpointText) {
-    await finalizePostCapture(tab.id, state.checkpointText, state.fragmentsCollected);
+    await clearRetryState(tab.id, state);
+    await finalizeCapture(tab.id, state.checkpointText, state.fragmentsCollected);
   } else {
     updateState(tab.id, { progress: 'Stopping...' });
   }
@@ -530,7 +547,8 @@ async function handleRetry() {
   if (state.retryStage === 'dedup') {
     const pendingText = state.pendingText;
     updateState(tab.id, { active: true, status: 'Deduplicating', progress: 'Retrying dedup...', error: '' });
-    await finalizePostCapture(tab.id, pendingText, state.fragmentsCollected || 0);
+    finalizePostCapture(tab.id, pendingText, state.fragmentsCollected || 0)
+      .catch((error) => handleRetryFailure(tab.id, error));
     return { ok: true };
   }
 
@@ -540,17 +558,30 @@ async function handleRetry() {
   chrome.storage.local.remove(`retryState:${tab.id}`).catch(() => {});
   if (rs.stage === 'dedup') {
     state.operationPrompts = normalizeCapturePrompts(rs.promptSnapshot);
+    state.operationBackend = rs.backendSnapshot
+      ? normalizeBackendSettings(rs.backendSnapshot.host, rs.backendSnapshot.port)
+      : await snapshotBackendSettings();
     updateState(tab.id, { active: true, status: 'Deduplicating', progress: 'Retrying dedup...', error: '' });
-    await finalizePostCapture(
+    finalizePostCapture(
       tab.id,
       rs.mergedText || mergeFragments(rs.fragments || []),
       rs.fragmentsCollected ?? (rs.fragments || []).length
-    );
+    ).catch((error) => handleRetryFailure(tab.id, error));
     return { ok: true };
   }
   updateState(tab.id, { active: true, status: 'Capturing', progress: 'Retrying...', error: '' });
-  await resumeCaptureLoop(rs);
+  resumeCaptureLoop(rs).catch((error) => handleCaptureLoopFailure(tab.id, error, 'Capture retry failed:'));
   return { ok: true };
+}
+
+function handleRetryFailure(tabId, error) {
+  console.error('Retry failed:', error);
+  updateState(tabId, {
+    active: true,
+    status: 'Error',
+    error: error.message || 'Retry failed.',
+    progress: 'Retry failed. Click Retry to continue.'
+  });
 }
 
 // ── manual translation (delegated to background so it survives popup close) ─
@@ -693,6 +724,7 @@ async function handleTranslateStart(msg) {
       await chrome.storage.local.remove(`tl2Result:${tabId}`);
       chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: true }).catch(() => {});
     });
+    msg.recoveryStarted?.();
 
     try {
       const customPrompt = renderTranslationPrompt(promptSnapshot, language);
@@ -704,9 +736,13 @@ async function handleTranslateStart(msg) {
             await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
             await clearOperation('translate', tabId, operationId);
             chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
-            if (translated) autoCopyIfEnabled(translated);
-            if (translated) autoSaveIfEnabled(translated);
-            if (translated) autoFormatIfEnabled(tabId, translated, host, port);
+            if (translated) {
+              await Promise.allSettled([
+                autoCopyIfEnabled(translated),
+                autoSaveIfEnabled(translated),
+                autoFormatIfEnabled(tabId, translated, host, port)
+              ]);
+            }
           }
         );
         if (!committed) return { ok: false, error: 'Translation superseded.' };
@@ -728,11 +764,13 @@ async function handleTranslateStart(msg) {
           await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
           await clearOperation('translate', tabId, operationId);
           chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
-          // Auto-copy / auto-save translated text
-          if (translated) autoCopyIfEnabled(translated);
-          if (translated) autoSaveIfEnabled(translated);
-          // Auto-format: trigger from background so it survives popup close
-          if (translated) autoFormatIfEnabled(tabId, translated, host, port);
+          if (translated) {
+            await Promise.allSettled([
+              autoCopyIfEnabled(translated),
+              autoSaveIfEnabled(translated),
+              autoFormatIfEnabled(tabId, translated, host, port)
+            ]);
+          }
         }
       );
       if (!committed) return { ok: false, error: 'Translation superseded.' };
@@ -868,6 +906,7 @@ async function handleFormatStart(msg) {
       await chrome.storage.local.remove(`fmtResult:${tabId}`);
       chrome.runtime.sendMessage({ type: 'fmt:formatting', tabId, value: true }).catch(() => {});
     });
+    msg.recoveryStarted?.();
 
     try {
       const url = buildBackendEndpoint(host || DEFAULT_HOST, port || DEFAULT_PORT, `/format?_=${Date.now()}`);
@@ -886,9 +925,12 @@ async function handleFormatStart(msg) {
           await chrome.storage.local.set({ [`fmtResult:${tabId}`]: formatted });
           await clearOperation('format', tabId, operationId);
           chrome.runtime.sendMessage({ type: 'format:update', tabId, text: formatted }).catch(() => {});
-          // Auto-copy / auto-save formatted text (background-side, survives popup close)
-          if (formatted) fmtAutoCopyIfEnabled(formatted);
-          if (formatted) fmtAutoSaveIfEnabled(formatted);
+          if (formatted) {
+            await Promise.allSettled([
+              fmtAutoCopyIfEnabled(formatted),
+              fmtAutoSaveIfEnabled(formatted)
+            ]);
+          }
         }
       );
       if (!committed) return { ok: false, error: 'Formatting superseded.' };
@@ -967,8 +1009,7 @@ async function autoFormatIfEnabled(tabId, text, host, port, source = 'translatio
     host = backend.backendHost;
     port = backend.backendPort;
   }
-  handleFormatStart({ tabId, text, prompt: prompt.formatPrompt, host, port })
-    .catch(() => {});
+  return handleFormatStart({ tabId, text, prompt: prompt.formatPrompt, host, port });
 }
 
 async function getActiveTab() {
@@ -996,6 +1037,7 @@ async function runCaptureLoop(tab, region) {
   if (!tab?.id) throw new Error('Missing tab id.');
   const tabId = tab.id;
   const promptSnapshot = getState(tabId).operationPrompts || await snapshotCapturePrompts();
+  const backendSnapshot = getState(tabId).operationBackend || await snapshotBackendSettings();
   const normalizedRegion = normalizeRegion(region);
   if (normalizedRegion.width < 2 || normalizedRegion.height < 2) {
     throw new Error('Selected region is too small.');
@@ -1009,7 +1051,8 @@ async function runCaptureLoop(tab, region) {
     resetBeforeStart: true,
     refreshAutoscroll: false,
     captureUrl: tab.url || null,
-    promptSnapshot
+    promptSnapshot,
+    backendSnapshot
   });
 }
 
@@ -1026,6 +1069,7 @@ async function resumeCaptureLoop(rs) {
     refreshAutoscroll: true,
     captureUrl: rs.captureUrl || null,
     promptSnapshot: rs.promptSnapshot || getState(tabId).operationPrompts || await snapshotCapturePrompts(),
+    backendSnapshot: rs.backendSnapshot || getState(tabId).operationBackend || await snapshotBackendSettings(),
     operationId: rs.operationId,
     captureDocumentId: rs.captureDocumentId || null
   });
@@ -1041,6 +1085,7 @@ async function executeCaptureLoop({
   refreshAutoscroll,
   captureUrl,
   promptSnapshot,
+  backendSnapshot,
   operationId: recoveredOperationId,
   captureDocumentId: recoveredDocumentId = null
 }) {
@@ -1062,12 +1107,17 @@ async function executeCaptureLoop({
   let fixedAutoscroll;
   let completed = false;
   try {
+    backendSnapshot = backendSnapshot || state.operationBackend || await snapshotBackendSettings();
     if (resetBeforeStart) {
       resetState(tabId);
       state.operationPrompts = normalizeCapturePrompts(promptSnapshot);
+      state.operationBackend = normalizeBackendSettings(backendSnapshot.host, backendSnapshot.port);
       updateState(tabId, { active: true, status: 'Capturing', progress: 'Starting capture loop.' });
     } else if (!state.operationPrompts) {
       state.operationPrompts = normalizeCapturePrompts(promptSnapshot);
+    }
+    if (!state.operationBackend) {
+      state.operationBackend = normalizeBackendSettings(backendSnapshot.host, backendSnapshot.port);
     }
 
     const initialTab = await getLiveTargetTab(tabId);
@@ -1094,6 +1144,7 @@ async function executeCaptureLoop({
         captureUrl: state.captureUrl,
         captureDocumentId: state.captureDocumentId,
         promptSnapshot: state.operationPrompts,
+        ...(state.operationBackend ? { backendSnapshot: state.operationBackend } : {}),
         stage
       };
       await persistOperation('capture', tabId, operationId, input);
@@ -1163,7 +1214,8 @@ async function executeCaptureLoop({
             pageNumber,
             controller.signal,
             state.operationPrompts?.ocr,
-            operationId
+            operationId,
+            state.operationBackend
           );
           accumulator.append(text);
           fragmentCount += 1;
@@ -1442,6 +1494,7 @@ async function finalizePostCapture(tabId, mergedText, fragmentsOrCount) {
     mergedText,
     fragmentsCollected: fragmentCount,
     promptSnapshot: state.operationPrompts,
+    ...(state.operationBackend ? { backendSnapshot: state.operationBackend } : {}),
     operationId: state.captureOperationId,
     ...(state.captureUrl ? { captureUrl: state.captureUrl } : {})
   };
@@ -1452,17 +1505,24 @@ async function finalizePostCapture(tabId, mergedText, fragmentsOrCount) {
       mergedText,
       fragmentsCollected: fragmentCount,
       promptSnapshot: state.operationPrompts,
+      ...(state.operationBackend ? { backendSnapshot: state.operationBackend } : {}),
       captureUrl: state.captureUrl
     });
   }
   let finalText;
   for (let attempt = 1; ; attempt++) {
+    if (state.stopRequested) {
+      await clearRetryState(tabId, state);
+      finalText = null;
+      break;
+    }
     try {
       finalText = await postTextForDedup(
         mergedText,
         signal,
         state.operationPrompts?.dedup,
-        state.captureOperationId
+        state.captureOperationId,
+        state.operationBackend
       );
       await clearRetryState(tabId, state);
       break;
@@ -1619,7 +1679,7 @@ async function cropVisibleCapture(dataUrl, region) {
 
 // ── OCR call ───────────────────────────────────────────────────
 
-async function postImageForOcr(blob, pageNumber, signal, customPrompt, operationId = '') {
+async function postImageForOcr(blob, pageNumber, signal, customPrompt, operationId = '', backendSnapshot = null) {
   if (arguments.length < 4) {
     const stored = await chrome.storage.local.get('ocrPrompt');
     customPrompt = normalizeCustomPrompt(stored.ocrPrompt);
@@ -1628,7 +1688,9 @@ async function postImageForOcr(blob, pageNumber, signal, customPrompt, operation
   formData.append('image', blob, `page-${String(pageNumber).padStart(4, '0')}.png`);
   if (customPrompt) formData.append('prompt', customPrompt);
 
-  const url = await getBackendEndpoint('/ocr');
+  const url = backendSnapshot
+    ? buildBackendEndpoint(backendSnapshot.host, backendSnapshot.port, '/ocr')
+    : await getBackendEndpoint('/ocr');
   const response = await fetchWithTimeout(url, {
     method: 'POST',
     headers: await getBackendHeaders(undefined, operationId ? `${operationId}:page:${pageNumber}` : ''),
@@ -1647,12 +1709,14 @@ async function postImageForOcr(blob, pageNumber, signal, customPrompt, operation
   return (await response.text()).trim();
 }
 
-async function postTextForDedup(text, signal, customPrompt, operationId = '') {
+async function postTextForDedup(text, signal, customPrompt, operationId = '', backendSnapshot = null) {
   if (arguments.length < 3) {
     const stored = await chrome.storage.local.get('dedupPrompt');
     customPrompt = normalizeCustomPrompt(stored.dedupPrompt);
   }
-  const url = await getBackendEndpoint('/dedup');
+  const url = backendSnapshot
+    ? buildBackendEndpoint(backendSnapshot.host, backendSnapshot.port, '/dedup')
+    : await getBackendEndpoint('/dedup');
 
   const body = { text };
   if (customPrompt) body.prompt = customPrompt;
@@ -1813,6 +1877,7 @@ function resetState(tabId) {
     partialReason: '',
     partialError: '',
     operationPrompts: null,
+    operationBackend: null,
     selectionToken: null,
     checkpointText: '',
     captureDocumentGeneration: 0,
@@ -1828,9 +1893,7 @@ function resetState(tabId) {
     `tl2Result:${tabId}`,
     `tl2Status:${tabId}`,
     `fmtResult:${tabId}`,
-    `fmtStatus:${tabId}`,
-    `preDedup:${tabId}`,
-    `postDedup:${tabId}`
+    `fmtStatus:${tabId}`
   ]).catch(() => {});
 }
 
@@ -1914,8 +1977,7 @@ function getPublicState(state) {
     lastRegion: state.lastRegion,
     retryStage: state.retryStage,
     retryState: state.retryState ? { stage: state.retryState.stage } : null,
-    partialReason: state.partialReason,
-    tl2Translating: state.tl2Translating
+    partialReason: state.partialReason
   };
 }
 
@@ -2046,29 +2108,67 @@ async function clearRetryState(tabId, state = getState(tabId)) {
   await chrome.storage.local.remove(`retryState:${tabId}`);
 }
 
+async function removeScannedOperationIfCurrent(key, scannedOperation) {
+  await serializeQueuedOperation(operationCheckpointQueues, key, async () => {
+    const stored = await chrome.storage.local.get(key);
+    if (JSON.stringify(stored[key]) === JSON.stringify(scannedOperation)) {
+      await chrome.storage.local.remove(key);
+    }
+  });
+}
+
+async function rereadRecoveryCheckpoint(key, scannedOperation) {
+  const stored = await chrome.storage.local.get(key);
+  const current = stored[key];
+  if (!current || current.status !== 'running') return null;
+  if (current.operationId !== scannedOperation.operationId
+      || current.updatedAt !== scannedOperation.updatedAt) return null;
+  return current;
+}
+
+async function waitForRecoveryHandoff(startOperation) {
+  let signalStarted;
+  const started = new Promise((resolve) => { signalStarted = resolve; });
+  const operation = startOperation(signalStarted);
+  await Promise.race([started, operation]);
+  return { operation };
+}
+
 async function recoverPersistedOperations() {
   const stored = await chrome.storage.local.get(null);
   const operations = Object.entries(stored)
     .filter(([key, value]) => key.startsWith('operation:') && value?.status === 'running');
-  for (const [key, operation] of operations) {
+  for (let [key, operation] of operations) {
     if (operation.version !== OPERATION_SCHEMA_VERSION
         || !Number.isInteger(operation.tabId)
         || typeof operation.operationId !== 'string'
         || !operation.input || typeof operation.input !== 'object') {
-      await chrome.storage.local.remove(key);
+      await removeScannedOperationIfCurrent(key, operation);
       continue;
     }
     const tab = await getLiveTargetTab(operation.tabId);
     if (!tab) {
-      await chrome.storage.local.remove(key);
+      await removeScannedOperationIfCurrent(key, operation);
       continue;
     }
+    operation = await rereadRecoveryCheckpoint(key, operation);
+    if (!operation) continue;
     if (operation.type === 'translate' && !translateControllers.has(operation.tabId)) {
-      handleTranslateStart({ ...operation.input, tabId: operation.tabId, operationId: operation.operationId })
-        .catch((error) => console.error('Translation recovery failed:', error));
+      const { operation: recovered } = await waitForRecoveryHandoff((recoveryStarted) => handleTranslateStart({
+        ...operation.input,
+        tabId: operation.tabId,
+        operationId: operation.operationId,
+        recoveryStarted
+      }));
+      recovered.catch((error) => console.error('Translation recovery failed:', error));
     } else if (operation.type === 'format' && !formatControllers.has(operation.tabId)) {
-      handleFormatStart({ ...operation.input, tabId: operation.tabId, operationId: operation.operationId })
-        .catch((error) => console.error('Format recovery failed:', error));
+      const { operation: recovered } = await waitForRecoveryHandoff((recoveryStarted) => handleFormatStart({
+        ...operation.input,
+        tabId: operation.tabId,
+        operationId: operation.operationId,
+        recoveryStarted
+      }));
+      recovered.catch((error) => console.error('Format recovery failed:', error));
     } else if (operation.type === 'capture' && !captureControllers.has(operation.tabId)) {
       const input = operation.input;
       const state = getState(operation.tabId);
@@ -2079,6 +2179,9 @@ async function recoverPersistedOperations() {
         checkpointText: input.mergedText || '',
         fragmentsCollected: input.fragmentsCollected || 0,
         operationPrompts: normalizeCapturePrompts(input.promptSnapshot),
+        operationBackend: input.backendSnapshot
+          ? normalizeBackendSettings(input.backendSnapshot.host, input.backendSnapshot.port)
+          : await snapshotBackendSettings(),
         captureUrl: input.captureUrl || tab.url || null,
         captureOperationId: operation.operationId,
         captureDocumentId: input.captureDocumentId || null
@@ -2109,4 +2212,15 @@ async function recoverPersistedOperations() {
   }
 }
 
-recoverPersistedOperations().catch((error) => console.error('Operation recovery scan failed:', error));
+startupReadiness = (async () => {
+  try {
+    await recoverScrollLocks();
+  } catch (error) {
+    console.error('Stale scroll-lock cleanup failed:', error);
+  }
+  try {
+    await recoverPersistedOperations();
+  } catch (error) {
+    console.error('Operation recovery scan failed:', error);
+  }
+})();

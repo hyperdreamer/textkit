@@ -51,10 +51,6 @@
       sendResponse({ ok: true, documentId });
       return false;
     }
-    if (message?.type === 'get-viewport') {
-      sendResponse({ width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio || 1, documentId });
-      return false;
-    }
     if (message?.type === 'page:get-document-id') {
       sendResponse({ ok: true, documentId });
       return false;

@@ -261,6 +261,18 @@ def test_zero_image_pixel_limit_disables_check() -> None:
     ).startswith("data:image/png;base64,")
 
 
+def test_animated_images_are_rejected_for_ocr() -> None:
+    buffer = BytesIO()
+    frames = [Image.new("RGB", (2, 2), color=color) for color in ("white", "black")]
+    frames[0].save(buffer, format="GIF", save_all=True, append_images=frames[1:], loop=0)
+
+    with pytest.raises(main.HTTPException) as exc_info:
+        main._image_to_data_url(buffer.getvalue(), "image/gif")
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Animated images are not supported for OCR"
+
+
 @pytest.mark.asyncio
 async def test_zero_upload_limit_reads_entire_upload() -> None:
     upload = main.UploadFile(file=BytesIO(b"complete upload"), filename="test.txt")

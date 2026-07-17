@@ -328,6 +328,80 @@ test('unedited server default in textarea is not sent as custom prompt', async (
   assert.equal(Object.hasOwn(starts.at(-1).prompts, 'dedup'), false);
 });
 
+test('capture start persists and sends one normalized backend snapshot', async () => {
+  const harness = createPopupHarness();
+  harness.elements.get('backend-host').value = 'HTTP://LOCALHOST';
+  harness.elements.get('backend-port').value = '9876';
+  harness.elements.get('ocr-autoscroll').checked = true;
+  harness.elements.get('ocr-capture-interval').value = '250';
+
+  await harness.context.startCapture();
+
+  const start = harness.runtimeMessages.find((message) => message.type === 'popup:start');
+  assert.deepEqual({ ...start.backend }, { host: 'localhost', port: 9876 });
+  assert.equal(harness.syncData.backendHost, 'localhost');
+  assert.equal(harness.syncData.backendPort, 9876);
+  assert.equal(harness.syncData.captureIntervalMs, 250);
+});
+
+test('popup restores persisted OCR status before rendering Idle state', async () => {
+  const harness = createPopupHarness({
+    localData: { 'lastResult:1': 'restored result', 'lastStatus:1': 'Done' },
+    runtimeSendMessage: async (message) => message.type === 'popup:get-state'
+      ? { ok: true, tabId: 1, state: { status: 'Idle', active: false, progress: 'Ready' } }
+      : { ok: true },
+    fetch: async () => ({ ok: false, status: 503 })
+  });
+
+  await harness.context.init();
+
+  assert.equal(harness.elements.get('status').textContent, 'Done');
+  assert.equal(harness.elements.get('result').value, 'restored result');
+});
+
+test('successful host permission refreshes fallback previews', async () => {
+  let fetchCalls = 0;
+  let granted = false;
+  const harness = createPopupHarness({
+    permissionContains: async () => granted,
+    permissionRequest: async () => { granted = true; return true; },
+    fetch: async () => {
+      fetchCalls += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ template: 'Granted preview', source: 'file', version: 'v1' })
+      };
+    }
+  });
+
+  assert.equal(await harness.context.ensureHostPermission('localhost'), true);
+  await waitFor(() => fetchCalls === 4, 'fallback previews were not refreshed after permission grant');
+});
+
+test('failed translation and format Stop responses preserve running UI', async () => {
+  const harness = createPopupHarness({
+    runtimeSendMessage: async (message) => {
+      if (message.type === 'translate:stop') return { ok: false, error: 'translation stop rejected' };
+      if (message.type === 'format:stop') return { ok: false, error: 'format stop rejected' };
+      return { ok: true };
+    }
+  });
+  vm.runInContext('currentTabId = 1', harness.context);
+  harness.elements.get('tl2-translate').textContent = 'Stop';
+  harness.elements.get('fmt-format').textContent = 'Stop';
+
+  assert.equal(await harness.context.stopTranslation(), false);
+  assert.equal(await harness.context.stopFormat(), false);
+
+  assert.equal(harness.elements.get('tl2-translate').textContent, 'Stop');
+  assert.ok(harness.elements.get('tl2-translate').classList.contains('danger'));
+  assert.match(harness.elements.get('tl2-status-text').textContent, /translation stop rejected/);
+  assert.equal(harness.elements.get('fmt-format').textContent, 'Stop');
+  assert.ok(harness.elements.get('fmt-format').classList.contains('danger'));
+  assert.match(harness.elements.get('fmt-status-text').textContent, /format stop rejected/);
+});
+
 test('persisted prompt overrides survive fallback refresh and are sent as custom', async () => {
   const harness = createPopupHarness({
     localData: { ocrPrompt: 'Persisted OCR override' },
@@ -474,6 +548,20 @@ test('blank file bridge host uses localhost with its configured port', async () 
   await harness.context.fetchPathSuggestions('');
 
   assert.equal(requestedUrl, 'http://localhost:9777/paths?prefix=');
+});
+
+test('path suggestions reject drive-relative, UNC, device, and colon paths', () => {
+  const harness = createPopupHarness();
+  for (const unsafe of [
+    'C:relative.txt',
+    'C:/absolute.txt',
+    '//server/share/file.txt',
+    '\\\\?\\C:\\device.txt',
+    'notes/name:stream.txt'
+  ]) {
+    assert.equal(harness.context.isSafeRelativePath(unsafe), false, unsafe);
+  }
+  assert.equal(harness.context.isSafeRelativePath('notes/safe.txt'), true);
 });
 
 test('slow path response cannot overwrite newer suggestions', async () => {

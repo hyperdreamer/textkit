@@ -202,6 +202,13 @@ async function refreshFallback(config, { force = false } = {}) {
     : '';
   const headers = cached?.version ? { 'If-None-Match': `"${cached.version}"` } : {};
   const request = (async () => {
+    if (chrome.permissions?.contains) {
+      const permitted = await chrome.permissions.contains({ origins: [`http://${backend.host}/*`] });
+      if (!permitted) {
+        progressEl.textContent = 'Prompt previews need backend permission; start a capture or save backend settings to grant it.';
+        return;
+      }
+    }
     const ctrl = new AbortController();
     const timeoutId = setTimeout(() => ctrl.abort(), 3000);
     try {
@@ -210,7 +217,10 @@ async function refreshFallback(config, { force = false } = {}) {
         { headers, signal: ctrl.signal }
       );
       if (response.status === 304) return;
-      if (!response.ok) return;
+      if (!response.ok) {
+        progressEl.textContent = `Prompt preview backend is unavailable (HTTP ${response.status}).`;
+        return;
+      }
       const data = await response.json();
       if (!data || typeof data.template !== 'string' || !data.version) return;
       const liveBackend = normalizeBackendSettings(hostInput.value, portInput.value);
@@ -220,11 +230,16 @@ async function refreshFallback(config, { force = false } = {}) {
       if (_fallbackRequests.get(`${identity}:generation`) !== generation) return;
       _fallbackData.set(identity, data);
       updatePromptUi(config);
+      if (progressEl.textContent.startsWith('Prompt preview')) progressEl.textContent = 'Ready';
     } finally {
       clearTimeout(timeoutId);
       if (_fallbackRequests.get(identity) === request) _fallbackRequests.delete(identity);
     }
-  })().catch(() => {});
+  })().catch((error) => {
+    progressEl.textContent = error?.name === 'AbortError'
+      ? 'Prompt preview backend timed out.'
+      : 'Prompt preview backend is unavailable.';
+  });
   _fallbackRequests.set(identity, request);
   return request;
 }
@@ -450,20 +465,15 @@ async function init() {
   captureIntervalInput.value = items.captureIntervalMs;
 
   const resultKey = currentTabId ? `lastResult:${currentTabId}` : null;
-  // Get live state first so renderState has the right mergedText
-  await refreshState();
-  // Always restore from storage if textarea is empty — survives popup close + SW restart
-  if (!resultEl.value.trim() && resultKey) {
-    const stored = await chrome.storage.local.get(resultKey);
-    if (stored[resultKey]) resultEl.value = stored[resultKey];
-  }
-
-  // Load last persisted status for status bar
   const statusKey = currentTabId ? `lastStatus:${currentTabId}` : null;
-  if (statusKey) {
-    const { [statusKey]: storedStatus } = await chrome.storage.local.get(statusKey);
-    if (storedStatus) lastStoredStatus = storedStatus;
+  if (resultKey && statusKey) {
+    const stored = await chrome.storage.local.get([resultKey, statusKey]);
+    if (stored[resultKey]) resultEl.value = stored[resultKey];
+    if (stored[statusKey]) lastStoredStatus = stored[statusKey];
   }
+  // Render only after the persisted result/status are available, so a reopened
+  // popup cannot briefly pair a restored result with an Idle status.
+  await refreshState();
 
   // Load translate language (set value so translatePrompt key is correct)
   const tl = await chrome.storage.local.get('tlLanguage');
@@ -730,10 +740,15 @@ async function saveFileBridgeSettings() {
 }
 
 async function ensureHostPermission(host) {
-  if (!chrome.permissions?.contains || !chrome.permissions?.request) return true;
+  if (!chrome.permissions?.contains || !chrome.permissions?.request) {
+    refreshAllFallbacks({ force: true }).catch(() => {});
+    return true;
+  }
   const origins = [`http://${host}/*`];
-  if (await chrome.permissions.contains({ origins })) return true;
-  return chrome.permissions.request({ origins });
+  const granted = await chrome.permissions.contains({ origins })
+    || await chrome.permissions.request({ origins });
+  if (granted) refreshAllFallbacks({ force: true }).catch(() => {});
+  return granted;
 }
 
 async function ensureFileBridgePermission() {
@@ -799,6 +814,17 @@ async function startCapture() {
   try {
     backend = normalizeBackendSettings(hostInput.value, portInput.value);
     if (!await ensureHostPermission(backend.host)) throw new Error('Backend permission was not granted.');
+    const intervalVal = parseInt(captureIntervalInput.value, 10);
+    const captureIntervalMs = (Number.isFinite(intervalVal) && intervalVal >= 50 && intervalVal <= 2000)
+      ? intervalVal : 100;
+    await chrome.storage.sync.set({
+      backendHost: backend.host,
+      backendPort: backend.port,
+      ocrAutoscroll: autoscrollCheckbox.checked,
+      captureIntervalMs
+    });
+    hostInput.value = backend.host;
+    portInput.value = backend.port;
   } catch (error) {
     progressEl.textContent = error.message;
     return;
@@ -823,6 +849,7 @@ async function startCapture() {
     if (dedupState.hasPersistedOverride && dedupPromptEl.value.trim()) prompts.dedup = dedupPromptEl.value;
     const response = await chrome.runtime.sendMessage({
       type: 'popup:start',
+      backend,
       ...(Object.keys(prompts).length ? { prompts } : {})
     });
     if (!response?.ok) {
@@ -838,7 +865,8 @@ async function startCapture() {
 async function stopCapture() {
   stopButton.disabled = true;
   try {
-    await chrome.runtime.sendMessage({ type: 'popup:stop' });
+    const response = await chrome.runtime.sendMessage({ type: 'popup:stop' });
+    if (!response?.ok) throw new Error(response?.error || 'Unable to stop capture.');
   } catch (e) {
     progressEl.textContent = e.message || 'Unable to stop capture.';
     stopButton.disabled = false;
@@ -872,7 +900,7 @@ function renderState(state) {
   fragmentsEl.textContent = String(latestState.fragmentsCollected || 0);
   shortProgressEl.textContent = latestState.progress || 'Ready';
   progressEl.textContent = latestState.error || latestState.progress || 'Ready';
-  if (!userEditedResult) resultEl.value = mergedText;
+  if (!userEditedResult && (mergedText || latestState.status !== 'Idle')) resultEl.value = mergedText;
 
   // Clear translation result when a new capture starts
   if (latestState.status === 'Selecting') {
@@ -903,13 +931,6 @@ function renderState(state) {
 
   updateTranslationButtons();
 
-  // Handle auto-translate state from background
-  if (latestState.tl2Translating) {
-    tl2Translate.textContent = 'Stop';
-    tl2Translate.classList.add('danger');
-    tl2Copy.disabled = tl2Save.disabled = tl2Download.disabled = true;
-    setTl2Progress('Translating...');
-  }
 }
 
 async function copyOcrText() {
@@ -927,7 +948,7 @@ function downloadOcrText() {
 async function doTranslation() {
   // Button shows "Stop" — abort the background translation
   if (tl2Translate.textContent === 'Stop') {
-    stopTranslation();
+    await stopTranslation();
     return;
   }
 
@@ -984,14 +1005,26 @@ async function doTranslation() {
   });
 }
 
-function stopTranslation() {
-  if (!currentTabId) return;
-  chrome.runtime.sendMessage({ type: 'translate:stop', tabId: currentTabId }).catch(() => {});
-  tl2Translate.textContent = 'Translate';
-  tl2Translate.classList.remove('danger');
-  if (currentTabId) chrome.storage.local.remove(`tl2Translating:${currentTabId}`);
-  updateTranslationButtons();
-  setTl2Progress('Translation stopped.');
+async function stopTranslation() {
+  if (!currentTabId) return false;
+  tl2Translate.disabled = true;
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'translate:stop', tabId: currentTabId });
+    if (!response?.ok) throw new Error(response?.error || 'Unable to stop translation.');
+    tl2Translate.textContent = 'Translate';
+    tl2Translate.classList.remove('danger');
+    await chrome.storage.local.remove(`tl2Translating:${currentTabId}`);
+    updateTranslationButtons();
+    setTl2Progress('Translation stopped.');
+    return true;
+  } catch (error) {
+    tl2Translate.textContent = 'Stop';
+    tl2Translate.classList.add('danger');
+    setTl2Progress(`Stop failed: ${error.message || 'translation is still running.'}`);
+    return false;
+  } finally {
+    tl2Translate.disabled = false;
+  }
 }
 
 async function copyResult(textarea, button, setProgress = () => {}) {
@@ -1034,7 +1067,7 @@ function updateTranslationButtons() {
 async function doFormat() {
   // Button shows "Stop" — abort the background formatting
   if (fmtFormat.textContent === 'Stop') {
-    stopFormat();
+    await stopFormat();
     return;
   }
 
@@ -1082,14 +1115,26 @@ async function doFormat() {
   });
 }
 
-function stopFormat() {
-  if (!currentTabId) return;
-  chrome.runtime.sendMessage({ type: 'format:stop', tabId: currentTabId }).catch(() => {});
-  fmtFormat.textContent = 'Format';
-  fmtFormat.classList.remove('danger');
-  if (currentTabId) chrome.storage.local.remove(`fmtFormatting:${currentTabId}`);
-  updateFormatButtons();
-  setFmtProgress('Formatting stopped.');
+async function stopFormat() {
+  if (!currentTabId) return false;
+  fmtFormat.disabled = true;
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'format:stop', tabId: currentTabId });
+    if (!response?.ok) throw new Error(response?.error || 'Unable to stop formatting.');
+    fmtFormat.textContent = 'Format';
+    fmtFormat.classList.remove('danger');
+    await chrome.storage.local.remove(`fmtFormatting:${currentTabId}`);
+    updateFormatButtons();
+    setFmtProgress('Formatting stopped.');
+    return true;
+  } catch (error) {
+    fmtFormat.textContent = 'Stop';
+    fmtFormat.classList.add('danger');
+    setFmtProgress(`Stop failed: ${error.message || 'formatting is still running.'}`);
+    return false;
+  } finally {
+    fmtFormat.disabled = false;
+  }
 }
 
 function setFmtProgress(text) {
@@ -1362,8 +1407,8 @@ async function fetchPathSuggestions(prefix, generation = ++_pathSuggestionGenera
 function isSafeRelativePath(value) {
   const path = String(value || '');
   if (!path || path.length > 1024 || path.includes('\0') || path.includes('\\')) return false;
-  if (path.startsWith('/') || /^[A-Za-z]:\//.test(path)) return false;
-  return !path.split('/').some((part) => part === '..');
+  if (path.startsWith('/') || /^[A-Za-z]:/.test(path)) return false;
+  return !path.split('/').some((part) => part === '..' || part.includes(':'));
 }
 
 function normalizePathPrefix(value) {
