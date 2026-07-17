@@ -80,7 +80,7 @@ function createElement(id = '') {
 function createPopupHarness(options = {}) {
   const elements = new Map();
   const localData = { ...(options.localData || {}) };
-  const syncData = { ...(options.syncData || {}) };
+  const syncData = { fileBridgeToken: 'bridge-secret', ...(options.syncData || {}) };
   let timerId = 0;
   const timers = new Map();
 

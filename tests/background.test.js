@@ -747,11 +747,14 @@ test('a non-OCR capture failure finalizes fragments already collected', async ()
   const harness = createBackgroundHarness();
   const state = harness.context.getState(1);
   state.fragments = ['first fragment', 'second fragment'];
+  state.active = true;
+  state.status = 'Selecting';
+  state.selectionToken = 'selection-token';
   vm.runInContext("runCaptureLoop = async () => { throw new Error('scroll failed'); };", harness.context);
 
   let response;
   harness.events.runtimeMessage.emit(
-    { type: 'selection:complete', region: REGION },
+    { type: 'selection:complete', region: REGION, selectionToken: 'selection-token' },
     { tab: { id: 1, windowId: 10, active: true } },
     (value) => { response = value; }
   );
@@ -809,7 +812,7 @@ test('manual translation substitutes every language placeholder in a custom prom
     },
     fetch: async (_url, options) => {
       requestBody = JSON.parse(options.body);
-      return { ok: true, json: async () => ({ text: 'bonjour' }) };
+      return { ok: true, text: async () => JSON.stringify({ text: 'bonjour' }) };
     }
   });
 
@@ -823,6 +826,98 @@ test('manual translation substitutes every language placeholder in a custom prom
 
   assert.equal(result.ok, true);
   assert.equal(requestBody.prompt, 'Translate to French. Answer only in French.');
+});
+
+test('manual translation rejects invalid JSON instead of storing an empty success', async () => {
+  const harness = createBackgroundHarness({
+    fetch: async () => ({ ok: true, text: async () => '<html>proxy error</html>' })
+  });
+
+  const result = await harness.context.handleTranslateStart({
+    tabId: 1,
+    text: 'hello',
+    language: 'French',
+    host: 'localhost',
+    port: 8765
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /invalid JSON/);
+  assert.equal(Object.hasOwn(harness.localData, 'tl2Result:1'), false);
+});
+
+test('file bridge saves require safe paths, authentication, and explicit success', async () => {
+  let fetchCalls = 0;
+  let requestHeaders;
+  const harness = createBackgroundHarness({
+    syncValues: { fileBridgeToken: 'bridge-secret' },
+    fetch: async (_url, options) => {
+      fetchCalls += 1;
+      requestHeaders = options.headers;
+      return { ok: true, text: async () => JSON.stringify({ success: true, path: '/ignored' }) };
+    }
+  });
+
+  const traversal = await harness.context.handleSaveTranslation({ text: 'hello', path: '../escape.txt' });
+  const saved = await harness.context.handleSaveTranslation({ text: 'hello', path: 'notes//today.txt' });
+
+  assert.equal(traversal.ok, false);
+  assert.equal(fetchCalls, 1);
+  assert.equal(requestHeaders['X-TextKit-Bridge-Token'], 'bridge-secret');
+  assert.equal(saved.ok, true);
+  assert.equal(saved.path, 'notes/today.txt');
+});
+
+test('file bridge empty or implicit-success responses are rejected', async () => {
+  let responseBody = '';
+  const harness = createBackgroundHarness({
+    syncValues: { fileBridgeToken: 'bridge-secret' },
+    fetch: async () => ({ ok: true, text: async () => responseBody })
+  });
+
+  const empty = await harness.context.handleSaveTranslation({ text: 'hello', path: 'notes.txt' });
+  responseBody = JSON.stringify({ path: 'notes.txt' });
+  const implicit = await harness.context.handleSaveTranslation({ text: 'hello', path: 'notes.txt' });
+
+  assert.equal(empty.ok, false);
+  assert.match(empty.error, /empty response/);
+  assert.equal(implicit.ok, false);
+});
+
+test('scroll response errors are not treated as reaching the bottom', () => {
+  const harness = createBackgroundHarness();
+
+  assert.throws(
+    () => harness.context.requireScrollResponse({ changed: false, error: 'scroll blocked' }),
+    /Page scroll failed: scroll blocked/
+  );
+});
+
+test('stale selection completion tokens are rejected', () => {
+  const harness = createBackgroundHarness();
+  const state = harness.context.getState(1);
+  state.active = true;
+  state.status = 'Selecting';
+  state.selectionToken = 'expected';
+  let response;
+
+  harness.events.runtimeMessage.emit(
+    { type: 'selection:complete', region: REGION, selectionToken: 'forged' },
+    { tab: { id: 1 } },
+    (value) => { response = value; }
+  );
+
+  assert.equal(response.ok, false);
+  assert.equal(state.status, 'Selecting');
+});
+
+test('offscreen creation failures are surfaced', async () => {
+  const harness = createBackgroundHarness();
+  harness.context.chrome.offscreen.createDocument = async () => {
+    throw new Error('offscreen unavailable');
+  };
+
+  await assert.rejects(harness.context.copyToClipboard('text'), /offscreen unavailable/);
 });
 
 test('auto-copy waits for offscreen confirmation before showing success', async () => {
@@ -903,7 +998,7 @@ test('manual format reads the stored prompt once when the operation starts', asy
   });
   await waitFor(() => requestBody, 'format request did not start');
   await harness.context.chrome.storage.local.set({ formatPrompt: 'Edited later' });
-  response.resolve({ ok: true, json: async () => ({ text: 'HELLO' }) });
+  response.resolve({ ok: true, text: async () => JSON.stringify({ text: 'HELLO' }) });
 
   const result = await operation;
   assert.equal(result.ok, true);

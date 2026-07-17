@@ -7,6 +7,7 @@ const AFTER_SEND_DELAY_MS = 0;
 const DEFAULT_CAPTURE_INTERVAL_MS = 100;
 const BACKEND_TIMEOUT_MS = 12 * 60 * 1000;
 const MAX_CAPTURE_PAGES = 500;
+const MAX_SAVE_PATH_CHARS = 1024;
 const LOCAL_BACKEND_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 
 let _backendBaseUrl = null;
@@ -50,6 +51,60 @@ async function getFileBridgeEndpoint(path) {
   return _fileBridgeBaseUrl + path;
 }
 
+async function getBackendHeaders(contentType) {
+  const { backendToken } = await chrome.storage.sync.get({ backendToken: '' });
+  const headers = {};
+  if (contentType) headers['Content-Type'] = contentType;
+  if (String(backendToken || '').trim()) headers['X-TextKit-Token'] = String(backendToken).trim();
+  return headers;
+}
+
+async function getFileBridgeHeaders(contentType = 'application/json') {
+  const { fileBridgeToken } = await chrome.storage.sync.get({ fileBridgeToken: '' });
+  const token = String(fileBridgeToken || '').trim();
+  if (!token) throw new Error('File bridge token is required. Configure it in Settings.');
+  return {
+    ...(contentType ? { 'Content-Type': contentType } : {}),
+    'X-TextKit-Bridge-Token': token
+  };
+}
+
+function normalizeSavePath(value) {
+  const raw = String(value || '').trim();
+  if (!raw) throw new Error('Save path is required.');
+  if (raw.length > MAX_SAVE_PATH_CHARS || raw.includes('\0')) throw new Error('Save path is invalid or too long.');
+  const slashPath = raw.replace(/\\/g, '/');
+  if (slashPath.startsWith('/') || /^[A-Za-z]:\//.test(slashPath)) {
+    throw new Error('Save path must be relative to the file bridge root.');
+  }
+  const parts = slashPath.split('/').filter((part) => part && part !== '.');
+  if (!parts.length || parts.some((part) => part === '..')) {
+    throw new Error('Save path must not contain traversal segments.');
+  }
+  return parts.join('/');
+}
+
+async function readJsonObject(response, label) {
+  const raw = await response.text();
+  if (!raw.trim()) throw new Error(`${label} returned an empty response.`);
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    throw new Error(`${label} returned invalid JSON.`);
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new Error(`${label} returned an invalid response schema.`);
+  }
+  return payload;
+}
+
+function requireTextPayload(payload, label) {
+  if (payload.error) throw new Error(String(payload.error));
+  if (typeof payload.text !== 'string') throw new Error(`${label} response is missing text.`);
+  return payload.text;
+}
+
 function buildBackendEndpoint(host, port, path) {
   const normalized = normalizeBackendSettings(host, port);
   return `http://${normalized.host}:${normalized.port}${path}`;
@@ -88,6 +143,11 @@ function normalizeCapturePrompts(prompts = {}) {
   };
 }
 
+function createSelectionToken() {
+  return globalThis.crypto?.randomUUID?.()
+    || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
 async function snapshotCapturePrompts() {
   const stored = await chrome.storage.local.get(['ocrPrompt', 'dedupPrompt']);
   return normalizeCapturePrompts({
@@ -112,7 +172,8 @@ function getState(tabId) {
       lastRegion: savedLastRegion, stopRequested: false, retryState: null,
       retryStage: null, pendingText: '', captureInFlight: false,
       targetRemoved: false, navigationChanged: false, captureUrl: null,
-      collectionComplete: false, partialReason: '', partialError: '', operationPrompts: null
+      collectionComplete: false, partialReason: '', partialError: '', operationPrompts: null,
+      selectionToken: null
     });
   }
   return states.get(tabId);
@@ -214,18 +275,28 @@ chrome.commands.onCommand.addListener(async (command) => {
     if (!tab?.id) {
       return;
     }
+    const state = getState(tab.id);
+    if (state.active || state.captureInFlight || state.status === 'Selecting') {
+      console.warn('A capture is already active for this tab.');
+      return;
+    }
     await ensureContentScript(tab.id);
-    getState(tab.id).operationPrompts = await snapshotCapturePrompts();
+    state.operationPrompts = await snapshotCapturePrompts();
+    state.selectionToken = createSelectionToken();
 
     updateState(tab.id, { active: true, status: 'Selecting', progress: 'Drag a rectangle.' });
     await chrome.tabs.sendMessage(tab.id, {
       type: 'selection:start',
-      lastRegion: getState(tab.id).lastRegion || undefined
+      lastRegion: state.lastRegion || undefined,
+      selectionToken: state.selectionToken
     });
   } catch (e) {
     console.error('Command handler failed:', e);
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id) updateState(tab.id, { active: false, status: 'Error', error: e.message, progress: 'Failed.' });
+    if (tab?.id) {
+      getState(tab.id).selectionToken = null;
+      updateState(tab.id, { active: false, status: 'Error', error: e.message, progress: 'Failed.' });
+    }
   }
 });
 
@@ -257,6 +328,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, error: 'Invalid selected region.' });
       return false;
     }
+    const state = getState(tabId);
+    if (state.status !== 'Selecting' || !state.selectionToken || message.selectionToken !== state.selectionToken) {
+      sendResponse({ ok: false, error: 'Selection confirmation is stale or unauthorized.' });
+      return false;
+    }
+    state.selectionToken = null;
     // Remember region for reuse
     const { x, y, width, height } = message.region;
     const saved = { x, y, width, height };
@@ -280,7 +357,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === 'selection:cancelled') {
     const tabId = sender.tab?.id;
-    if (tabId) updateState(tabId, { active: false, status: 'Cancelled', progress: 'Selection cancelled.' });
+    const state = tabId ? getState(tabId) : null;
+    if (state && message.selectionToken === state.selectionToken) {
+      state.selectionToken = null;
+      updateState(tabId, { active: false, status: 'Cancelled', progress: 'Selection cancelled.' });
+    }
     return false;
   }
   if (message?.type === 'popup:stop') {
@@ -320,17 +401,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 async function handlePopupStart(message = {}) {
   const tab = await getActiveTab();
+  const state = getState(tab.id);
+  if (state.active || state.captureInFlight || state.status === 'Selecting') {
+    throw new Error('A capture is already active for this tab.');
+  }
   await ensureContentScript(tab.id);
-  getState(tab.id).operationPrompts = message.prompts
+  state.operationPrompts = message.prompts
     ? normalizeCapturePrompts(message.prompts)
     : await snapshotCapturePrompts();
+  state.selectionToken = createSelectionToken();
   updateState(tab.id, { active: true, status: 'Selecting', progress: 'Drag a rectangle.' });
   try {
     await chrome.tabs.sendMessage(tab.id, {
       type: 'selection:start',
-      lastRegion: getState(tab.id).lastRegion || undefined
+      lastRegion: state.lastRegion || undefined,
+      selectionToken: state.selectionToken
     });
   } catch (error) {
+    state.selectionToken = null;
     updateState(tab.id, {
       active: false,
       status: 'Error',
@@ -344,11 +432,15 @@ async function handlePopupStart(message = {}) {
 
 async function handleReuseRegion() {
   const tab = await getActiveTab();
-  const region = getState(tab.id).lastRegion;
+  const state = getState(tab.id);
+  if (state.active || state.captureInFlight || state.status === 'Selecting') {
+    throw new Error('A capture is already active for this tab.');
+  }
+  const region = state.lastRegion;
   if (!region) throw new Error('No saved region. Select a region first.');
   if (tab.windowId == null || tab.windowId < 0) throw new Error('Invalid windowId.');
   await ensureContentScript(tab.id);
-  getState(tab.id).operationPrompts = await snapshotCapturePrompts();
+  state.operationPrompts = await snapshotCapturePrompts();
   // Get actual viewport dimensions from the content script
   const vp = await chrome.tabs.sendMessage(tab.id, { type: 'get-viewport' });
   const fullRegion = {
@@ -416,13 +508,6 @@ async function handleStop() {
 async function handleRetry() {
   const tab = await getActiveTab();
   const state = getState(tab.id);
-
-  if (state.retryStage === 'translate') {
-    const pendingText = state.pendingText;
-    updateState(tab.id, { active: true, status: 'Translating', progress: 'Retrying translation...', error: '' });
-    const result = await finalizeCapture(tab.id, pendingText, state.fragments || []);
-    return { ok: true, result };
-  }
 
   if (state.retryStage === 'dedup') {
     const pendingText = state.pendingText;
@@ -517,15 +602,13 @@ async function handleTranslateStart(msg) {
       const url = buildBackendEndpoint(host || DEFAULT_HOST, port || DEFAULT_PORT, `/translate?_=${Date.now()}`);
       const response = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: await getBackendHeaders('application/json'),
         body: JSON.stringify({ text, language, prompt: customPrompt || undefined }),
         signal: controller.signal
       });
-      const payload = await response.json().catch(() => ({}));
+      const payload = await readJsonObject(response, 'Translation backend');
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-      if (payload.error) throw new Error(payload.error);
-
-      const translated = payload.text || '';
+      const translated = requireTextPayload(payload, 'Translation backend');
       await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
       chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
       // Auto-copy / auto-save translated text
@@ -549,7 +632,9 @@ async function handleTranslateStart(msg) {
     clearTimeout(timeoutId);
     if (controller && translateControllers.get(tabId) === controller) {
       translateControllers.delete(tabId);
-      chrome.storage.local.remove(`tl2Translating:${tabId}`);
+      await chrome.storage.local.remove(`tl2Translating:${tabId}`).catch((error) => {
+        console.error('Failed to clear translation state:', error);
+      });
       chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: false }).catch(() => {});
     }
     if (captureControllers.size === 0 && translateControllers.size === 0 && formatControllers.size === 0) stopKeepAlive();
@@ -570,15 +655,28 @@ function handleTranslateStop(tabId) {
 async function handleSaveTranslation(msg) {
   const { text, path } = msg;
   if (!text || !path) return { ok: false, error: 'Missing text or path' };
+  let normalizedPath;
+  try {
+    normalizedPath = normalizeSavePath(path);
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
   const url = await getFileBridgeEndpoint('/save');
   const response = await fetchWithTimeout(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, path })
+    headers: await getFileBridgeHeaders(),
+    body: JSON.stringify({ text, path: normalizedPath })
   });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok || payload.error) return { ok: false, error: payload.error || payload.detail || `HTTP ${response.status}` };
-  return { ok: true, path: payload.path || path };
+  let payload;
+  try {
+    payload = await readJsonObject(response, 'File bridge');
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+  if (!response.ok || payload.success !== true) {
+    return { ok: false, error: payload.error || payload.detail || `HTTP ${response.status}` };
+  }
+  return { ok: true, path: normalizedPath };
 }
 
 // ── manual format (delegated to background so it survives popup close) ─
@@ -620,15 +718,13 @@ async function handleFormatStart(msg) {
       const url = buildBackendEndpoint(host || DEFAULT_HOST, port || DEFAULT_PORT, `/format?_=${Date.now()}`);
       const response = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: await getBackendHeaders('application/json'),
         body: JSON.stringify({ text, prompt }),
         signal: controller.signal
       });
-      const payload = await response.json().catch(() => ({}));
+      const payload = await readJsonObject(response, 'Format backend');
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-      if (payload.error) throw new Error(payload.error);
-
-      const formatted = payload.text || '';
+      const formatted = requireTextPayload(payload, 'Format backend');
       await chrome.storage.local.set({ [`fmtResult:${tabId}`]: formatted });
       chrome.runtime.sendMessage({ type: 'format:update', tabId, text: formatted }).catch(() => {});
       // Auto-copy / auto-save formatted text (background-side, survives popup close)
@@ -650,7 +746,9 @@ async function handleFormatStart(msg) {
     clearTimeout(timeoutId);
     if (formatControllers.get(tabId) === controller) {
       formatControllers.delete(tabId);
-      chrome.storage.local.remove(`fmtFormatting:${tabId}`);
+      await chrome.storage.local.remove(`fmtFormatting:${tabId}`).catch((error) => {
+        console.error('Failed to clear format state:', error);
+      });
       chrome.runtime.sendMessage({ type: 'fmt:formatting', tabId, value: false }).catch(() => {});
     }
     if (captureControllers.size === 0 && translateControllers.size === 0 && formatControllers.size === 0) stopKeepAlive();
@@ -878,7 +976,7 @@ async function executeCaptureLoop({
           overlapPx: OVERLAP_PX
         }, `Rechecking page ${pageNumber}...`);
         if (recheckResult.status !== 'sent') break;
-        const recheck = recheckResult.response;
+        const recheck = requireScrollResponse(recheckResult.response);
         if (recheck?.changed) {
           atBottom = false;
           scrollY = recheck.scrollY;
@@ -893,7 +991,7 @@ async function executeCaptureLoop({
         overlapPx: OVERLAP_PX
       }, `Scrolling after page ${pageNumber}...`);
       if (sentScroll.status !== 'sent') break;
-      const scrollResult = sentScroll.response;
+      const scrollResult = requireScrollResponse(sentScroll.response);
 
       if (scrollResult?.atBottom) {
         if (!scrollResult.changed && fragments.length > 0) break;
@@ -1158,8 +1256,19 @@ async function finalizeCapture(tabId, finalText, fragments) {
     fragments,
     mergedText: finalText
   });
-  chrome.storage.local.set({ [`lastResult:${tabId}`]: finalText });
-  chrome.storage.local.set({ [`lastStatus:${tabId}`]: finalStatus });
+  try {
+    await chrome.storage.local.set({
+      [`lastResult:${tabId}`]: finalText,
+      [`lastStatus:${tabId}`]: finalStatus
+    });
+  } catch (error) {
+    updateState(tabId, {
+      status: 'Error',
+      error: `Failed to persist capture result: ${error.message}`,
+      progress: 'Capture finished, but its result could not be saved.'
+    });
+    throw error;
+  }
 
   // Run post-capture automation only for a normally completed capture.
   if (!isPartial) {
@@ -1211,14 +1320,13 @@ async function autoTranslateIfEnabled(tabId, originalText) {
     const url = await getBackendEndpoint('/translate');
     const response = await fetch(url + '?_=' + Date.now(), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: await getBackendHeaders('application/json'),
       body: JSON.stringify({ text: originalText, language, prompt: customPrompt || undefined }),
       signal: controller.signal
     });
-    const payload = await response.json().catch(() => ({}));
+    const payload = await readJsonObject(response, 'Translation backend');
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-    if (payload.error) throw new Error(payload.error);
-    const translated = payload.text || '';
+    const translated = requireTextPayload(payload, 'Translation backend');
     updateState(tabId, { tl2Translating: false });
     await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
     chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
@@ -1233,13 +1341,17 @@ async function autoTranslateIfEnabled(tabId, originalText) {
     const errorMessage = timedOut ? 'Translation timed out.' : (e.message || 'Translation failed.');
     await chrome.storage.local.set({ [`tl2Status:${tabId}`]: errorMessage });
     updateState(tabId, { tl2Translating: false });
-    chrome.storage.local.remove(`tl2Translating:${tabId}`);
+    await chrome.storage.local.remove(`tl2Translating:${tabId}`).catch((error) => {
+      console.error('Failed to clear auto-translation state:', error);
+    });
     chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: '', error: errorMessage }).catch(() => {});
   } finally {
     clearTimeout(timeoutId);
     if (controller && translateControllers.get(tabId) === controller) {
       translateControllers.delete(tabId);
-      chrome.storage.local.remove(`tl2Translating:${tabId}`);
+      await chrome.storage.local.remove(`tl2Translating:${tabId}`).catch((error) => {
+        console.error('Failed to clear auto-translation state:', error);
+      });
       chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: false }).catch(() => {});
     }
   }
@@ -1288,7 +1400,11 @@ async function postImageForOcr(blob, pageNumber, signal, customPrompt) {
   if (customPrompt) formData.append('prompt', customPrompt);
 
   const url = await getBackendEndpoint('/ocr');
-  const response = await fetchWithTimeout(url, { method: 'POST', body: formData }, signal);
+  const response = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers: await getBackendHeaders(),
+    body: formData
+  }, signal);
 
   if (!response.ok) {
     throw new Error(`OCR HTTP ${response.status}: ${await response.text().catch(() => '')}`);
@@ -1296,12 +1412,8 @@ async function postImageForOcr(blob, pageNumber, signal, customPrompt) {
 
   const ct = response.headers.get('content-type') || '';
   if (ct.includes('application/json')) {
-    const payload = await response.json().catch(() => {
-      throw new Error('OCR backend returned invalid JSON.');
-    });
-    const t = payload.text ?? payload.result ?? payload.content ?? '';
-    if (payload.error) throw new Error(`OCR backend error: ${payload.error}`);
-    return String(t).trim();
+    const payload = await readJsonObject(response, 'OCR backend');
+    return requireTextPayload(payload, 'OCR backend').trim();
   }
   return (await response.text()).trim();
 }
@@ -1318,7 +1430,7 @@ async function postTextForDedup(text, signal, customPrompt) {
 
   const response = await fetchWithTimeout(url + '?_=' + Date.now(), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: await getBackendHeaders('application/json'),
     body: JSON.stringify(body)
   }, signal);
 
@@ -1326,11 +1438,8 @@ async function postTextForDedup(text, signal, customPrompt) {
     throw new Error(`Dedup HTTP ${response.status}: ${await response.text().catch(() => '')}`);
   }
 
-  const payload = await response.json().catch(() => {
-    throw new Error('Dedup backend returned invalid JSON.');
-  });
-  if (payload.error) throw new Error(`Dedup backend error: ${payload.error}`);
-  return String(payload.text ?? '').trim();
+  const payload = await readJsonObject(response, 'Dedup backend');
+  return requireTextPayload(payload, 'Dedup backend').trim();
 }
 
 // ── merge logic ────────────────────────────────────────────────
@@ -1392,6 +1501,14 @@ function normalizeRegion(r) {
   };
 }
 
+function requireScrollResponse(response) {
+  if (response?.error) throw new Error(`Page scroll failed: ${response.error}`);
+  if (!response || typeof response.changed !== 'boolean' || !Number.isFinite(Number(response.scrollY))) {
+    throw new Error('Page scroll returned an invalid response.');
+  }
+  return response;
+}
+
 function isValidRegion(r) {
   return r && Number.isFinite(+r.x) && Number.isFinite(+r.y)
     && Number.isFinite(+r.width) && Number.isFinite(+r.height)
@@ -1449,7 +1566,8 @@ function resetState(tabId) {
     collectionComplete: false,
     partialReason: '',
     partialError: '',
-    operationPrompts: null
+    operationPrompts: null,
+    selectionToken: null
   });
   broadcastState(tabId);
   // Clear stale stored result/status so popup init() doesn't reload old capture
@@ -1468,14 +1586,22 @@ function resetState(tabId) {
 
 async function copyToClipboard(text) {
   if (!text) return false;
-  try {
+  let hasDocument = false;
+  if (typeof chrome.offscreen.hasDocument === 'function') {
+    hasDocument = await chrome.offscreen.hasDocument();
+  } else if (typeof chrome.runtime.getContexts === 'function' && typeof chrome.runtime.getURL === 'function') {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: ['OFFSCREEN_DOCUMENT'],
+      documentUrls: [chrome.runtime.getURL('offscreen.html')]
+    });
+    hasDocument = contexts.length > 0;
+  }
+  if (!hasDocument) {
     await chrome.offscreen.createDocument({
       url: 'offscreen.html',
-      reasons: ['CLIPBOARD', 'DOM_PARSER'],
-      justification: 'Clipboard and download access for OCR results'
+      reasons: ['CLIPBOARD'],
+      justification: 'Clipboard access for TextKit results'
     });
-  } catch (e) {
-    // Document may already exist — that's fine
   }
   const copyId = nextOffscreenCopyId++;
   return new Promise((resolve, reject) => {

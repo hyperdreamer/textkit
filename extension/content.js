@@ -3,11 +3,15 @@
   window.__textkitContentLoaded = true;
 
   let overlay = null;
+  let overlayRoot = null;
   let selection = null;
+  let hint = null;
   let handles = [];
   let dragMode = null; // 'new' | 'move' | 'resize-nw' | 'resize-ne' | ...
   let dragStart = null;
   let region = null; // { x, y, width, height }
+  let selectionToken = null;
+  let confirmPending = false;
 
   const MIN_SIZE = 10;
   const HANDLE_SIZE = 8;
@@ -16,7 +20,11 @@
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === 'selection:start') {
-      startSelectionMode(message.lastRegion || null);
+      if (typeof message.selectionToken !== 'string' || !message.selectionToken) {
+        sendResponse({ ok: false, error: 'Missing selection confirmation token.' });
+        return false;
+      }
+      startSelectionMode(message.lastRegion || null, message.selectionToken);
       sendResponse({ ok: true });
       return false;
     }
@@ -75,12 +83,33 @@
     }
   }
 
-  function startSelectionMode(saved) {
+  const OVERLAY_STYLES = `
+    :host { position: fixed; inset: 0; z-index: 2147483647; cursor: crosshair;
+      background: transparent; user-select: none; }
+    .textkit-selection { position: fixed; box-sizing: border-box; border: 2px solid #000;
+      background: transparent; box-shadow: 0 0 0 9999px rgba(139, 90, 43, .22);
+      pointer-events: none; }
+    .textkit-handle { position: fixed; width: 16px; height: 16px; background: #fff;
+      border: 2px solid #000; border-radius: 3px; z-index: 2147483648;
+      pointer-events: auto; display: none; }
+    .textkit-handle.nw { cursor: nw-resize; } .textkit-handle.n { cursor: n-resize; }
+    .textkit-handle.ne { cursor: ne-resize; } .textkit-handle.e { cursor: e-resize; }
+    .textkit-handle.se { cursor: se-resize; } .textkit-handle.s { cursor: s-resize; }
+    .textkit-handle.sw { cursor: sw-resize; } .textkit-handle.w { cursor: w-resize; }
+    .textkit-hint { position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+      padding: 8px 12px; border-radius: 6px; background: rgba(17, 24, 39, .94);
+      color: #fff; font: 13px/1.4 system-ui, sans-serif; pointer-events: none;
+      white-space: nowrap; }
+  `;
+
+  function startSelectionMode(saved, token) {
     removeOverlay();
 
     overlay = document.createElement('div');
     overlay.className = 'textkit-overlay';
-    overlay.innerHTML = '<div class="textkit-selection"></div>'
+    overlayRoot = overlay.attachShadow({ mode: 'closed' });
+    overlayRoot.innerHTML = `<style>${OVERLAY_STYLES}</style>`
+      + '<div class="textkit-selection"></div>'
       + '<div class="textkit-handle nw"></div>'
       + '<div class="textkit-handle n"></div>'
       + '<div class="textkit-handle ne"></div>'
@@ -91,10 +120,11 @@
       + '<div class="textkit-handle w"></div>'
       + '<div class="textkit-hint"></div>';
     document.documentElement.appendChild(overlay);
+    selectionToken = token;
 
-    selection = overlay.querySelector('.textkit-selection');
-    handles = [...overlay.querySelectorAll('.textkit-handle')];
-    const hint = overlay.querySelector('.textkit-hint');
+    selection = overlayRoot.querySelector('.textkit-selection');
+    handles = [...overlayRoot.querySelectorAll('.textkit-handle')];
+    hint = overlayRoot.querySelector('.textkit-hint');
 
     // Pre-draw saved region if available
     if (saved && saved.width >= MIN_SIZE && saved.height >= MIN_SIZE) {
@@ -145,7 +175,7 @@
   }
 
   function onPointerDown(event) {
-    if (!overlay) return;
+    if (!overlay || event.isTrusted !== true || confirmPending) return;
     overlay.setPointerCapture(event.pointerId);
     const ex = clamp(event.clientX, 0, window.innerWidth);
     const ey = clamp(event.clientY, 0, window.innerHeight);
@@ -171,7 +201,7 @@
   }
 
   function onPointerMove(event) {
-    if (!dragMode || !dragStart) return;
+    if (event.isTrusted !== true || !dragMode || !dragStart) return;
     const ex = clamp(event.clientX, 0, window.innerWidth);
     const ey = clamp(event.clientY, 0, window.innerHeight);
     const dx = ex - dragStart.ex;
@@ -227,6 +257,7 @@
   }
 
   function onPointerUp(event) {
+    if (event.isTrusted !== true) return;
     if (overlay) overlay.releasePointerCapture(event.pointerId);
     dragMode = null;
     dragStart = null;
@@ -234,7 +265,7 @@
   }
 
   function confirmSelection() {
-    if (!region || region.width < MIN_SIZE || region.height < MIN_SIZE) return;
+    if (confirmPending || !selectionToken || !region || region.width < MIN_SIZE || region.height < MIN_SIZE) return;
 
     const result = {
       x: region.x,
@@ -246,20 +277,35 @@
       devicePixelRatio: window.devicePixelRatio || 1
     };
 
-    removeOverlay();
+    confirmPending = true;
+    overlay.style.display = 'none';
     // Wait for the browser to finish painting the overlay removal so
     // captureVisibleTab doesn't snapshot the hint text or selection UI.
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
-        chrome.runtime.sendMessage({ type: 'selection:complete', region: result }).catch(() => {});
+        chrome.runtime.sendMessage({
+          type: 'selection:complete',
+          region: result,
+          selectionToken
+        }).then((response) => {
+          if (!response?.ok) throw new Error(response?.error || 'Selection was not accepted.');
+          removeOverlay();
+        }).catch((error) => {
+          confirmPending = false;
+          if (!overlay) return;
+          overlay.style.display = '';
+          if (hint) hint.textContent = `${error.message} Adjust the region and try again.`;
+        });
       });
     });
   }
 
   function onKeyDown(event) {
+    if (event.isTrusted !== true || confirmPending) return;
     if (event.key === 'Escape') {
+      const cancelledToken = selectionToken;
       removeOverlay();
-      chrome.runtime.sendMessage({ type: 'selection:cancelled' }).catch(() => {});
+      chrome.runtime.sendMessage({ type: 'selection:cancelled', selectionToken: cancelledToken }).catch(() => {});
     }
     if (event.key === ' ' && event.ctrlKey) {
       event.preventDefault();
@@ -303,11 +349,15 @@
     }
     window.removeEventListener('keydown', onKeyDown, true);
     overlay = null;
+    overlayRoot = null;
     selection = null;
+    hint = null;
     handles = [];
     dragMode = null;
     dragStart = null;
     region = null;
+    selectionToken = null;
+    confirmPending = false;
   }
 
   async function scrollDown(overlapPx = 50) {

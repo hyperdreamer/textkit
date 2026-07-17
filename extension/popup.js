@@ -12,8 +12,10 @@ const copyButton = document.getElementById('copy');
 const downloadButton = document.getElementById('download');
 const hostInput = document.getElementById('backend-host');
 const portInput = document.getElementById('backend-port');
+const backendTokenInput = document.getElementById('backend-token');
 const fileBridgeHostInput = document.getElementById('file-bridge-host');
 const fileBridgePortInput = document.getElementById('file-bridge-port');
+const fileBridgeTokenInput = document.getElementById('file-bridge-token');
 const settingsGear = document.getElementById('settings-gear');
 const settingsPanel = document.getElementById('backend-settings-panel');
 const autoscrollCheckbox = document.getElementById('ocr-autoscroll');
@@ -188,6 +190,8 @@ async function refreshFallback(config, { force = false } = {}) {
     ? `?language=${encodeURIComponent(tlLanguage.value)}`
     : '';
   const headers = cached?.version ? { 'If-None-Match': `"${cached.version}"` } : {};
+  const backendToken = backendTokenInput.value.trim();
+  if (backendToken) headers['X-TextKit-Token'] = backendToken;
   const request = (async () => {
     const ctrl = new AbortController();
     const timeoutId = setTimeout(() => ctrl.abort(), 3000);
@@ -261,8 +265,10 @@ downloadButton.addEventListener('click', downloadOcrText);
 resultEl.addEventListener('input', saveOcrText);
 hostInput.addEventListener('change', saveSettings);
 portInput.addEventListener('change', saveSettings);
+backendTokenInput.addEventListener('change', saveSettings);
 fileBridgeHostInput.addEventListener('change', saveFileBridgeSettings);
 fileBridgePortInput.addEventListener('change', saveFileBridgeSettings);
+fileBridgeTokenInput.addEventListener('change', saveFileBridgeSettings);
 settingsGear.addEventListener('click', () => {
   const isOpen = !settingsPanel.classList.contains('hidden');
   settingsPanel.classList.toggle('hidden', isOpen);
@@ -393,8 +399,8 @@ async function init() {
   currentTabId = tab?.id || null;
 
   const items = await chrome.storage.sync.get({
-    backendHost: 'localhost', backendPort: 8765,
-    fileBridgeHost: '', fileBridgePort: FILE_BRIDGE_DEFAULT_PORT,
+    backendHost: 'localhost', backendPort: 8765, backendToken: '',
+    fileBridgeHost: '', fileBridgePort: FILE_BRIDGE_DEFAULT_PORT, fileBridgeToken: '',
     ocrAutoscroll: true,
     captureIntervalMs: 100,
     ocrHost: null, ocrPort: null
@@ -411,6 +417,8 @@ async function init() {
   }
   fileBridgeHostInput.value = items.fileBridgeHost || '';
   fileBridgePortInput.value = items.fileBridgePort || FILE_BRIDGE_DEFAULT_PORT;
+  backendTokenInput.value = items.backendToken || '';
+  fileBridgeTokenInput.value = items.fileBridgeToken || '';
   tlLanguage.value = tlLanguage.value || 'original';
   tl2Language.value = tl2Language.value || 'original';
   autoscrollCheckbox.checked = items.ocrAutoscroll;
@@ -640,6 +648,7 @@ async function saveSettings() {
   await chrome.storage.sync.set({
     backendHost: backend.host,
     backendPort: backend.port,
+    backendToken: backendTokenInput.value.trim(),
     ocrAutoscroll: autoscrollCheckbox.checked,
     captureIntervalMs
   });
@@ -658,7 +667,11 @@ async function saveFileBridgeSettings() {
       progressEl.textContent = e.message;
       return;
     }
-    await chrome.storage.sync.set({ fileBridgeHost: '', fileBridgePort: port });
+    await chrome.storage.sync.set({
+      fileBridgeHost: '',
+      fileBridgePort: port,
+      fileBridgeToken: fileBridgeTokenInput.value.trim()
+    });
     fileBridgeHostInput.value = '';
     fileBridgePortInput.value = port;
     return;
@@ -673,7 +686,8 @@ async function saveFileBridgeSettings() {
   }
   await chrome.storage.sync.set({
     fileBridgeHost: fileBridge.host,
-    fileBridgePort: fileBridge.port
+    fileBridgePort: fileBridge.port,
+    fileBridgeToken: fileBridgeTokenInput.value.trim()
   });
   fileBridgeHostInput.value = fileBridge.host;
   fileBridgePortInput.value = fileBridge.port;
@@ -1137,6 +1151,7 @@ async function saveTl2Settings() {
 
 const PATH_HISTORY_KEY = 'tl2PathHistory';
 const MAX_PATH_HISTORY = 20;
+const PATH_REQUEST_TIMEOUT_MS = 3000;
 let _pathDebounceTimer = null;
 let _pathSuggestionGeneration = 0;
 
@@ -1147,26 +1162,35 @@ function loadPathSuggestions() {
 
 async function fetchPathSuggestions(prefix, generation = ++_pathSuggestionGeneration) {
   if (generation > _pathSuggestionGeneration) _pathSuggestionGeneration = generation;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), PATH_REQUEST_TIMEOUT_MS);
   try {
     const items = await chrome.storage.sync.get({
       fileBridgeHost: '',
-      fileBridgePort: FILE_BRIDGE_DEFAULT_PORT
+      fileBridgePort: FILE_BRIDGE_DEFAULT_PORT,
+      fileBridgeToken: ''
     });
+    const token = String(items.fileBridgeToken || '').trim();
+    if (!token) throw new Error('File bridge token is required.');
+    const safePrefix = normalizePathPrefix(prefix);
     const hasFileBridgeHost = String(items.fileBridgeHost || '').trim().length > 0;
     const fileBridge = normalizeBackendSettings(
       hasFileBridgeHost ? items.fileBridgeHost : 'localhost',
       items.fileBridgePort || FILE_BRIDGE_DEFAULT_PORT
     );
-    const resp = await fetch(`http://${fileBridge.host}:${fileBridge.port}/paths?prefix=${encodeURIComponent(prefix)}`);
+    const resp = await fetch(
+      `http://${fileBridge.host}:${fileBridge.port}/paths?prefix=${encodeURIComponent(safePrefix)}`,
+      {
+        headers: { 'X-TextKit-Bridge-Token': token },
+        signal: controller.signal
+      }
+    );
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json().catch(() => ({}));
-    const paths = data.paths || [];
-    // If user typed a ~ prefix, prepend ~/ so the browser's <datalist>
-    // filtering matches. The backend returns paths relative to save_root;
-    // we only need to restore the tilde the user typed.
-    const tildePrefix = prefix.startsWith('~/') ? '~/' : (prefix === '~' ? '~/' : '');
+    const data = await resp.json();
+    if (!data || !Array.isArray(data.paths)) throw new Error('File bridge returned an invalid path response.');
+    const paths = data.paths.filter(isSafeRelativePath);
     if (generation !== _pathSuggestionGeneration) return false;
-    populatePathSuggestions(paths.map((path) => tildePrefix + path));
+    populatePathSuggestions(paths);
     return true;
   } catch {
     const stored = await chrome.storage.local.get(PATH_HISTORY_KEY);
@@ -1174,10 +1198,26 @@ async function fetchPathSuggestions(prefix, generation = ++_pathSuggestionGenera
     const history = Array.isArray(stored[PATH_HISTORY_KEY]) ? stored[PATH_HISTORY_KEY] : [];
     const prefixLower = prefix.toLowerCase();
     populatePathSuggestions(history.filter((path) => (
-      !prefixLower || String(path).toLowerCase().startsWith(prefixLower)
+      isSafeRelativePath(path) && (!prefixLower || String(path).toLowerCase().startsWith(prefixLower))
     )));
     return true;
+  } finally {
+    clearTimeout(timeoutId);
   }
+}
+
+function isSafeRelativePath(value) {
+  const path = String(value || '');
+  if (!path || path.length > 1024 || path.includes('\0') || path.includes('\\')) return false;
+  if (path.startsWith('/') || /^[A-Za-z]:\//.test(path)) return false;
+  return !path.split('/').some((part) => part === '..');
+}
+
+function normalizePathPrefix(value) {
+  const prefix = String(value || '').trim();
+  if (!prefix) return '';
+  if (!isSafeRelativePath(prefix)) throw new Error('Path prefix must be relative and must not contain traversal.');
+  return prefix;
 }
 
 function populatePathSuggestions(paths) {
