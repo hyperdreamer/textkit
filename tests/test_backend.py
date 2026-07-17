@@ -6,6 +6,7 @@ from io import BytesIO
 from pathlib import Path
 
 import pytest
+import httpx
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -442,3 +443,37 @@ def test_credentials_are_resolved_lazily_per_operation(
     assert main._resolve_ai_api_key(main._resolve_ai_config(config, config.ocr)) == "base-key"
     with pytest.raises(main.HTTPException, match="MISSING_TEXT_KEY"):
         main._resolve_ai_api_key(main._resolve_ai_config(config, config.text))
+
+
+@pytest.mark.asyncio
+async def test_operation_id_is_forwarded_as_provider_idempotency_key() -> None:
+    seen_headers: httpx.Headers | None = None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal seen_headers
+        seen_headers = request.headers
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "done"}}],
+                "model": "test-model",
+                "usage": {"total_tokens": 1},
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    previous = main._http_client
+    token = main._operation_id.set("translate:1:stable-id")
+    main._http_client = client
+    try:
+        result = await main._post_openai_chat_completion(
+            _ai_config(), [{"role": "user", "content": "hello"}]
+        )
+    finally:
+        main._operation_id.reset(token)
+        main._http_client = previous
+        await client.aclose()
+
+    assert result.text == "done"
+    assert seen_headers is not None
+    assert seen_headers["idempotency-key"] == "translate:1:stable-id"

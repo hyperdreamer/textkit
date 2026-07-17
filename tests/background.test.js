@@ -208,8 +208,12 @@ function createBackgroundHarness(options = {}) {
     ocrCalls.push({ blob, pageNumber });
     return `page ${pageNumber}`;
   };
-  context.__testFinalize = async (tabId, text, fragments) => {
-    finalized.push({ tabId, text, fragments: [...fragments] });
+  context.__testFinalize = async (tabId, text, fragmentsOrCount) => {
+    finalized.push({
+      tabId,
+      text,
+      fragmentCount: Array.isArray(fragmentsOrCount) ? fragmentsOrCount.length : fragmentsOrCount
+    });
     return text;
   };
   vm.runInContext(`
@@ -387,7 +391,39 @@ test('same-tab navigation stops before a new document frame can be mixed in', as
 
   assert.equal(harness.cropCalls.length, 1);
   assert.deepEqual(harness.ocrCalls.map((call) => call.pageNumber), [1]);
-  assert.deepEqual(harness.finalized[0].fragments, ['page 1']);
+  assert.equal(harness.finalized[0].text, 'page 1');
+  assert.equal(harness.finalized[0].fragmentCount, 1);
+  assert.equal(harness.context.getState(1).partialReason, 'navigation');
+});
+
+test('same-URL reload stops capture on the loading document boundary', async () => {
+  const secondFrame = deferred();
+  let scrollCalls = 0;
+  const url = 'https://example.test/same';
+  const harness = createBackgroundHarness({
+    tabs: [{ id: 1, windowId: 10, active: true, url }],
+    syncValues: { ocrAutoscroll: true },
+    captureVisibleTab(_windowId, _captureOptions, callNumber) {
+      return callNumber === 2 ? secondFrame.promise : 'data:image/png;base64,first-page';
+    },
+    sendMessage(_tabId, message) {
+      if (message.type !== 'page:scroll-down') return { ok: true, documentId: 'document-one' };
+      scrollCalls += 1;
+      return { changed: true, atBottom: false, scrollY: scrollCalls * 100, documentId: 'document-one' };
+    }
+  });
+  vm.runInContext('sleep = async () => {};', harness.context);
+
+  const capturePromise = harness.context.runCaptureLoop(
+    { id: 1, windowId: 10, active: true, url },
+    REGION
+  );
+  await waitFor(() => harness.captureCalls.length === 2, 'second capture did not start');
+  harness.events.onUpdated.emit(1, { status: 'loading' }, { ...harness.tabs.get(1), url });
+  secondFrame.resolve('data:image/png;base64,reloaded-document');
+  await capturePromise;
+
+  assert.equal(harness.ocrCalls.length, 1);
   assert.equal(harness.context.getState(1).partialReason, 'navigation');
 });
 
@@ -659,7 +695,8 @@ test('OCR retry snapshot is persisted before the infinite retry loop', async () 
   const operation = harness.context.executeCaptureLoop({
     tabId: 1,
     region: REGION,
-    fragments: ['first page'],
+    mergedText: 'first page',
+    fragmentsCollected: 1,
     lastScrollY: 100,
     resetBeforeStart: false,
     refreshAutoscroll: false,
@@ -673,8 +710,12 @@ test('OCR retry snapshot is persisted before the infinite retry loop', async () 
       stage: 'ocr',
       tabId: 1,
       region: REGION,
-      fragments: ['first page'],
+      mergedText: 'first page',
+      fragmentsCollected: 1,
       lastScrollY: 100,
+      captureUrl: null,
+      captureDocumentId: null,
+      operationId: harness.localData['retryState:1'].operationId,
       promptSnapshot: { ocr: 'OCR prompt', dedup: 'Dedup prompt' }
     }
   );
@@ -705,7 +746,8 @@ test('dedup retry snapshot is persisted before the infinite retry loop', async (
       stage: 'dedup',
       tabId: 1,
       mergedText: 'merged text',
-      fragments: ['first', 'second'],
+      fragmentsCollected: 2,
+      operationId: null,
       promptSnapshot: { dedup: 'Dedup prompt' }
     }
   );
@@ -730,7 +772,8 @@ test('stored retry state becomes actionable after a service worker restart', asy
 
   assert.equal(recovered.status, 'Error');
   assert.equal(recovered.active, true);
-  assert.deepEqual([...recovered.fragments], ['recovered fragment']);
+  assert.equal(recovered.checkpointText, 'recovered fragment');
+  assert.equal(recovered.fragmentsCollected, 1);
 
   harness.context.__resumedRetry = null;
   vm.runInContext('resumeCaptureLoop = async (retryState) => { __resumedRetry = retryState; };', harness.context);
@@ -746,7 +789,8 @@ test('stored retry state becomes actionable after a service worker restart', asy
 test('a non-OCR capture failure finalizes fragments already collected', async () => {
   const harness = createBackgroundHarness();
   const state = harness.context.getState(1);
-  state.fragments = ['first fragment', 'second fragment'];
+  state.fragmentsCollected = 2;
+  state.checkpointText = 'first fragment\nsecond fragment';
   state.active = true;
   state.status = 'Selecting';
   state.selectionToken = 'selection-token';
@@ -761,7 +805,8 @@ test('a non-OCR capture failure finalizes fragments already collected', async ()
   assert.equal(response.ok, true);
   await waitFor(() => harness.finalized.length === 1, 'partial fragments were not finalized');
   assert.equal(harness.finalized[0].tabId, 1);
-  assert.deepEqual(harness.finalized[0].fragments, ['first fragment', 'second fragment']);
+  assert.equal(harness.finalized[0].text, 'first fragment\nsecond fragment');
+  assert.equal(harness.finalized[0].fragmentCount, 2);
 });
 
 test('failed selection start resets active state to Error', async () => {
@@ -774,6 +819,23 @@ test('failed selection start resets active state to Error', async () => {
   await assert.rejects(harness.context.handlePopupStart(), /content script unavailable/);
   assert.equal(harness.context.getState(1).active, false);
   assert.equal(harness.context.getState(1).status, 'Error');
+});
+
+test('keyboard capture command does not mutate an active capture', async () => {
+  const harness = createBackgroundHarness();
+  const state = harness.context.getState(1);
+  Object.assign(state, { active: true, captureInFlight: true, status: 'Capturing', progress: 'Page 2' });
+
+  harness.events.command.emit('start-region-capture');
+  await delay();
+
+  assert.equal(state.active, true);
+  assert.equal(state.captureInFlight, true);
+  assert.equal(state.status, 'Capturing');
+  assert.equal(
+    harness.messageCalls.filter(({ message }) => message.type === 'selection:start').length,
+    0
+  );
 });
 
 test('Stop cancels an in-progress selection', async () => {
@@ -844,6 +906,48 @@ test('manual translation rejects invalid JSON instead of storing an empty succes
   assert.equal(result.ok, false);
   assert.match(result.error, /invalid JSON/);
   assert.equal(Object.hasOwn(harness.localData, 'tl2Result:1'), false);
+});
+
+test('superseded translation cannot overwrite a newer result', async () => {
+  const firstResponse = deferred();
+  let call = 0;
+  const harness = createBackgroundHarness({
+    fetch: async () => {
+      call += 1;
+      if (call === 1) return firstResponse.promise;
+      return { ok: true, text: async () => JSON.stringify({ text: 'new result' }) };
+    }
+  });
+
+  const first = harness.context.handleTranslateStart({ tabId: 1, text: 'old', language: 'French' });
+  await waitFor(() => call === 1, 'first translation did not start');
+  const second = await harness.context.handleTranslateStart({ tabId: 1, text: 'new', language: 'French' });
+  firstResponse.resolve({ ok: true, text: async () => JSON.stringify({ text: 'stale result' }) });
+  const firstResult = await first;
+
+  assert.equal(second.ok, true);
+  assert.equal(firstResult.ok, false);
+  assert.equal(harness.localData['tl2Result:1'], 'new result');
+});
+
+test('persisted translation resumes after a service worker restart', async () => {
+  const operation = {
+    version: 1,
+    type: 'translate',
+    tabId: 1,
+    operationId: 'translate:1:recovery-id',
+    status: 'running',
+    input: { text: 'hello', language: 'French', host: 'localhost', port: 8765 },
+    updatedAt: Date.now()
+  };
+  const harness = createBackgroundHarness({
+    localData: { 'operation:translate:1': operation },
+    fetch: async () => ({ ok: true, text: async () => JSON.stringify({ text: 'bonjour' }) })
+  });
+
+  await waitFor(() => harness.localData['tl2Result:1'] === 'bonjour', 'translation was not recovered');
+
+  assert.equal(Object.hasOwn(harness.localData, 'operation:translate:1'), false);
 });
 
 test('file bridge saves require safe paths, authentication, and explicit success', async () => {
@@ -918,6 +1022,38 @@ test('offscreen creation failures are surfaced', async () => {
   };
 
   await assert.rejects(harness.context.copyToClipboard('text'), /offscreen unavailable/);
+});
+
+test('state broadcasts omit fragment arrays and private retry payloads', () => {
+  const harness = createBackgroundHarness();
+  const state = harness.context.getState(1);
+  state.fragments = ['large fragment'];
+  state.retryState = { stage: 'ocr', mergedText: 'private checkpoint' };
+
+  harness.context.updateState(1, { progress: 'working' });
+  const message = harness.runtimeMessages.at(-1);
+
+  assert.equal(Object.hasOwn(message.state, 'fragments'), false);
+  assert.equal(message.state.retryState.stage, 'ocr');
+  assert.equal(Object.hasOwn(message.state.retryState, 'mergedText'), false);
+});
+
+test('tab close during capture cleans state and persisted operation data', async () => {
+  const frame = deferred();
+  const harness = createBackgroundHarness({
+    localData: { 'lastResult:1': 'stale' },
+    captureVisibleTab: () => frame.promise
+  });
+
+  const capture = harness.context.runCaptureLoop({ id: 1, windowId: 10, active: true }, REGION);
+  await waitFor(() => harness.captureCalls.length === 1, 'capture did not start');
+  harness.removeTab(1);
+  frame.resolve('data:image/png;base64,closed-tab');
+  await capture;
+
+  assert.equal(vm.runInContext('states.has(1)', harness.context), false);
+  assert.equal(Object.hasOwn(harness.localData, 'lastResult:1'), false);
+  assert.equal(Object.hasOwn(harness.localData, 'operation:capture:1'), false);
 });
 
 test('auto-copy waits for offscreen confirmation before showing success', async () => {
@@ -1003,6 +1139,28 @@ test('manual format reads the stored prompt once when the operation starts', asy
   const result = await operation;
   assert.equal(result.ok, true);
   assert.equal(requestBody.prompt, 'Initial format prompt');
+});
+
+test('superseded format operation cannot overwrite a newer result', async () => {
+  const firstResponse = deferred();
+  let call = 0;
+  const harness = createBackgroundHarness({
+    fetch: async () => {
+      call += 1;
+      if (call === 1) return firstResponse.promise;
+      return { ok: true, text: async () => JSON.stringify({ text: 'new format' }) };
+    }
+  });
+
+  const first = harness.context.handleFormatStart({ tabId: 1, text: 'old' });
+  await waitFor(() => call === 1, 'first format did not start');
+  const second = await harness.context.handleFormatStart({ tabId: 1, text: 'new' });
+  firstResponse.resolve({ ok: true, text: async () => JSON.stringify({ text: 'stale format' }) });
+  const firstResult = await first;
+
+  assert.equal(second.ok, true);
+  assert.equal(firstResult.ok, false);
+  assert.equal(harness.localData['fmtResult:1'], 'new format');
 });
 
 test('OCR-source auto-format runs once even when auto-translate also completes', async () => {

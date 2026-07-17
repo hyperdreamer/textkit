@@ -15,6 +15,8 @@
 
   const MIN_SIZE = 10;
   const HANDLE_SIZE = 8;
+  const documentId = globalThis.crypto?.randomUUID?.()
+    || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
   let _scrollLocked = false;
 
@@ -41,16 +43,20 @@
     }
     if (message?.type === 'page:lock-scroll') {
       lockScroll();
-      sendResponse({ ok: true });
+      sendResponse({ ok: true, documentId });
       return false;
     }
     if (message?.type === 'page:unlock-scroll') {
       unlockScroll();
-      sendResponse({ ok: true });
+      sendResponse({ ok: true, documentId });
       return false;
     }
     if (message?.type === 'get-viewport') {
-      sendResponse({ width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio || 1 });
+      sendResponse({ width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio || 1, documentId });
+      return false;
+    }
+    if (message?.type === 'page:get-document-id') {
+      sendResponse({ ok: true, documentId });
       return false;
     }
     return false;
@@ -372,7 +378,8 @@
       scrollY: after,
       changed: Math.abs(after - before) > 1,
       atBottom: after >= maxScrollY - 1,
-      maxScrollY
+      maxScrollY,
+      documentId
     };
   }
 

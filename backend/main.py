@@ -15,6 +15,7 @@ import time
 import warnings
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
 from typing import Annotated, Any
@@ -272,6 +273,7 @@ _debug_dir: Path | None = None
 _rate_events: defaultdict[str, deque[float]] = defaultdict(deque)
 _active_requests = 0
 _limit_lock = asyncio.Lock()
+_operation_id: ContextVar[str] = ContextVar("textkit_operation_id", default="")
 
 
 def _load_yaml_config(path: Path | None = None) -> dict[str, Any]:
@@ -566,6 +568,9 @@ async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str
     api_key = _resolve_ai_api_key(config)
     request_body = {"model": config.model, "messages": messages}
     headers = {"Authorization": f"Bearer {api_key}"}
+    operation_id = _operation_id.get()
+    if operation_id:
+        headers["Idempotency-Key"] = operation_id
     timeout = httpx.Timeout(
         connect=config.timeout.connect,
         read=config.timeout.read,
@@ -829,9 +834,15 @@ async def security_and_limits(request: Request, call_next: Any) -> Response:
     rejected = await _acquire_request_slot(request, config)
     if rejected:
         return rejected
+    operation_id = request.headers.get("x-textkit-operation-id", "").strip()
+    if operation_id and (len(operation_id) > 200 or not re.fullmatch(r"[A-Za-z0-9:._-]+", operation_id)):
+        await _release_request_slot()
+        return JSONResponse(status_code=400, content=_error_payload("Invalid operation ID"))
+    operation_token = _operation_id.set(operation_id)
     try:
         return await call_next(request)
     finally:
+        _operation_id.reset(operation_token)
         await _release_request_slot()
 
 

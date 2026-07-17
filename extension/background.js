@@ -8,6 +8,8 @@ const DEFAULT_CAPTURE_INTERVAL_MS = 100;
 const BACKEND_TIMEOUT_MS = 12 * 60 * 1000;
 const MAX_CAPTURE_PAGES = 500;
 const MAX_SAVE_PATH_CHARS = 1024;
+const MAX_PERSISTED_TEXT_CHARS = 1_000_000;
+const OPERATION_SCHEMA_VERSION = 1;
 const LOCAL_BACKEND_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 
 let _backendBaseUrl = null;
@@ -51,11 +53,12 @@ async function getFileBridgeEndpoint(path) {
   return _fileBridgeBaseUrl + path;
 }
 
-async function getBackendHeaders(contentType) {
+async function getBackendHeaders(contentType, operationId = '') {
   const { backendToken } = await chrome.storage.sync.get({ backendToken: '' });
   const headers = {};
   if (contentType) headers['Content-Type'] = contentType;
   if (String(backendToken || '').trim()) headers['X-TextKit-Token'] = String(backendToken).trim();
+  if (operationId) headers['X-TextKit-Operation-Id'] = operationId;
   return headers;
 }
 
@@ -103,6 +106,13 @@ function requireTextPayload(payload, label) {
   if (payload.error) throw new Error(String(payload.error));
   if (typeof payload.text !== 'string') throw new Error(`${label} response is missing text.`);
   return payload.text;
+}
+
+function requirePersistableText(text, label) {
+  if (String(text).length > MAX_PERSISTED_TEXT_CHARS) {
+    throw new Error(`${label} exceeds the ${MAX_PERSISTED_TEXT_CHARS}-character storage safety limit.`);
+  }
+  return text;
 }
 
 function buildBackendEndpoint(host, port, path) {
@@ -159,6 +169,7 @@ async function snapshotCapturePrompts() {
 let states = new Map();
 let savedLastRegion = null;
 const windowActivationGenerations = new Map();
+const tabDocumentGenerations = new Map();
 const targetTabWaiters = new Set();
 let targetTabChangeRevision = 0;
 const pendingOffscreenCopies = new Map();
@@ -173,7 +184,8 @@ function getState(tabId) {
       retryStage: null, pendingText: '', captureInFlight: false,
       targetRemoved: false, navigationChanged: false, captureUrl: null,
       collectionComplete: false, partialReason: '', partialError: '', operationPrompts: null,
-      selectionToken: null
+      selectionToken: null, checkpointText: '', captureDocumentGeneration: 0,
+      captureOperationId: null, captureDocumentId: null
     });
   }
   return states.get(tabId);
@@ -185,7 +197,9 @@ async function getRecoverableState(tabId) {
   const retryState = await loadRetryState(tabId);
   if (!retryState) return state;
 
-  const fragments = Array.isArray(retryState.fragments) ? retryState.fragments : [];
+  const legacyFragments = Array.isArray(retryState.fragments) ? retryState.fragments : [];
+  const checkpointText = retryState.mergedText || mergeFragments(legacyFragments);
+  const fragmentsCollected = retryState.fragmentsCollected ?? legacyFragments.length;
   Object.assign(state, {
     active: true,
     status: 'Error',
@@ -193,8 +207,8 @@ async function getRecoverableState(tabId) {
       ? 'Dedup retry was interrupted. Click Retry to continue.'
       : 'OCR retry was interrupted. Click Retry to continue.',
     error: 'The extension service worker restarted during a backend retry.',
-    fragments,
-    fragmentsCollected: fragments.length,
+    checkpointText,
+    fragmentsCollected,
     retryState,
     operationPrompts: normalizeCapturePrompts(retryState.promptSnapshot)
   });
@@ -230,9 +244,12 @@ chrome.tabs.onActivated.addListener(({ windowId }) => {
 chrome.tabs.onAttached?.addListener(notifyTargetTabChange);
 chrome.tabs.onDetached?.addListener(notifyTargetTabChange);
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (!changeInfo.url) return;
+  if (changeInfo.status === 'loading') {
+    tabDocumentGenerations.set(tabId, (tabDocumentGenerations.get(tabId) || 0) + 1);
+  }
   const state = states.get(tabId);
-  if (!state?.captureInFlight || state.collectionComplete || !state.captureUrl || changeInfo.url === state.captureUrl) return;
+  if (!state?.captureInFlight || state.collectionComplete) return;
+  if (changeInfo.status !== 'loading' && (!changeInfo.url || !state.captureUrl || changeInfo.url === state.captureUrl)) return;
   markTargetNavigated(tabId, state);
 });
 
@@ -250,9 +267,18 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   handleTranslateStop(tabId);
   handleFormatStop(tabId);
   captureControllers.get(tabId)?.abort();
-  captureControllers.delete(tabId);
   if (captureInFlight) return;
-  chrome.storage.local.remove([
+  cleanupClosedTab(tabId).catch(() => {});
+});
+
+async function cleanupClosedTab(tabId) {
+  states.delete(tabId);
+  tabDocumentGenerations.delete(tabId);
+  captureControllers.delete(tabId);
+  captureOperationIds.delete(tabId);
+  translateOperationIds.delete(tabId);
+  formatOperationIds.delete(tabId);
+  await chrome.storage.local.remove([
     `lastResult:${tabId}`,
     `tl2Result:${tabId}`,
     `tl2Status:${tabId}`,
@@ -261,11 +287,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     `fmtStatus:${tabId}`,
     `fmtFormatting:${tabId}`,
     `retryState:${tabId}`,
-    `preDedup:${tabId}`,
-    `postDedup:${tabId}`,
-    `lastStatus:${tabId}`
-  ]).catch(() => {});
-});
+    `lastStatus:${tabId}`,
+    operationStorageKey('capture', tabId),
+    operationStorageKey('translate', tabId),
+    operationStorageKey('format', tabId)
+  ]);
+}
 // ── keyboard shortcut ──────────────────────────────────────────
 
 chrome.commands.onCommand.addListener(async (command) => {
@@ -309,7 +336,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message?.type === 'popup:get-state') {
     getActiveTab()
-      .then(async (tab) => sendResponse({ ok: true, state: await getRecoverableState(tab.id), tabId: tab.id }))
+      .then(async (tab) => sendResponse({ ok: true, state: getPublicState(await getRecoverableState(tab.id)), tabId: tab.id }))
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
   }
@@ -458,12 +485,13 @@ async function handleReuseRegion() {
 async function handleCaptureLoopFailure(tabId, error, logPrefix) {
   console.error(logPrefix, error);
   const state = getState(tabId);
-  if (state.fragments?.length > 0) {
+  if (state.fragmentsCollected > 0 && state.checkpointText) {
     try {
       state.partialReason = 'error';
       state.partialError = error.message || 'Capture failed.';
       updateState(tabId, { error: state.partialError });
-      await finalizePostCapture(tabId, mergeFragments(state.fragments), state.fragments);
+      await finalizePostCapture(tabId, state.checkpointText, state.fragmentsCollected);
+      if (state.captureOperationId) await clearOperation('capture', tabId, state.captureOperationId).catch(() => {});
       return;
     } catch (finalizeError) {
       error = finalizeError;
@@ -497,8 +525,8 @@ async function handleStop() {
   handleFormatStop(tab.id);
   // If in error state
   // If in error state (waiting for retry), finalize collected fragments now
-  if (state.status === 'Error' && state.fragments?.length > 0) {
-    await finalizePostCapture(tab.id, mergeFragments(state.fragments), state.fragments);
+  if (state.status === 'Error' && state.fragmentsCollected > 0 && state.checkpointText) {
+    await finalizePostCapture(tab.id, state.checkpointText, state.fragmentsCollected);
   } else {
     updateState(tab.id, { progress: 'Stopping...' });
   }
@@ -512,7 +540,7 @@ async function handleRetry() {
   if (state.retryStage === 'dedup') {
     const pendingText = state.pendingText;
     updateState(tab.id, { active: true, status: 'Deduplicating', progress: 'Retrying dedup...', error: '' });
-    await finalizePostCapture(tab.id, pendingText, state.fragments || []);
+    await finalizePostCapture(tab.id, pendingText, state.fragmentsCollected || 0);
     return { ok: true };
   }
 
@@ -523,7 +551,11 @@ async function handleRetry() {
   if (rs.stage === 'dedup') {
     state.operationPrompts = normalizeCapturePrompts(rs.promptSnapshot);
     updateState(tab.id, { active: true, status: 'Deduplicating', progress: 'Retrying dedup...', error: '' });
-    await finalizePostCapture(tab.id, rs.mergedText || mergeFragments(rs.fragments || []), rs.fragments || []);
+    await finalizePostCapture(
+      tab.id,
+      rs.mergedText || mergeFragments(rs.fragments || []),
+      rs.fragmentsCollected ?? (rs.fragments || []).length
+    );
     return { ok: true };
   }
   updateState(tab.id, { active: true, status: 'Capturing', progress: 'Retrying...', error: '' });
@@ -536,7 +568,42 @@ async function handleRetry() {
 const translateControllers = new Map();
 const formatControllers = new Map();
 const captureControllers = new Map();
+const translateOperationIds = new Map();
+const formatOperationIds = new Map();
+const captureOperationIds = new Map();
 let keepAliveIntervalId = null;
+
+function createOperationId(type, tabId) {
+  return `${type}:${tabId}:${createSelectionToken()}`;
+}
+
+function isCurrentOperation(operationMap, tabId, operationId) {
+  return operationMap.get(tabId) === operationId;
+}
+
+function operationStorageKey(type, tabId) {
+  return `operation:${type}:${tabId}`;
+}
+
+async function persistOperation(type, tabId, operationId, input, status = 'running') {
+  await chrome.storage.local.set({
+    [operationStorageKey(type, tabId)]: {
+      version: OPERATION_SCHEMA_VERSION,
+      type,
+      tabId,
+      operationId,
+      status,
+      input,
+      updatedAt: Date.now()
+    }
+  });
+}
+
+async function clearOperation(type, tabId, operationId) {
+  const key = operationStorageKey(type, tabId);
+  const stored = await chrome.storage.local.get(key);
+  if (stored[key]?.operationId === operationId) await chrome.storage.local.remove(key);
+}
 
 function startKeepAlive() {
   if (keepAliveIntervalId) return;
@@ -554,6 +621,12 @@ function stopKeepAlive() {
 async function handleTranslateStart(msg) {
   const { tabId, text, language, host, port } = msg;
   if (!tabId || !text) return { ok: false, error: 'Missing tabId or text' };
+  try {
+    requirePersistableText(text, 'Translation input');
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+  const operationId = msg.operationId || createOperationId('translate', tabId);
   const promptWasProvided = Object.prototype.hasOwnProperty.call(msg, 'prompt');
   let promptSnapshot = promptWasProvided ? normalizeCustomPrompt(msg.prompt) : undefined;
   if (!promptWasProvided) {
@@ -571,6 +644,7 @@ async function handleTranslateStart(msg) {
 
   try {
     translateControllers.set(tabId, controller);
+    translateOperationIds.set(tabId, operationId);
     startKeepAlive();
     timeoutId = setTimeout(() => {
       timedOut = true;
@@ -580,6 +654,10 @@ async function handleTranslateStart(msg) {
     // Persist state so popup reopen shows "Stop" button.
     // Clear any stale result so init() doesn't mistake an old result
     // for a just-completed translation.
+    await persistOperation('translate', tabId, operationId, {
+      text, language, host: host || DEFAULT_HOST, port: port || DEFAULT_PORT,
+      prompt: promptSnapshot
+    });
     await chrome.storage.local.set({
       [`tl2Translating:${tabId}`]: true,
       [`tl2Status:${tabId}`]: `Translating to ${language}...`
@@ -592,7 +670,9 @@ async function handleTranslateStart(msg) {
       // "Original" with no custom prompt → pass through unchanged
       if (language === 'original' && !promptSnapshot) {
         const translated = text;
+        if (!isCurrentOperation(translateOperationIds, tabId, operationId)) return { ok: false, error: 'Translation superseded.' };
         await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
+        await clearOperation('translate', tabId, operationId);
         chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
         if (translated) autoCopyIfEnabled(translated);
         if (translated) autoSaveIfEnabled(translated);
@@ -602,14 +682,19 @@ async function handleTranslateStart(msg) {
       const url = buildBackendEndpoint(host || DEFAULT_HOST, port || DEFAULT_PORT, `/translate?_=${Date.now()}`);
       const response = await fetch(url, {
         method: 'POST',
-        headers: await getBackendHeaders('application/json'),
+        headers: await getBackendHeaders('application/json', operationId),
         body: JSON.stringify({ text, language, prompt: customPrompt || undefined }),
         signal: controller.signal
       });
       const payload = await readJsonObject(response, 'Translation backend');
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
       const translated = requireTextPayload(payload, 'Translation backend');
+      requirePersistableText(translated, 'Translation result');
+      if (!isCurrentOperation(translateOperationIds, tabId, operationId)) {
+        return { ok: false, error: 'Translation superseded.' };
+      }
       await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
+      await clearOperation('translate', tabId, operationId);
       chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
       // Auto-copy / auto-save translated text
       if (translated) autoCopyIfEnabled(translated);
@@ -617,6 +702,10 @@ async function handleTranslateStart(msg) {
       // Auto-format: trigger from background so it survives popup close
       if (translated) autoFormatIfEnabled(tabId, translated, host, port);
     } catch (e) {
+      if (!isCurrentOperation(translateOperationIds, tabId, operationId)) {
+        return { ok: false, error: 'Translation superseded.' };
+      }
+      await clearOperation('translate', tabId, operationId).catch(() => {});
       if (e.name === 'AbortError') {
         const message = timedOut ? 'Translation timed out.' : 'Translation stopped.';
         await chrome.storage.local.set({ [`tl2Status:${tabId}`]: message });
@@ -630,8 +719,10 @@ async function handleTranslateStart(msg) {
     }
   } finally {
     clearTimeout(timeoutId);
-    if (controller && translateControllers.get(tabId) === controller) {
+    if (controller && translateControllers.get(tabId) === controller
+        && isCurrentOperation(translateOperationIds, tabId, operationId)) {
       translateControllers.delete(tabId);
+      translateOperationIds.delete(tabId);
       await chrome.storage.local.remove(`tl2Translating:${tabId}`).catch((error) => {
         console.error('Failed to clear translation state:', error);
       });
@@ -645,11 +736,14 @@ async function handleTranslateStart(msg) {
 
 function handleTranslateStop(tabId) {
   const controller = translateControllers.get(tabId);
+  const operationId = translateOperationIds.get(tabId);
   if (controller) {
     controller.abort();
     translateControllers.delete(tabId);
     chrome.storage.local.remove(`tl2Translating:${tabId}`);
   }
+  translateOperationIds.delete(tabId);
+  if (operationId) clearOperation('translate', tabId, operationId).catch(() => {});
 }
 
 async function handleSaveTranslation(msg) {
@@ -684,6 +778,12 @@ async function handleSaveTranslation(msg) {
 async function handleFormatStart(msg) {
   const { tabId, text, host, port } = msg;
   if (!tabId || !text) return { ok: false, error: 'Missing tabId or text' };
+  try {
+    requirePersistableText(text, 'Format input');
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+  const operationId = msg.operationId || createOperationId('format', tabId);
   const promptWasProvided = Object.prototype.hasOwnProperty.call(msg, 'prompt');
   let prompt = promptWasProvided ? normalizeCustomPrompt(msg.prompt) : undefined;
   if (!promptWasProvided) {
@@ -700,6 +800,7 @@ async function handleFormatStart(msg) {
 
   try {
     formatControllers.set(tabId, controller);
+    formatOperationIds.set(tabId, operationId);
     startKeepAlive();
     timeoutId = setTimeout(() => {
       timedOut = true;
@@ -707,6 +808,9 @@ async function handleFormatStart(msg) {
     }, BACKEND_TIMEOUT_MS);
 
     // Persist state so popup reopen shows "Stop" button.
+    await persistOperation('format', tabId, operationId, {
+      text, host: host || DEFAULT_HOST, port: port || DEFAULT_PORT, prompt
+    });
     await chrome.storage.local.set({
       [`fmtFormatting:${tabId}`]: true,
       [`fmtStatus:${tabId}`]: 'Formatting...'
@@ -718,19 +822,28 @@ async function handleFormatStart(msg) {
       const url = buildBackendEndpoint(host || DEFAULT_HOST, port || DEFAULT_PORT, `/format?_=${Date.now()}`);
       const response = await fetch(url, {
         method: 'POST',
-        headers: await getBackendHeaders('application/json'),
+        headers: await getBackendHeaders('application/json', operationId),
         body: JSON.stringify({ text, prompt }),
         signal: controller.signal
       });
       const payload = await readJsonObject(response, 'Format backend');
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
       const formatted = requireTextPayload(payload, 'Format backend');
+      requirePersistableText(formatted, 'Format result');
+      if (!isCurrentOperation(formatOperationIds, tabId, operationId)) {
+        return { ok: false, error: 'Formatting superseded.' };
+      }
       await chrome.storage.local.set({ [`fmtResult:${tabId}`]: formatted });
+      await clearOperation('format', tabId, operationId);
       chrome.runtime.sendMessage({ type: 'format:update', tabId, text: formatted }).catch(() => {});
       // Auto-copy / auto-save formatted text (background-side, survives popup close)
       if (formatted) fmtAutoCopyIfEnabled(formatted);
       if (formatted) fmtAutoSaveIfEnabled(formatted);
     } catch (e) {
+      if (!isCurrentOperation(formatOperationIds, tabId, operationId)) {
+        return { ok: false, error: 'Formatting superseded.' };
+      }
+      await clearOperation('format', tabId, operationId).catch(() => {});
       if (e.name === 'AbortError') {
         const message = timedOut ? 'Formatting timed out.' : 'Formatting stopped.';
         await chrome.storage.local.set({ [`fmtStatus:${tabId}`]: message });
@@ -744,8 +857,10 @@ async function handleFormatStart(msg) {
     }
   } finally {
     clearTimeout(timeoutId);
-    if (formatControllers.get(tabId) === controller) {
+    if (formatControllers.get(tabId) === controller
+        && isCurrentOperation(formatOperationIds, tabId, operationId)) {
       formatControllers.delete(tabId);
+      formatOperationIds.delete(tabId);
       await chrome.storage.local.remove(`fmtFormatting:${tabId}`).catch((error) => {
         console.error('Failed to clear format state:', error);
       });
@@ -759,11 +874,14 @@ async function handleFormatStart(msg) {
 
 function handleFormatStop(tabId) {
   const controller = formatControllers.get(tabId);
+  const operationId = formatOperationIds.get(tabId);
   if (controller) {
     controller.abort();
     formatControllers.delete(tabId);
     chrome.storage.local.remove(`fmtFormatting:${tabId}`);
   }
+  formatOperationIds.delete(tabId);
+  if (operationId) clearOperation('format', tabId, operationId).catch(() => {});
 }
 
 async function autoFormatIfEnabled(tabId, text, host, port, source = 'translation') {
@@ -815,7 +933,8 @@ async function runCaptureLoop(tab, region) {
   return executeCaptureLoop({
     tabId,
     region: normalizedRegion,
-    fragments: [],
+    mergedText: '',
+    fragmentsCollected: 0,
     lastScrollY: -1,
     resetBeforeStart: true,
     refreshAutoscroll: false,
@@ -830,24 +949,30 @@ async function resumeCaptureLoop(rs) {
   return executeCaptureLoop({
     tabId,
     region: normalizeRegion(rs.region),
-    fragments: rs.fragments || [],
+    mergedText: rs.mergedText || mergeFragments(rs.fragments || []),
+    fragmentsCollected: rs.fragmentsCollected ?? (rs.fragments || []).length,
     lastScrollY: rs.lastScrollY ?? -1,
     resetBeforeStart: false,
     refreshAutoscroll: true,
     captureUrl: rs.captureUrl || null,
-    promptSnapshot: rs.promptSnapshot || getState(tabId).operationPrompts || await snapshotCapturePrompts()
+    promptSnapshot: rs.promptSnapshot || getState(tabId).operationPrompts || await snapshotCapturePrompts(),
+    operationId: rs.operationId,
+    captureDocumentId: rs.captureDocumentId || null
   });
 }
 
 async function executeCaptureLoop({
   tabId,
   region,
-  fragments,
+  mergedText,
+  fragmentsCollected,
   lastScrollY,
   resetBeforeStart,
   refreshAutoscroll,
   captureUrl,
-  promptSnapshot
+  promptSnapshot,
+  operationId: recoveredOperationId,
+  captureDocumentId: recoveredDocumentId = null
 }) {
   const state = getState(tabId);
 
@@ -856,11 +981,16 @@ async function executeCaptureLoop({
   state.captureInFlight = true;
 
   const controller = new AbortController();
+  const operationId = recoveredOperationId || createOperationId('capture', tabId);
   captureControllers.set(tabId, controller);
+  captureOperationIds.set(tabId, operationId);
   startKeepAlive();
 
+  const accumulator = new IncrementalFragmentMerger(mergedText || '');
+  let fragmentCount = Number(fragmentsCollected) || 0;
   let scrollLocked = false;
   let fixedAutoscroll;
+  let completed = false;
   try {
     if (resetBeforeStart) {
       resetState(tabId);
@@ -872,12 +1002,37 @@ async function executeCaptureLoop({
 
     const initialTab = await getLiveTargetTab(tabId);
     state.captureUrl = captureUrl || initialTab?.url || state.captureUrl || null;
+    state.captureDocumentGeneration = tabDocumentGenerations.get(tabId) || 0;
+    const identity = await chrome.tabs.sendMessage(tabId, { type: 'page:get-document-id' }).catch(() => null);
+    if (recoveredDocumentId && identity?.documentId && recoveredDocumentId !== identity.documentId) {
+      state.navigationChanged = true;
+      state.partialReason = 'navigation';
+    }
+    state.captureDocumentId = recoveredDocumentId || identity?.documentId || null;
+    state.captureOperationId = operationId;
+    state.checkpointText = accumulator.text;
 
     let scrollY = lastScrollY;
     let atBottom = false;
 
+    const persistCheckpoint = async (stage = 'capture') => {
+      const input = {
+        region,
+        mergedText: accumulator.text,
+        fragmentsCollected: fragmentCount,
+        lastScrollY: scrollY,
+        captureUrl: state.captureUrl,
+        captureDocumentId: state.captureDocumentId,
+        promptSnapshot: state.operationPrompts,
+        stage
+      };
+      await persistOperation('capture', tabId, operationId, input);
+      return input;
+    };
+    await persistCheckpoint();
+
     capturePages: while (true) {
-      if (state.stopRequested || state.targetRemoved) break;
+      if (state.stopRequested || state.targetRemoved || state.navigationChanged) break;
       if (fixedAutoscroll === undefined || refreshAutoscroll) {
         const settings = await chrome.storage.sync.get({ ocrAutoscroll: true });
         fixedAutoscroll = settings.ocrAutoscroll;
@@ -886,14 +1041,14 @@ async function executeCaptureLoop({
       const { captureIntervalMs } = await chrome.storage.sync.get({
         captureIntervalMs: DEFAULT_CAPTURE_INTERVAL_MS
       });
-      if (!ocrAutoscroll && fragments.length > 0) {
+      if (!ocrAutoscroll && fragmentCount > 0) {
         updateState(tabId, { progress: 'Single capture complete (autoscroll off).' });
         break;
       }
-      const pageNumber = fragments.length + 1;
+      const pageNumber = fragmentCount + 1;
       updateState(tabId, {
         currentPage: pageNumber,
-        fragmentsCollected: fragments.length,
+        fragmentsCollected: fragmentCount,
         progress: `Capturing page ${pageNumber}...`
       });
 
@@ -911,14 +1066,12 @@ async function executeCaptureLoop({
       const croppedBlob = await cropVisibleCapture(dataUrl, region);
 
       updateState(tabId, { progress: `Sending page ${pageNumber} to OCR...` });
+      const checkpoint = await persistCheckpoint('ocr');
       state.retryState = {
         stage: 'ocr',
         tabId,
-        region,
-        fragments: [...fragments],
-        lastScrollY: scrollY,
-        promptSnapshot: state.operationPrompts,
-        ...(state.captureUrl ? { captureUrl: state.captureUrl } : {})
+        operationId,
+        ...checkpoint
       };
       await chrome.storage.local.set({ [`retryState:${tabId}`]: state.retryState });
       for (let attempt = 1; ; attempt++) {
@@ -939,12 +1092,22 @@ async function executeCaptureLoop({
             croppedBlob,
             pageNumber,
             controller.signal,
-            state.operationPrompts?.ocr
+            state.operationPrompts?.ocr,
+            operationId
           );
-          fragments.push(text);
+          accumulator.append(text);
+          fragmentCount += 1;
+          state.checkpointText = accumulator.text;
           await clearRetryState(tabId, state);
+          await persistCheckpoint();
           break;
         } catch (e) {
+          if (e?.code === 'TEXT_LIMIT') {
+            state.partialReason = 'text_limit';
+            state.partialError = e.message;
+            await clearRetryState(tabId, state);
+            break capturePages;
+          }
           if (state.stopRequested || state.targetRemoved || controller.signal.aborted) {
             await clearRetryState(tabId, state);
             break capturePages;
@@ -955,16 +1118,15 @@ async function executeCaptureLoop({
       }
 
       updateState(tabId, {
-        fragments,
-        fragmentsCollected: fragments.length,
-        progress: `Collected ${fragments.length} fragment${fragments.length === 1 ? '' : 's'}.`
+        fragmentsCollected: fragmentCount,
+        progress: `Collected ${fragmentCount} fragment${fragmentCount === 1 ? '' : 's'}.`
       });
 
       await sleep(AFTER_SEND_DELAY_MS);
 
       if (!ocrAutoscroll) break;
 
-      if (fragments.length >= MAX_CAPTURE_PAGES) {
+      if (fragmentCount >= MAX_CAPTURE_PAGES) {
         updateState(tabId, { progress: `Reached page limit (${MAX_CAPTURE_PAGES}). Stopping.` });
         break;
       }
@@ -994,7 +1156,7 @@ async function executeCaptureLoop({
       const scrollResult = requireScrollResponse(sentScroll.response);
 
       if (scrollResult?.atBottom) {
-        if (!scrollResult.changed && fragments.length > 0) break;
+        if (!scrollResult.changed && fragmentCount > 0) break;
         atBottom = true;
         await sleep(captureIntervalMs);
         continue;
@@ -1004,24 +1166,28 @@ async function executeCaptureLoop({
     }
 
     state.collectionComplete = true;
-    const mergedText = mergeFragments(fragments);
+    const finalMergedText = accumulator.text;
     if (state.navigationChanged) state.partialReason = 'navigation';
     else if (state.stopRequested) state.partialReason = 'stopped';
     else if (state.targetRemoved) state.partialReason = 'tab_closed';
     if (state.partialReason) {
       // An interrupted capture preserves every fragment collected so far but
       // must not present or automate the result as a complete capture.
-      await finalizeCapture(tabId, mergedText, fragments);
+      await finalizeCapture(tabId, finalMergedText, fragmentCount);
     } else {
-      updateState(tabId, { progress: 'Deduplicating merged text...', fragments });
-      await finalizePostCapture(tabId, mergedText, fragments);
+      updateState(tabId, { progress: 'Deduplicating merged text...' });
+      await finalizePostCapture(tabId, finalMergedText, fragmentCount);
     }
+    completed = true;
   } finally {
     state.captureInFlight = false;
-    captureControllers.delete(tabId);
+    if (captureControllers.get(tabId) === controller) captureControllers.delete(tabId);
+    if (isCurrentOperation(captureOperationIds, tabId, operationId)) captureOperationIds.delete(tabId);
+    if (completed) await clearOperation('capture', tabId, operationId).catch(() => {});
     if (captureControllers.size === 0 && translateControllers.size === 0 && formatControllers.size === 0) stopKeepAlive();
     // Unlock page scroll
     if (scrollLocked) chrome.tabs.sendMessage(tabId, { type: 'page:unlock-scroll' }).catch(() => {});
+    if (state.targetRemoved) await cleanupClosedTab(tabId).catch(() => {});
   }
 }
 
@@ -1046,7 +1212,8 @@ function markTargetNavigated(tabId, state = getState(tabId)) {
 }
 
 function targetDocumentChanged(tabId, state, tab) {
-  if (!state.captureUrl || !tab?.url || tab.url === state.captureUrl) return false;
+  const generationChanged = (tabDocumentGenerations.get(tabId) || 0) !== state.captureDocumentGeneration;
+  if (!generationChanged && (!state.captureUrl || !tab?.url || tab.url === state.captureUrl)) return false;
   markTargetNavigated(tabId, state);
   return true;
 }
@@ -1164,9 +1331,17 @@ async function sendMessageToActiveTarget(tabId, state, signal, message, resumePr
       continue;
     }
     try {
+      const response = await chrome.tabs.sendMessage(tabId, message);
+      if (response?.documentId) {
+        if (state.captureDocumentId && response.documentId !== state.captureDocumentId) {
+          markTargetNavigated(tabId, state);
+          return { status: 'navigated' };
+        }
+        state.captureDocumentId ||= response.documentId;
+      }
       return {
         status: 'sent',
-        response: await chrome.tabs.sendMessage(tabId, message),
+        response,
         windowId: snapshot.windowId
       };
     } catch (error) {
@@ -1181,10 +1356,13 @@ async function sendMessageToActiveTarget(tabId, state, signal, message, resumePr
   }
 }
 
-async function finalizePostCapture(tabId, mergedText, fragments) {
+function fragmentCountOf(fragmentsOrCount) {
+  return Array.isArray(fragmentsOrCount) ? fragmentsOrCount.length : Math.max(0, Number(fragmentsOrCount) || 0);
+}
+
+async function finalizePostCapture(tabId, mergedText, fragmentsOrCount) {
   const state = getState(tabId);
-  // Save pre-dedup text for debugging
-  chrome.storage.local.set({ [`preDedup:${tabId}`]: mergedText }).catch(() => {});
+  const fragmentCount = fragmentCountOf(fragmentsOrCount);
   const signal = captureControllers.get(tabId)?.signal;
   state.retryStage = 'dedup';
   state.pendingText = mergedText;
@@ -1192,21 +1370,30 @@ async function finalizePostCapture(tabId, mergedText, fragments) {
     stage: 'dedup',
     tabId,
     mergedText,
-    fragments: [...fragments],
+    fragmentsCollected: fragmentCount,
     promptSnapshot: state.operationPrompts,
+    operationId: state.captureOperationId,
     ...(state.captureUrl ? { captureUrl: state.captureUrl } : {})
   };
   await chrome.storage.local.set({ [`retryState:${tabId}`]: state.retryState });
+  if (state.captureOperationId) {
+    await persistOperation('capture', tabId, state.captureOperationId, {
+      stage: 'dedup',
+      mergedText,
+      fragmentsCollected: fragmentCount,
+      promptSnapshot: state.operationPrompts,
+      captureUrl: state.captureUrl
+    });
+  }
   let finalText;
   for (let attempt = 1; ; attempt++) {
     try {
       finalText = await postTextForDedup(
         mergedText,
         signal,
-        state.operationPrompts?.dedup
+        state.operationPrompts?.dedup,
+        state.captureOperationId
       );
-      // Save post-dedup text for debugging
-      chrome.storage.local.set({ [`postDedup:${tabId}`]: finalText }).catch(() => {});
       await clearRetryState(tabId, state);
       break;
     } catch (e) {
@@ -1222,38 +1409,43 @@ async function finalizePostCapture(tabId, mergedText, fragments) {
 
   if (!finalText) {
     // Stop requested during retry — finalize raw text
-    await finalizeCapture(tabId, mergedText, fragments);
+    await finalizeCapture(tabId, mergedText, fragmentCount);
     return;
   }
 
-  await finalizeCapture(tabId, finalText, fragments);
+  await finalizeCapture(tabId, finalText, fragmentCount);
 }
 
-async function finalizeCapture(tabId, finalText, fragments) {
+async function finalizeCapture(tabId, finalText, fragmentsOrCount) {
   const state = getState(tabId);
+  requirePersistableText(finalText, 'Capture result');
+  const fragmentCount = fragmentCountOf(fragmentsOrCount);
   state.retryStage = null;
   state.pendingText = '';
 
   const isPartial = Boolean(state.partialReason);
   let progress = 'Finished.';
   if (state.partialReason === 'navigation') {
-    progress = `Partial capture: page navigation stopped capture after ${fragments.length} fragment${fragments.length === 1 ? '' : 's'}.`;
+    progress = `Partial capture: page navigation stopped capture after ${fragmentCount} fragment${fragmentCount === 1 ? '' : 's'}.`;
   } else if (state.partialReason === 'stopped') {
-    progress = `Partial capture stopped after ${fragments.length} fragment${fragments.length === 1 ? '' : 's'}.`;
+    progress = `Partial capture stopped after ${fragmentCount} fragment${fragmentCount === 1 ? '' : 's'}.`;
   } else if (state.partialReason === 'tab_closed') {
-    progress = `Partial capture: the tab closed after ${fragments.length} fragment${fragments.length === 1 ? '' : 's'}.`;
+    progress = `Partial capture: the tab closed after ${fragmentCount} fragment${fragmentCount === 1 ? '' : 's'}.`;
   } else if (state.partialReason === 'error') {
-    progress = `Partial capture ended after an error; saved ${fragments.length} fragment${fragments.length === 1 ? '' : 's'}.`;
+    progress = `Partial capture ended after an error; saved ${fragmentCount} fragment${fragmentCount === 1 ? '' : 's'}.`;
+  } else if (state.partialReason === 'text_limit') {
+    progress = `Partial capture stopped at the ${MAX_PERSISTED_TEXT_CHARS}-character safety limit after ${fragmentCount} fragment${fragmentCount === 1 ? '' : 's'}.`;
   }
   const finalStatus = isPartial ? 'Partial' : 'Done';
 
   updateState(tabId, {
     active: false,
     status: finalStatus,
-    currentPage: fragments.length,
-    fragmentsCollected: fragments.length,
+    currentPage: fragmentCount,
+    fragmentsCollected: fragmentCount,
     progress,
-    fragments,
+    fragments: [],
+    checkpointText: finalText,
     mergedText: finalText
   });
   try {
@@ -1285,76 +1477,10 @@ async function autoTranslateIfEnabled(tabId, originalText) {
   });
   if (!ocrAutoTranslate) return;
 
-  // Read language from the global Translation tab setting
   const tl2Lang = await chrome.storage.local.get('tl2Language');
   const language = tl2Lang.tl2Language || 'original';
-  const key = `translatePrompt:${language}`;
-  const stored = await chrome.storage.local.get(key);
-  const promptSnapshot = normalizeCustomPrompt(stored[key]);
-  // "Original" with no custom prompt → skip (nothing to do)
-  if (language === 'original' && !promptSnapshot) return;
-
-  // Abort any in-flight translation for this tab
-  handleTranslateStop(tabId);
-
-  let controller = null;
-  let timedOut = false;
-  let timeoutId = null;
-
-  try {
-    controller = new AbortController();
-    translateControllers.set(tabId, controller);
-    timeoutId = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, BACKEND_TIMEOUT_MS);
-
-    updateState(tabId, { tl2Translating: true });
-    await chrome.storage.local.set({
-      [`tl2Translating:${tabId}`]: true,
-      [`tl2Status:${tabId}`]: `Translating to ${language}...`
-    });
-    await chrome.storage.local.remove(`tl2Result:${tabId}`);
-    chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: true }).catch(() => {});
-    const customPrompt = renderTranslationPrompt(promptSnapshot, language);
-    const url = await getBackendEndpoint('/translate');
-    const response = await fetch(url + '?_=' + Date.now(), {
-      method: 'POST',
-      headers: await getBackendHeaders('application/json'),
-      body: JSON.stringify({ text: originalText, language, prompt: customPrompt || undefined }),
-      signal: controller.signal
-    });
-    const payload = await readJsonObject(response, 'Translation backend');
-    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-    const translated = requireTextPayload(payload, 'Translation backend');
-    updateState(tabId, { tl2Translating: false });
-    await chrome.storage.local.set({ [`tl2Result:${tabId}`]: translated });
-    chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: translated }).catch(() => {});
-    // Auto-copy / auto-save translated text
-    if (translated) autoCopyIfEnabled(translated);
-    if (translated) autoSaveIfEnabled(translated);
-    // Auto-format if enabled
-    if (translated) autoFormatIfEnabled(tabId, translated);
-  } catch (e) {
-    if (e.name === 'AbortError' && !timedOut) return; // User clicked Stop — silent
-    console.error('Auto-translate failed:', e);
-    const errorMessage = timedOut ? 'Translation timed out.' : (e.message || 'Translation failed.');
-    await chrome.storage.local.set({ [`tl2Status:${tabId}`]: errorMessage });
-    updateState(tabId, { tl2Translating: false });
-    await chrome.storage.local.remove(`tl2Translating:${tabId}`).catch((error) => {
-      console.error('Failed to clear auto-translation state:', error);
-    });
-    chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: '', error: errorMessage }).catch(() => {});
-  } finally {
-    clearTimeout(timeoutId);
-    if (controller && translateControllers.get(tabId) === controller) {
-      translateControllers.delete(tabId);
-      await chrome.storage.local.remove(`tl2Translating:${tabId}`).catch((error) => {
-        console.error('Failed to clear auto-translation state:', error);
-      });
-      chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: false }).catch(() => {});
-    }
-  }
+  const result = await handleTranslateStart({ tabId, text: originalText, language });
+  if (!result?.ok) throw new Error(result?.error || 'Auto-translation failed.');
 }
 
 function renderTranslationPrompt(template, language) {
@@ -1390,7 +1516,7 @@ async function cropVisibleCapture(dataUrl, region) {
 
 // ── OCR call ───────────────────────────────────────────────────
 
-async function postImageForOcr(blob, pageNumber, signal, customPrompt) {
+async function postImageForOcr(blob, pageNumber, signal, customPrompt, operationId = '') {
   if (arguments.length < 4) {
     const stored = await chrome.storage.local.get('ocrPrompt');
     customPrompt = normalizeCustomPrompt(stored.ocrPrompt);
@@ -1402,7 +1528,7 @@ async function postImageForOcr(blob, pageNumber, signal, customPrompt) {
   const url = await getBackendEndpoint('/ocr');
   const response = await fetchWithTimeout(url, {
     method: 'POST',
-    headers: await getBackendHeaders(),
+    headers: await getBackendHeaders(undefined, operationId ? `${operationId}:page:${pageNumber}` : ''),
     body: formData
   }, signal);
 
@@ -1418,7 +1544,7 @@ async function postImageForOcr(blob, pageNumber, signal, customPrompt) {
   return (await response.text()).trim();
 }
 
-async function postTextForDedup(text, signal, customPrompt) {
+async function postTextForDedup(text, signal, customPrompt, operationId = '') {
   if (arguments.length < 3) {
     const stored = await chrome.storage.local.get('dedupPrompt');
     customPrompt = normalizeCustomPrompt(stored.dedupPrompt);
@@ -1430,7 +1556,7 @@ async function postTextForDedup(text, signal, customPrompt) {
 
   const response = await fetchWithTimeout(url + '?_=' + Date.now(), {
     method: 'POST',
-    headers: await getBackendHeaders('application/json'),
+    headers: await getBackendHeaders('application/json', operationId ? `${operationId}:dedup` : ''),
     body: JSON.stringify(body)
   }, signal);
 
@@ -1444,11 +1570,34 @@ async function postTextForDedup(text, signal, customPrompt) {
 
 // ── merge logic ────────────────────────────────────────────────
 
+class IncrementalFragmentMerger {
+  constructor(initialText = '') {
+    this.text = normalizeText(initialText);
+    this.lines = this.text ? this.text.split('\n') : [];
+  }
+
+  append(fragment) {
+    const nextLines = splitLines(fragment);
+    if (!nextLines.length) return;
+    const overlap = findLineOverlap(this.lines, nextLines);
+    const appendedLines = nextLines.slice(overlap);
+    if (!appendedLines.length) return;
+    const appendedText = appendedLines.join('\n');
+    const candidateLength = this.text.length + (this.text ? 1 : 0) + appendedText.length;
+    if (candidateLength > MAX_PERSISTED_TEXT_CHARS) {
+      const error = new Error(`Capture text exceeded the ${MAX_PERSISTED_TEXT_CHARS}-character checkpoint limit.`);
+      error.code = 'TEXT_LIMIT';
+      throw error;
+    }
+    this.lines.push(...appendedLines);
+    this.text = this.text ? `${this.text}\n${appendedText}` : appendedText;
+  }
+}
+
 function mergeFragments(fragments) {
-  return fragments.reduce((merged, f) => {
-    const clean = normalizeText(f);
-    return merged ? mergeTwoFragments(merged, clean) : clean;
-  }, '');
+  const merger = new IncrementalFragmentMerger();
+  for (const fragment of fragments || []) merger.append(fragment);
+  return merger.text;
 }
 
 function mergeTwoFragments(prev, next) {
@@ -1567,7 +1716,11 @@ function resetState(tabId) {
     partialReason: '',
     partialError: '',
     operationPrompts: null,
-    selectionToken: null
+    selectionToken: null,
+    checkpointText: '',
+    captureDocumentGeneration: 0,
+    captureOperationId: null,
+    captureDocumentId: null
   });
   broadcastState(tabId);
   // Clear stale stored result/status so popup init() doesn't reload old capture
@@ -1640,8 +1793,25 @@ function updateState(tabId, partial) {
   broadcastState(tabId);
 }
 
+function getPublicState(state) {
+  return {
+    active: state.active,
+    status: state.status,
+    currentPage: state.currentPage,
+    fragmentsCollected: state.fragmentsCollected,
+    progress: state.progress,
+    mergedText: state.mergedText,
+    error: state.error,
+    lastRegion: state.lastRegion,
+    retryStage: state.retryStage,
+    retryState: state.retryState ? { stage: state.retryState.stage } : null,
+    partialReason: state.partialReason,
+    tl2Translating: state.tl2Translating
+  };
+}
+
 function broadcastState(tabId) {
-  chrome.runtime.sendMessage({ type: 'state:update', tabId, state: getState(tabId) }).catch(() => {});
+  chrome.runtime.sendMessage({ type: 'state:update', tabId, state: getPublicState(getState(tabId)) }).catch(() => {});
 }
 
 // ── Auto-copy / auto-save helpers (for auto-translate) ─────────
@@ -1760,3 +1930,67 @@ async function clearRetryState(tabId, state = getState(tabId)) {
   state.retryState = null;
   await chrome.storage.local.remove(`retryState:${tabId}`);
 }
+
+async function recoverPersistedOperations() {
+  const stored = await chrome.storage.local.get(null);
+  const operations = Object.entries(stored)
+    .filter(([key, value]) => key.startsWith('operation:') && value?.status === 'running');
+  for (const [key, operation] of operations) {
+    if (operation.version !== OPERATION_SCHEMA_VERSION
+        || !Number.isInteger(operation.tabId)
+        || typeof operation.operationId !== 'string'
+        || !operation.input || typeof operation.input !== 'object') {
+      await chrome.storage.local.remove(key);
+      continue;
+    }
+    const tab = await getLiveTargetTab(operation.tabId);
+    if (!tab) {
+      await chrome.storage.local.remove(key);
+      continue;
+    }
+    if (operation.type === 'translate' && !translateControllers.has(operation.tabId)) {
+      handleTranslateStart({ ...operation.input, tabId: operation.tabId, operationId: operation.operationId })
+        .catch((error) => console.error('Translation recovery failed:', error));
+    } else if (operation.type === 'format' && !formatControllers.has(operation.tabId)) {
+      handleFormatStart({ ...operation.input, tabId: operation.tabId, operationId: operation.operationId })
+        .catch((error) => console.error('Format recovery failed:', error));
+    } else if (operation.type === 'capture' && !captureControllers.has(operation.tabId)) {
+      const input = operation.input;
+      const state = getState(operation.tabId);
+      Object.assign(state, {
+        active: true,
+        status: input.stage === 'dedup' ? 'Deduplicating' : 'Capturing',
+        progress: 'Resuming after service worker restart...',
+        checkpointText: input.mergedText || '',
+        fragmentsCollected: input.fragmentsCollected || 0,
+        operationPrompts: normalizeCapturePrompts(input.promptSnapshot),
+        captureUrl: input.captureUrl || tab.url || null,
+        captureOperationId: operation.operationId,
+        captureDocumentId: input.captureDocumentId || null
+      });
+      if (input.stage === 'dedup') {
+        const controller = new AbortController();
+        captureControllers.set(operation.tabId, controller);
+        captureOperationIds.set(operation.tabId, operation.operationId);
+        startKeepAlive();
+        finalizePostCapture(
+          operation.tabId,
+          input.mergedText || '',
+          input.fragmentsCollected || 0
+        ).then(() => clearOperation('capture', operation.tabId, operation.operationId))
+          .catch((error) => console.error('Dedup recovery failed:', error))
+          .finally(() => {
+            if (captureControllers.get(operation.tabId) === controller) captureControllers.delete(operation.tabId);
+            if (isCurrentOperation(captureOperationIds, operation.tabId, operation.operationId)) {
+              captureOperationIds.delete(operation.tabId);
+            }
+          });
+      } else {
+        resumeCaptureLoop({ ...input, tabId: operation.tabId, operationId: operation.operationId })
+          .catch((error) => handleCaptureLoopFailure(operation.tabId, error, 'Capture recovery failed:'));
+      }
+    }
+  }
+}
+
+recoverPersistedOperations().catch((error) => console.error('Operation recovery scan failed:', error));
