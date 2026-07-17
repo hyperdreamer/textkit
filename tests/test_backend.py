@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from io import BytesIO
 from pathlib import Path
 
@@ -12,8 +13,16 @@ from backend import main
 
 
 @pytest.fixture
-def client() -> TestClient:
-    return TestClient(main.app)
+def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    monkeypatch.setattr(main, "load_config", lambda: _app_config())
+    return TestClient(main.app, headers={"X-TextKit-Admin-Token": "test-admin"})
+
+
+@pytest.fixture(autouse=True)
+def reset_backend_globals() -> None:
+    main._prompt_cache.clear()
+    main._rate_events.clear()
+    main._active_requests = 0
 
 
 def _ai_config() -> main.AIConfig:
@@ -25,7 +34,13 @@ def _ai_config() -> main.AIConfig:
 
 
 def _app_config(*, host: str = "localhost", debug: bool = False) -> main.AppConfig:
-    return main.AppConfig(host=host, debug=debug, ai=_ai_config())
+    return main.AppConfig(
+        host=host,
+        debug=debug,
+        extension_token="test-extension",
+        admin_token="test-admin",
+        ai=_ai_config(),
+    )
 
 
 def _png_bytes() -> bytes:
@@ -63,14 +78,12 @@ def test_ai_endpoints_reject_untrusted_web_origins(
     response = client.post(path, headers={"Origin": "https://malicious.example"})
 
     assert response.status_code == 403
-    assert response.json()["error"] == (
-        "Origin not allowed for AI endpoint: https://malicious.example"
-    )
+    assert response.json()["error"] == "Extension origin is not authorized"
 
 
 @pytest.mark.parametrize(
     "origin",
-    [None, "chrome-extension://abcdefghijklmnop", "http://localhost:3000"],
+    [None, "http://localhost:3000"],
 )
 def test_ai_endpoints_allow_curl_extension_and_configured_host_origins(
     client: TestClient,
@@ -95,6 +108,29 @@ def test_ai_endpoints_allow_curl_extension_and_configured_host_origins(
     assert response.json()["text"] == "formatted"
 
 
+def test_extension_origin_requires_shared_secret(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main, "load_config", lambda: _app_config())
+    origin = "chrome-extension://abcdefghijklmnopqrstuvwxyzabcdef"
+
+    rejected = client.post("/format", json={"text": "source"}, headers={"Origin": origin})
+    assert rejected.status_code == 403
+
+    async def fake_format(
+        _config: main.AIConfig, _text: str, _prompt: str | None = None
+    ) -> main.OCRResponse:
+        return main.OCRResponse(text="formatted", model="test-model", tokens_used=1)
+
+    monkeypatch.setattr(main, "format_text", fake_format)
+    accepted = client.post(
+        "/format",
+        json={"text": "source"},
+        headers={"Origin": origin, "X-TextKit-Token": "test-extension"},
+    )
+    assert accepted.status_code == 200
+
+
 def test_debug_artifacts_are_written_only_when_debug_is_enabled(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -113,18 +149,12 @@ def test_debug_artifacts_are_written_only_when_debug_is_enabled(
 
     monkeypatch.setattr(main, "transcribe_image", fake_ocr)
     monkeypatch.setattr(main, "deduplicate_text", fake_dedup)
-    writes: list[str] = []
+    writes: list[tuple[str, bytes]] = []
 
-    def record_bytes(path: Path, _data: bytes) -> int:
-        writes.append(str(path))
-        return 1
+    def record_private(name: str, data: bytes) -> None:
+        writes.append((name, data))
 
-    def record_text(path: Path, _data: str, **_kwargs: object) -> int:
-        writes.append(str(path))
-        return 1
-
-    monkeypatch.setattr(Path, "write_bytes", record_bytes)
-    monkeypatch.setattr(Path, "write_text", record_text)
+    monkeypatch.setattr(main, "_write_private_file", record_private)
 
     ocr_response = client.post(
         "/ocr",
@@ -147,11 +177,11 @@ def test_debug_artifacts_are_written_only_when_debug_is_enabled(
     )
     client.post("/dedup", json={"text": "raw text", "prompt": "deduplicate"})
 
-    assert writes == [
-        "/tmp/last_screenshot.png",
-        "/tmp/last_ocr.txt",
-        "/tmp/pre_dedup.txt",
-        "/tmp/after_dedup.txt",
+    assert [name for name, _data in writes] == [
+        "last_screenshot.png",
+        "last_ocr.txt",
+        "pre_dedup.txt",
+        "after_dedup.txt",
     ]
 
 
@@ -291,3 +321,124 @@ def test_file_bridge_routes_are_not_exposed_by_textkit(
     response = getattr(client, method)(path, **kwargs)
 
     assert response.status_code == 404
+
+
+def test_health_endpoint(client: TestClient) -> None:
+    response = client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_image_pixel_limit_is_checked_before_decode() -> None:
+    buffer = BytesIO()
+    Image.new("RGB", (4, 4), color="white").save(buffer, format="PNG")
+
+    with pytest.raises(main.HTTPException) as exc_info:
+        main._image_to_data_url(buffer.getvalue(), "image/png", max_pixels=15)
+
+    assert exc_info.value.status_code == 413
+
+
+def test_non_loopback_provider_requires_https() -> None:
+    with pytest.raises(main.ValidationError, match="must use HTTPS"):
+        main.AIConfig(api_base="http://provider.example", api_key="key", model="model")
+
+    config = main.AIConfig(api_base="http://127.0.0.1:8000", api_key="key", model="model")
+    assert config.api_base == "http://127.0.0.1:8000"
+
+
+def test_provider_response_requires_choices() -> None:
+    with pytest.raises(main.HTTPException) as exc_info:
+        main._extract_openai_text({"model": "test"})
+
+    assert exc_info.value.status_code == 502
+    assert "missing choices" in exc_info.value.detail
+
+
+def test_prompt_render_preserves_unrelated_braces(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(main, "PROMPTS_DIR", tmp_path)
+    (tmp_path / "translate.txt").write_text(
+        'Translate {language}; preserve JSON like {"key": true}.', encoding="utf-8"
+    )
+
+    assert main._render_prompt("translate", language="French") == (
+        'Translate French; preserve JSON like {"key": true}.'
+    )
+
+
+def test_prompt_put_requires_admin_authentication(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(main, "load_config", lambda: _app_config())
+    monkeypatch.setattr(main, "PROMPTS_DIR", tmp_path)
+    unauthenticated = TestClient(main.app)
+
+    response = unauthenticated.put("/prompts/ocr", json={"template": "safe"})
+
+    assert response.status_code == 401
+    assert not (tmp_path / "ocr.txt").exists()
+
+
+def test_prompt_put_is_atomic_private_and_versioned(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(main, "load_config", lambda: _app_config())
+    monkeypatch.setattr(main, "PROMPTS_DIR", tmp_path)
+
+    response = client.put("/prompts/ocr", json={"template": "new template"})
+
+    assert response.status_code == 200
+    prompt_path = tmp_path / "ocr.txt"
+    assert prompt_path.read_text(encoding="utf-8") == "new template"
+    assert os.stat(prompt_path).st_mode & 0o777 == 0o600
+    assert response.json()["version"] == hashlib.sha256(b"new template").hexdigest()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_request_and_model_fields_are_bounded(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main, "load_config", lambda: _app_config())
+
+    oversized = client.post(
+        "/format",
+        content=b"x" * (main.DEFAULT_MAX_REQUEST_BODY_BYTES + 1),
+        headers={"Content-Type": "application/json"},
+    )
+    unsupported_language = client.post(
+        "/translate", json={"text": "hello", "language": "Klingon"}
+    )
+
+    assert oversized.status_code == 413
+    assert unsupported_language.status_code == 400
+
+
+def test_config_schema_rejects_invalid_ranges(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("port: 70000\n", encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    main._config_cache = None
+
+    with pytest.raises(RuntimeError, match="Invalid config.yaml"):
+        main.load_config()
+
+
+def test_credentials_are_resolved_lazily_per_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MISSING_TEXT_KEY", raising=False)
+    config = main.AIConfig(
+        api_base="https://example.invalid",
+        api_key="base-key",
+        model="base-model",
+        text=main.ProviderOverride(api_key_env="MISSING_TEXT_KEY"),
+    )
+
+    assert main._resolve_ai_api_key(main._resolve_ai_config(config, config.ocr)) == "base-key"
+    with pytest.raises(main.HTTPException, match="MISSING_TEXT_KEY"):
+        main._resolve_ai_api_key(main._resolve_ai_config(config, config.text))

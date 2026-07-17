@@ -1,16 +1,23 @@
-"""FastAPI OCR backend using vision-capable AI chat models."""
+"""FastAPI OCR backend using OpenAI-compatible chat completion APIs."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
+import logging
 import os
-from dataclasses import dataclass
+import re
+import tempfile
+import time
+import warnings
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlsplit
 
 import httpx
@@ -19,10 +26,12 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from PIL import Image, UnidentifiedImageError
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
 try:
     from langdetect import DetectorFactory, detect
     from langdetect.lang_detect_exception import LangDetectException
+
     DetectorFactory.seed = 0
     _LANGDETECT_AVAILABLE = True
 except Exception:  # pragma: no cover - exercised only if langdetect is missing
@@ -32,26 +41,38 @@ except Exception:  # pragma: no cover - exercised only if langdetect is missing
 
 
 CONFIG_PATH = Path(__file__).with_name("config.yaml")
+PROMPTS_DIR = Path(__file__).with_name("prompts")
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-DEFAULT_SAVE_ROOT = "~"
 DEFAULT_MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+DEFAULT_MAX_IMAGE_PIXELS = 40_000_000
 DEFAULT_MAX_TEXT_CHARS = 200_000
+DEFAULT_MAX_PROMPT_CHARS = 20_000
+DEFAULT_MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
+MAX_LANGUAGE_CHARS = 32
+MIN_DETECT_CHARS = 20
+SUPPORTED_LANGUAGES = frozenset(
+    {"original", "chinese", "english", "japanese", "korean", "french", "german", "spanish"}
+)
+ADMIN_HEADER = "x-textkit-admin-token"
+EXTENSION_HEADER = "x-textkit-token"
 
+# Pillow checks this while parsing image headers. Treat warnings as hard errors,
+# then also enforce the (possibly lower) per-installation max_image_pixels value.
+Image.MAX_IMAGE_PIXELS = DEFAULT_MAX_IMAGE_PIXELS
+warnings.simplefilter("error", Image.DecompressionBombWarning)
 
-PROMPTS_DIR = Path(__file__).with_name("prompts")
-_prompt_cache: dict[str, str] = {}
 
 _DEFAULT_PROMPTS: dict[str, str] = {
     "ocr": (
         "Transcribe all visible text from this image. Return only the transcription, "
-        "verbatim \u2014 preserve exact wording, punctuation, and line breaks. "
+        "verbatim — preserve exact wording, punctuation, and line breaks. "
         "Do not add commentary, interpret, or guess illegible text."
     ),
     "dedup": (
         "Remove duplicate and overlapping passages from the text below. "
         "Return only the deduplicated result. Do not reword, paraphrase, or add "
-        "anything \u2014 only strip repeated or overlapping content."
+        "anything — only strip repeated or overlapping content."
     ),
     "translate": (
         "Translate the following text to {language}. Return only the translation. "
@@ -63,8 +84,6 @@ _DEFAULT_PROMPTS: dict[str, str] = {
     ),
 }
 
-
-MIN_DETECT_CHARS = 20
 _LANGUAGE_TO_ISO: dict[str, str] = {
     "chinese": "zh-cn",
     "english": "en",
@@ -76,45 +95,132 @@ _LANGUAGE_TO_ISO: dict[str, str] = {
 }
 
 
-def _load_prompt(name: str, language: str | None = None) -> str:
-    """Load a prompt from disk, falling back to the built-in default.
+class JsonFormatter(logging.Formatter):
+    """Small JSON formatter suitable for process supervisors and log shippers."""
 
-    When *language* is provided, a language-specific file (e.g.
-    ``translate.French.txt``) is tried before the base file.
-    """
-    cache_key = f"{name}.{language}" if language else name
-    if cache_key not in _prompt_cache:
-        # Try language-specific file first
-        if language:
-            specific_path = PROMPTS_DIR / f"{name}.{language}.txt"
-            if specific_path.is_file():
-                _prompt_cache[cache_key] = specific_path.read_text(encoding="utf-8").strip()
-                return _prompt_cache[cache_key]
-        # Fall back to base file
-        prompt_path = PROMPTS_DIR / f"{name}.txt"
-        if prompt_path.is_file():
-            _prompt_cache[cache_key] = prompt_path.read_text(encoding="utf-8").strip()
-        else:
-            _prompt_cache[cache_key] = _DEFAULT_PROMPTS.get(name, "")
-    return _prompt_cache[cache_key]
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "time": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        event = getattr(record, "event", None)
+        if event:
+            payload["event"] = event
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
 
 
-def _render_prompt(name: str, **kwargs: str) -> str:
-    """Load a prompt and substitute template variables."""
-    language: str | None = kwargs.get("language")  # type: ignore[assignment]
-    template = _load_prompt(name, language)
+logger = logging.getLogger("textkit")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonFormatter())
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+
+class FrozenModel(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class TimeoutConfig(FrozenModel):
+    """Per-phase provider timeouts, in seconds."""
+
+    connect: float = Field(default=10.0, gt=0, le=300)
+    read: float = Field(default=600.0, gt=0, le=3600)
+    write: float = Field(default=60.0, gt=0, le=600)
+    pool: float = Field(default=10.0, gt=0, le=300)
+
+
+def _validate_api_base_value(value: str) -> str:
+    normalized = value.strip().rstrip("/")
     try:
-        return template.format(**kwargs)
-    except KeyError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Prompt '{name}' references unknown variable: {e}",
-        )
+        parsed = urlsplit(normalized)
+    except ValueError as exc:
+        raise ValueError("api_base must be a valid absolute HTTP(S) URL") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("api_base must be a valid absolute HTTP(S) URL")
+    loopback = parsed.hostname.lower().strip("[]") in {"localhost", "127.0.0.1", "::1"}
+    if parsed.scheme != "https" and not loopback:
+        raise ValueError("api_base must use HTTPS unless it targets a loopback provider")
+    return normalized
+
+
+class ProviderOverride(FrozenModel):
+    """Optional per-task provider values; empty values inherit from the base."""
+
+    api_base: str = ""
+    api_key: str = ""
+    api_key_env: str = ""
+    model: str = Field(default="", max_length=200)
+
+    @field_validator("api_base")
+    @classmethod
+    def validate_api_base(cls, value: str) -> str:
+        return _validate_api_base_value(value) if value.strip() else ""
+
+
+class AIConfig(FrozenModel):
+    """OpenAI-compatible provider configuration with lazy secret references."""
+
+    api_base: str = "https://api.openai.com"
+    api_key: str = ""
+    api_key_env: str = ""
+    model: str = Field(default="gpt-4.1-mini", min_length=1, max_length=200)
+    timeout: TimeoutConfig = Field(default_factory=TimeoutConfig)
+    ocr: ProviderOverride | None = None
+    text: ProviderOverride | None = None
+
+    @field_validator("api_base")
+    @classmethod
+    def validate_api_base(cls, value: str) -> str:
+        return _validate_api_base_value(value)
+
+
+class AppConfig(FrozenModel):
+    """Validated application settings loaded from YAML."""
+
+    host: str = DEFAULT_HOST
+    port: int = Field(default=DEFAULT_PORT, ge=1, le=65535)
+    max_upload_bytes: int = Field(default=DEFAULT_MAX_UPLOAD_BYTES, ge=1024, le=100 * 1024 * 1024)
+    max_image_pixels: int = Field(default=DEFAULT_MAX_IMAGE_PIXELS, ge=1, le=200_000_000)
+    max_text_chars: int = Field(default=DEFAULT_MAX_TEXT_CHARS, ge=1, le=2_000_000)
+    max_prompt_chars: int = Field(default=DEFAULT_MAX_PROMPT_CHARS, ge=1, le=100_000)
+    max_request_body_bytes: int = Field(default=DEFAULT_MAX_REQUEST_BODY_BYTES, ge=1024, le=20 * 1024 * 1024)
+    requests_per_minute: int = Field(default=60, ge=1, le=10_000)
+    max_concurrent_requests: int = Field(default=4, ge=1, le=100)
+    debug: bool = False
+    extension_token: str = ""
+    admin_token: str = ""
+    allowed_extension_ids: tuple[str, ...] = ()
+    ai: AIConfig | None = Field(default_factory=AIConfig)
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, value: str) -> str:
+        host = value.strip().strip("[]")
+        if not host or any(char.isspace() for char in host):
+            raise ValueError("host must be a valid bind address")
+        return host
+
+    @field_validator("allowed_extension_ids")
+    @classmethod
+    def validate_extension_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        pattern = re.compile(r"^[a-p]{32}$")
+        normalized = tuple(dict.fromkeys(value.strip().lower() for value in values if value.strip()))
+        if any(not pattern.fullmatch(value) for value in normalized):
+            raise ValueError("allowed_extension_ids entries must be 32-character Chrome extension IDs")
+        return normalized
+
+
+BoundedText = Annotated[str, Field(min_length=1, max_length=2_000_000)]
+BoundedPrompt = Annotated[str, Field(max_length=DEFAULT_MAX_PROMPT_CHARS)]
 
 
 class OCRResponse(BaseModel):
-    """Response body returned by the OCR endpoint."""
-
     text: str
     model: str
     tokens_used: int
@@ -122,494 +228,410 @@ class OCRResponse(BaseModel):
 
 
 class DedupRequest(BaseModel):
-    """Request body accepted by the dedup endpoint."""
-
-    text: str
-    prompt: str | None = None
+    model_config = ConfigDict(extra="forbid")
+    text: BoundedText
+    prompt: BoundedPrompt | None = None
 
 
 class TranslateRequest(BaseModel):
-    """Request body accepted by the translate endpoint."""
+    model_config = ConfigDict(extra="forbid")
+    text: BoundedText
+    language: Annotated[str, Field(min_length=1, max_length=MAX_LANGUAGE_CHARS)]
+    prompt: BoundedPrompt | None = None
 
-    text: str
-    language: str
-    prompt: str | None = None
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str) -> str:
+        cleaned = value.strip()
+        if cleaned.lower() not in SUPPORTED_LANGUAGES:
+            raise ValueError(f"language must be one of: {', '.join(sorted(SUPPORTED_LANGUAGES))}")
+        return cleaned
 
 
 class PromptUpdate(BaseModel):
-    """Request body accepted by the PUT /prompts/{name} endpoint."""
-
-    template: str
+    model_config = ConfigDict(extra="forbid")
+    template: Annotated[str, Field(min_length=1, max_length=DEFAULT_MAX_PROMPT_CHARS)]
 
 
 class FormatRequest(BaseModel):
-    """Request body accepted by the format endpoint."""
-
-    text: str
-    prompt: str | None = None
-
-
-@dataclass(frozen=True)
-class TimeoutConfig:
-    """Per-phase HTTP timeouts for AI provider calls (all in seconds)."""
-
-    connect: float = 10.0
-    read: float = 600.0
-    write: float = 60.0
-    pool: float = 10.0
+    model_config = ConfigDict(extra="forbid")
+    text: BoundedText
+    prompt: BoundedPrompt | None = None
 
 
-@dataclass(frozen=True)
-class ProviderOverride:
-    """Per-task model/API override.  Empty fields inherit from the parent AIConfig.
-
-    When a field is left empty (the default), the parent ``AIConfig`` value is used.
-    This lets you override the model or API endpoint for a specific task.
-    """
-
-    api_base: str = ""
-    api_key: str = ""
-    model: str = ""
+class _PromptCacheEntry(FrozenModel):
+    template: str
+    signature: tuple[int, int]
 
 
-@dataclass(frozen=True)
-class AIConfig:
-    """Settings needed to call an OpenAI-compatible chat completions API.
-
-    ``model`` is the fallback used when a per-task override does not specify one.
-    ``ocr`` and ``text`` are optional per-task :class:`ProviderOverride` sections.
-    """
-
-    api_base: str
-    api_key: str
-    model: str
-    timeout: TimeoutConfig = TimeoutConfig()
-    ocr: ProviderOverride | None = None
-    text: ProviderOverride | None = None
+_prompt_cache: dict[str, _PromptCacheEntry | str] = {}
+_config_cache: tuple[tuple[int, int] | None, AppConfig] | None = None
+_config_lock = asyncio.Lock()
+_http_client: httpx.AsyncClient | None = None
+_debug_dir: Path | None = None
+_rate_events: defaultdict[str, deque[float]] = defaultdict(deque)
+_active_requests = 0
+_limit_lock = asyncio.Lock()
 
 
-@dataclass(frozen=True)
-class AppConfig:
-    """Application settings loaded from YAML and environment variables."""
-
-    host: str = DEFAULT_HOST
-    port: int = DEFAULT_PORT
-    save_root: Path = Path(DEFAULT_SAVE_ROOT)
-    max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES
-    max_text_chars: int = DEFAULT_MAX_TEXT_CHARS
-    debug: bool = False
-    ai: AIConfig | None = None
-
-
-def _debug(tag: str, msg: str, *, enabled: bool = False) -> None:
-    """Print a timestamped debug message when *enabled* is True."""
-    if not enabled:
-        return
-    import sys
-    from datetime import datetime, timezone
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"[DEBUG][{tag}] {ts} {msg}", file=sys.stderr, flush=True)
-
-
-def _load_yaml_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
-    """Load config.yaml if it exists, otherwise return an empty configuration."""
-
+def _load_yaml_config(path: Path | None = None) -> dict[str, Any]:
+    path = CONFIG_PATH if path is None else path
     if not path.exists():
         return {}
-
     with path.open("r", encoding="utf-8") as config_file:
         loaded = yaml.safe_load(config_file) or {}
-
     if not isinstance(loaded, dict):
         raise RuntimeError("config.yaml must contain a YAML mapping at the top level")
-
     return loaded
 
 
-def _read_api_key(ai_section: dict[str, Any]) -> str:
-    """Resolve an API key from config.yaml — plaintext or environment variable.
-
-    ``api_key_env`` names an environment variable to read the key from.
-    ``api_key`` is treated as a plaintext value and returned as-is, unless it
-    is prefixed with ``$`` (e.g. ``$OCR_API_KEY`` resolves
-    ``os.getenv("OCR_API_KEY")``).
-
-    When neither ``api_key`` nor ``api_key_env`` is configured, the function
-    falls back to ``OCR_API_KEY`` and ``OPENAI_API_KEY``.
-    """
-
-    # ``api_key_env`` is always an environment variable name.
-    env_ref = ai_section.get("api_key_env")
-    if isinstance(env_ref, str) and env_ref:
-        env_name = env_ref[1:] if env_ref.startswith("$") else env_ref
-        api_key = os.getenv(env_name)
-        if api_key:
-            return api_key
-        raise RuntimeError(f"API key not found in environment variable: {env_name}")
-
-    raw = ai_section.get("api_key")
-    if isinstance(raw, str) and raw:
-        # Explicit $ prefix → resolve as environment variable
-        if raw.startswith("$"):
-            env_name = raw[1:]
-            api_key = os.getenv(env_name)
-            if api_key:
-                return api_key
-            raise RuntimeError(
-                f"API key not found in environment variable: {env_name}"
-            )
-        # Plaintext key — use the value directly
-        return raw
-
-    # Neither api_key nor api_key_env configured → fall back to env vars
-    candidates = ["OCR_API_KEY", "OPENAI_API_KEY"]
-
-    for env_name in dict.fromkeys(candidates):
-        api_key = os.getenv(env_name)
-        if api_key:
-            return api_key
-
-    searched = ", ".join(dict.fromkeys(candidates))
-    raise RuntimeError(f"API key not found. Set one of: {searched}")
+def _config_signature(path: Path | None = None) -> tuple[int, int] | None:
+    path = CONFIG_PATH if path is None else path
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
 
 
 def load_config() -> AppConfig:
-    """Load application configuration from config.yaml with documented defaults."""
+    """Load and validate config.yaml, caching it until the file changes."""
 
-    raw_config = _load_yaml_config()
-    ai_section = raw_config.get("ai") or {}
-    if not isinstance(ai_section, dict):
-        raise RuntimeError("AI provider configuration must be a YAML mapping")
-
-    api_base = str(ai_section.get("api_base", "https://api.openai.com")).rstrip("/")
-    model = str(ai_section.get("model", "gpt-4.1-mini"))
-
-    def _parse_override(section: Any) -> ProviderOverride | None:
-        """Parse an optional nested ``ocr`` / ``text`` config section.
-
-        API keys are resolved eagerly here so that ``api_key_env``,
-        ``$ENV_VAR`` references, and fallbacks all
-        work correctly.  The resolved config stores the actual key.
-        """
-        if not isinstance(section, dict):
-            return None
-        has_key = bool(section.get("api_key") or section.get("api_key_env"))
-        api_key = (
-            _read_api_key(section) if has_key else ""
-        )
-        return ProviderOverride(
-            api_base=str(section.get("api_base", "")).rstrip("/") or "",
-            api_key=api_key,
-            model=str(section.get("model", "")) or "",
-        )
-
-    ocr_override = _parse_override(ai_section.get("ocr"))
-    text_override = _parse_override(ai_section.get("text"))
-
-    # Optional timeout overrides
-    timeout_raw = ai_section.get("timeout")
-    timeout_section = timeout_raw if isinstance(timeout_raw, dict) else {}
-    timeout = TimeoutConfig(
-        connect=float(timeout_section.get("connect", 10.0)),
-        read=float(timeout_section.get("read", 600.0)),
-        write=float(timeout_section.get("write", 60.0)),
-        pool=float(timeout_section.get("pool", 10.0)),
-    )
-
-    # Resolve API key now if available, otherwise store empty string.
-    # Actual key requirement is enforced at request time.
+    global _config_cache
+    signature = _config_signature()
+    if _config_cache and _config_cache[0] == signature:
+        return _config_cache[1]
+    raw = _load_yaml_config()
+    if "save_root" in raw:
+        raise RuntimeError("save_root was removed; file saving belongs to the authenticated file bridge")
     try:
-        api_key = _read_api_key(ai_section)
-    except RuntimeError:
-        api_key = ""
+        config = AppConfig.model_validate(raw)
+    except ValidationError as exc:
+        raise RuntimeError(f"Invalid config.yaml: {exc}") from exc
+    _config_cache = (signature, config)
+    return config
 
-    return AppConfig(
-        host=str(raw_config.get("host", DEFAULT_HOST)),
-        port=int(raw_config.get("port", DEFAULT_PORT)),
-        save_root=Path(str(raw_config.get("save_root", DEFAULT_SAVE_ROOT))).expanduser(),
-        max_upload_bytes=int(raw_config.get("max_upload_bytes", DEFAULT_MAX_UPLOAD_BYTES)),
-        max_text_chars=int(raw_config.get("max_text_chars", DEFAULT_MAX_TEXT_CHARS)),
-        debug=bool(raw_config.get("debug", False)),
-        ai=AIConfig(
-            api_base=api_base,
-            api_key=api_key,
-            model=model,
-            timeout=timeout,
-            ocr=ocr_override,
-            text=text_override,
-        ),
+
+async def _get_config() -> AppConfig:
+    """Avoid filesystem metadata/config reads on the async event loop."""
+
+    async with _config_lock:
+        return await asyncio.to_thread(load_config)
+
+
+def _resolve_secret(raw: str, env_name: str = "") -> str:
+    if env_name:
+        name = env_name[1:] if env_name.startswith("$") else env_name
+        return os.getenv(name, "")
+    if raw.startswith("$"):
+        return os.getenv(raw[1:], "")
+    return raw
+
+
+def _resolve_ai_api_key(config: AIConfig) -> str:
+    explicit = bool(config.api_key or config.api_key_env)
+    resolved = _resolve_secret(config.api_key, config.api_key_env)
+    if resolved:
+        return resolved
+    if explicit:
+        reference = config.api_key_env or config.api_key
+        raise HTTPException(status_code=500, detail=f"API key reference is not available: {reference}")
+    for env_name in ("OCR_API_KEY", "OPENAI_API_KEY"):
+        value = os.getenv(env_name)
+        if value:
+            return value
+    raise HTTPException(
+        status_code=500,
+        detail="No API key configured. Set ai.api_key/api_key_env or OCR_API_KEY.",
     )
 
 
 def _resolve_ai_config(base: AIConfig, override: ProviderOverride | None) -> AIConfig:
-    """Merge a per-task ``ProviderOverride`` into the base ``AIConfig``.
-
-    Every field that is empty in *override* falls back to *base*.
-    API keys in *override* are resolved through ``_read_api_key`` so
-    ``$ENV_VAR`` references and fallbacks work.
-    """
     if override is None:
         return base
-
-    api_base = override.api_base or base.api_base
-    model = override.model or base.model
-
-    # API key was already resolved eagerly in _parse_override.
-    # If the override provided a key, use it; otherwise inherit.
-    api_key = override.api_key or base.api_key
-
+    override_has_key = bool(override.api_key or override.api_key_env)
     return AIConfig(
-        api_base=api_base,
-        api_key=api_key,
-        model=model,
+        api_base=override.api_base or base.api_base,
+        api_key=override.api_key if override_has_key else base.api_key,
+        api_key_env=override.api_key_env if override_has_key else base.api_key_env,
+        model=override.model or base.model,
         timeout=base.timeout,
     )
 
 
-def _validate_text_size(text: str, config: AppConfig) -> None:
-    """Reject oversized text requests before sending them to costly model APIs."""
+def _prompt_path(name: str, language: str | None = None) -> Path:
+    return PROMPTS_DIR / (f"{name}.{language}.txt" if language else f"{name}.txt")
 
-    if len(text) > config.max_text_chars:
+
+def _read_prompt_path(path: Path) -> tuple[str, tuple[int, int]] | None:
+    try:
+        stat = path.stat()
+        template = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    return template, (stat.st_mtime_ns, stat.st_size)
+
+
+def _load_prompt(name: str, language: str | None = None) -> str:
+    """Load a prompt with signature-based cache invalidation across workers."""
+
+    candidates: list[tuple[str, Path]] = []
+    if language:
+        candidates.append((f"{name}.{language}", _prompt_path(name, language)))
+    candidates.append((name, _prompt_path(name)))
+    for cache_key, path in candidates:
+        loaded = _read_prompt_path(path)
+        if loaded is None:
+            continue
+        template, signature = loaded
+        cached = _prompt_cache.get(cache_key)
+        if isinstance(cached, _PromptCacheEntry) and cached.signature == signature:
+            return cached.template
+        # Compatibility with older tests/tools that may insert a plain string.
+        _prompt_cache[cache_key] = _PromptCacheEntry(template=template, signature=signature)
+        return template
+    return _DEFAULT_PROMPTS.get(name, "")
+
+
+def _render_prompt(name: str, **kwargs: str) -> str:
+    """Substitute only the supported literal placeholder, preserving other braces."""
+
+    language = kwargs.get("language")
+    template = _load_prompt(name, language)
+    return template.replace("{language}", language or "")
+
+
+def _validate_prompt_template(name: str, template: str, max_chars: int) -> None:
+    if not template.strip():
+        raise HTTPException(status_code=422, detail="Prompt template must not be empty")
+    if len(template) > max_chars:
+        raise HTTPException(status_code=413, detail=f"Prompt exceeds configured limit of {max_chars} characters")
+    if "\x00" in template:
+        raise HTTPException(status_code=422, detail="Prompt template contains a NUL character")
+    placeholders = set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", template))
+    unsupported = placeholders - ({"language"} if name == "translate" else set())
+    if unsupported:
         raise HTTPException(
-            status_code=413,
-            detail=f"Text exceeds configured limit of {config.max_text_chars} characters",
+            status_code=422,
+            detail=f"Unsupported prompt placeholder(s): {', '.join(sorted(unsupported))}",
         )
+
+
+def _atomic_write_prompt(path: Path, template: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
+            temp_file.write(template)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _read_prompt_direct(name: str, language: str | None = None) -> str | None:
+    loaded = _read_prompt_path(_prompt_path(name, language))
+    return loaded[0] if loaded is not None else None
+
+
+def _fallback_prompt(name: str, language: str | None = None) -> tuple[str, str]:
+    template = _read_prompt_direct(name, language)
+    if template is not None:
+        return template, "file"
+    if language:
+        template = _read_prompt_direct(name)
+        if template is not None:
+            return template, "file"
+    return _DEFAULT_PROMPTS.get(name, ""), "hardcoded"
+
+
+def _validate_text_size(text: str, config: AppConfig) -> None:
+    if len(text) > config.max_text_chars:
+        raise HTTPException(status_code=413, detail=f"Text exceeds configured limit of {config.max_text_chars} characters")
+
+
+def _validate_optional_prompt(prompt: str | None, config: AppConfig) -> None:
+    if prompt is not None and len(prompt) > config.max_prompt_chars:
+        raise HTTPException(status_code=413, detail=f"Prompt exceeds configured limit of {config.max_prompt_chars} characters")
 
 
 async def _read_limited_upload(image: UploadFile, max_bytes: int) -> bytes:
-    """Read an upload with a hard size limit to avoid unbounded memory use."""
-
     image_bytes = await image.read(max_bytes + 1)
     if len(image_bytes) > max_bytes:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Image exceeds configured limit of {max_bytes} bytes",
-        )
+        raise HTTPException(status_code=413, detail=f"Image exceeds configured limit of {max_bytes} bytes")
     return image_bytes
 
 
-def _image_to_data_url(image_bytes: bytes, _content_type: str | None) -> str:
-    """Validate image bytes and encode them using the detected image MIME type."""
+def _image_to_data_url(
+    image_bytes: bytes,
+    _content_type: str | None,
+    max_pixels: int = DEFAULT_MAX_IMAGE_PIXELS,
+) -> str:
+    """Inspect dimensions before decoding and encode with the detected MIME type."""
 
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Missing image data")
-
     try:
         with Image.open(BytesIO(image_bytes)) as image:
             inferred_format = (image.format or "").upper()
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > max_pixels:
+                raise HTTPException(status_code=413, detail=f"Image exceeds configured pixel limit of {max_pixels}")
             image.verify()
-        # ``verify`` checks container integrity but does not decode pixels. Reopen
-        # and load so truncated image data is rejected before it reaches the AI.
         with Image.open(BytesIO(image_bytes)) as image:
             image.load()
+    except HTTPException:
+        raise
+    except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+        raise HTTPException(status_code=413, detail="Image dimensions are too large") from exc
     except (UnidentifiedImageError, OSError, SyntaxError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="Uploaded file is not a valid image") from exc
-
-    # Pillow accepts a PNG with a missing IEND trailer, so enforce the required
-    # terminal chunk explicitly rather than treating a truncated PNG as valid.
-    if inferred_format == "PNG" and not image_bytes.endswith(
-        b"\x00\x00\x00\x00IEND\xaeB\x60\x82"
-    ):
+    if inferred_format == "PNG" and not image_bytes.endswith(b"\x00\x00\x00\x00IEND\xaeB\x60\x82"):
         raise HTTPException(status_code=400, detail="Uploaded file is not a valid image")
-
-    # Never trust the multipart Content-Type: derive the data URL type from the
-    # decoded bytes so a claimed image/png cannot disguise another format.
     mime_type = Image.MIME.get(inferred_format)
     if not mime_type:
         raise HTTPException(status_code=400, detail="Unsupported image format")
+    return f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
 
-    encoded = base64.b64encode(image_bytes).decode("ascii")
-    return f"data:{mime_type};base64,{encoded}"
+
+def _decode_provider_json(response: httpx.Response, provider_name: str) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"{provider_name} API returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail=f"{provider_name} API returned an unexpected response shape")
+    return payload
 
 
 def _extract_openai_text(payload: dict[str, Any]) -> str:
-    """Extract OCR text from an OpenAI-compatible chat completion response."""
-
-    choices = payload.get("choices") or []
-    if not choices:
-        return ""
-
-    message = choices[0].get("message") or {}
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise HTTPException(status_code=502, detail="OpenAI API response is missing choices")
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        raise HTTPException(status_code=502, detail="OpenAI API response is missing choices[0].message")
     content = message.get("content")
-    if isinstance(content, str):
+    if isinstance(content, str) and content.strip():
         return content.strip()
     if isinstance(content, list):
-        return "\n".join(
-            part.get("text", "").strip()
+        parts = [
+            part["text"].strip()
             for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
-        ).strip()
-    return ""
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+            and part["text"].strip()
+        ]
+        if parts:
+            return "\n".join(parts)
+    raise HTTPException(status_code=502, detail="OpenAI API response contains no text content")
 
 
-async def _call_with_retry(
-    config: AIConfig,
-    make_request: Any,
-    provider_name: str,
-) -> httpx.Response:
-    """Call the AI provider with a hard asyncio deadline and one retry.
+async def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+    return _http_client
 
-    The deadline is set slightly above ``config.timeout.read`` so the
-    per-phase httpx timeouts fire first in normal cases.  If the proxy
-    or network silently drops the connection, the hard deadline ensures
-    the backend always returns a response instead of hanging forever.
 
-    Only retries on connect errors (connection never established) to
-    avoid sending the same image/text twice when the request body
-    already reached the provider but the response was dropped.
-    """
+async def _call_with_retry(config: AIConfig, make_request: Any, provider_name: str) -> httpx.Response:
     deadline = config.timeout.read + 60
-
     last_exc: Exception | None = None
     for attempt in (1, 2):
         try:
             return await asyncio.wait_for(make_request(), timeout=deadline)
-        except asyncio.TimeoutError:
-            raise HTTPException(
-                status_code=504,
-                detail=f"{provider_name} API did not respond within {deadline}s",
-            )
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=f"{provider_name} API did not respond within {deadline}s") from exc
         except httpx.ConnectError as exc:
-            last_exc = HTTPException(
-                status_code=502,
-                detail=f"{provider_name} API connection failed: {exc}",
-            )
-        except (httpx.RequestError) as exc:
-            # Read/Write errors — do NOT retry, body may have been sent already
+            last_exc = HTTPException(status_code=502, detail=f"{provider_name} API connection failed: {exc}")
+        except httpx.RequestError as exc:
             raise HTTPException(
                 status_code=502,
                 detail=f"{provider_name} API request failed: {type(exc).__name__}: {exc}",
             ) from exc
         if attempt == 1:
             await asyncio.sleep(1)
-
     assert last_exc is not None
     raise last_exc
 
 
-async def _post_openai_chat_completion(
-    config: AIConfig,
-    messages: list[dict[str, Any]],
-) -> OCRResponse:
-    """Send messages to an OpenAI-compatible /v1/chat/completions API."""
-
-    if not config.api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="No API key configured. Set ai.api_key in config.yaml or the OCR_API_KEY environment variable.",
-        )
-
-    request_body = {
-        "model": config.model,
-        "messages": messages,
-    }
-    headers = {"Authorization": f"Bearer {config.api_key}"}
+async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str, Any]]) -> OCRResponse:
+    api_key = _resolve_ai_api_key(config)
+    request_body = {"model": config.model, "messages": messages}
+    headers = {"Authorization": f"Bearer {api_key}"}
+    timeout = httpx.Timeout(
+        connect=config.timeout.connect,
+        read=config.timeout.read,
+        write=config.timeout.write,
+        pool=config.timeout.pool,
+    )
 
     async def _do_request() -> httpx.Response:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                connect=config.timeout.connect,
-                read=config.timeout.read,
-                write=config.timeout.write,
-                pool=config.timeout.pool,
-            )
-        ) as client:
-            response = await client.post(
-                f"{config.api_base}/v1/chat/completions",
-                headers=headers,
-                json=request_body,
-            )
-            if response.is_error:
-                detail = response.text
-                if len(detail) > 500:
-                    detail = detail[:500] + "..."
-                raise HTTPException(status_code=502, detail=f"OpenAI API failed: {detail}")
-            return response
+        client = await _get_http_client()
+        response = await client.post(
+            f"{config.api_base}/v1/chat/completions",
+            headers=headers,
+            json=request_body,
+            timeout=timeout,
+        )
+        if response.is_error:
+            detail = response.text[:500] + ("..." if len(response.text) > 500 else "")
+            raise HTTPException(status_code=502, detail=f"OpenAI API failed: {detail}")
+        return response
 
-    response = await _call_with_retry(config, _do_request, "OpenAI")
-    # Parse response body (covered by asyncio deadline + httpx read timeout)
-    payload = _decode_provider_json(response, "OpenAI")
-    _text = _extract_openai_text(payload)
-    usage = payload.get("usage") or {}
-    return OCRResponse(
-        text=_text,
-        model=str(payload.get("model") or config.model),
-        tokens_used=int(usage.get("total_tokens") or 0),
-    )
+    payload = _decode_provider_json(await _call_with_retry(config, _do_request, "OpenAI"), "OpenAI")
+    text = _extract_openai_text(payload)
+    usage = payload.get("usage")
+    total_tokens = usage.get("total_tokens", 0) if isinstance(usage, dict) else 0
+    if not isinstance(total_tokens, int) or total_tokens < 0:
+        raise HTTPException(status_code=502, detail="OpenAI API response has invalid token usage")
+    model = payload.get("model", config.model)
+    if not isinstance(model, str):
+        raise HTTPException(status_code=502, detail="OpenAI API response has invalid model")
+    return OCRResponse(text=text, model=model, tokens_used=total_tokens)
 
 
 async def _call_openai(config: AIConfig, data_url: str, prompt: str | None = None) -> OCRResponse:
-    """Send the image to an OpenAI-compatible /v1/chat/completions API."""
-
-    ocr_prompt = prompt if prompt else _render_prompt("ocr")
     return await _post_openai_chat_completion(
         config,
-        [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": ocr_prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }
-        ],
+        [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt or _render_prompt("ocr")},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }],
     )
 
 
-def _decode_provider_json(response: httpx.Response, provider_name: str) -> dict[str, Any]:
-    """Decode provider JSON without leaking tracebacks to API clients."""
-
-    try:
-        payload = response.json()
-    except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"{provider_name} API returned invalid JSON",
-        ) from exc
-    if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=502,
-            detail=f"{provider_name} API returned an unexpected response shape",
-        )
-    return payload
-
-
 async def transcribe_image(config: AIConfig, data_url: str, prompt: str | None = None) -> OCRResponse:
-    """Route an OCR request to the configured provider."""
-
-    cfg = _resolve_ai_config(config, config.ocr)
-    return await _call_openai(cfg, data_url, prompt)
+    return await _call_openai(_resolve_ai_config(config, config.ocr), data_url, prompt)
 
 
 async def deduplicate_text(config: AIConfig, text: str, prompt: str | None = None) -> OCRResponse:
-    """Route a deduplication request to the configured provider."""
-
-    dedup_prompt = prompt if prompt else _render_prompt("dedup")
     cfg = _resolve_ai_config(config, config.text)
     return await _post_openai_chat_completion(
         cfg,
         [
-            {"role": "system", "content": dedup_prompt},
+            {"role": "system", "content": prompt or _render_prompt("dedup")},
             {"role": "user", "content": text},
         ],
     )
 
 
 def _detect_language(text: str) -> str | None:
-    """Return the ISO 639-1 code for *text*, or None on failure.
-
-    Wrapped in a try/except because ``langdetect`` raises
-    ``LangDetectException`` for inputs it cannot classify
-    (whitespace-only, digits-only, very short strings, etc.).
-    """
-
     if not _LANGDETECT_AVAILABLE:
         return None
     try:
         return detect(text)
-    except LangDetectException:
-        return None
-    except Exception:
+    except (LangDetectException, Exception):
         return None
 
 
@@ -620,270 +642,268 @@ def _should_skip_translation(
     *,
     debug: bool = False,
 ) -> tuple[bool, str, str | None]:
-    """Decide whether the AI translation call can be short-circuited.
-
-    Returns ``(skip, reason, detected_iso)``:
-
-    - ``skip=True, reason="original_target"`` — user picked "Original".
-    - ``skip=True, reason="same_language"``  — detected language matches the
-      target ISO code, so the text is already in the target language.
-    - ``skip=False`` — fall through to the AI provider.
-    """
-
     if prompt:
         return False, "", None
-
-    lang_key = (language or "").strip().lower()
+    lang_key = language.strip().lower()
     if lang_key == "original":
         return True, "original_target", None
-
     if len(text.strip()) < MIN_DETECT_CHARS:
         return False, "", None
-
     target_iso = _LANGUAGE_TO_ISO.get(lang_key)
-    if target_iso is None:
-        return False, "", None
-
     detected = _detect_language(text)
-    if detected is None:
-        return False, "", None
-
-    if detected == target_iso:
-        _debug(
-            "translate",
-            f"skipped ({ 'same_language' }) detected={detected} target={target_iso}",
-            enabled=debug,
-        )
+    if target_iso and detected == target_iso:
+        if debug:
+            logger.info("translation skipped: detected=%s target=%s", detected, target_iso, extra={"event": "translate.skip"})
         return True, "same_language", detected
-
     return False, "", detected
 
 
 async def translate_text(config: AIConfig, text: str, language: str, prompt: str | None = None) -> OCRResponse:
-    """Route a translation request to the configured provider."""
-
-    system_prompt = prompt or _render_prompt("translate", language=language)
     cfg = _resolve_ai_config(config, config.text)
     return await _post_openai_chat_completion(
         cfg,
         [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": prompt or _render_prompt("translate", language=language)},
             {"role": "user", "content": text},
         ],
     )
 
 
 async def format_text(config: AIConfig, text: str, prompt: str | None = None) -> OCRResponse:
-    """Route a format request to the configured provider.
-
-    Uses the user-provided *prompt* as the system prompt, falling back
-    to the template in ``backend/prompts/format.txt``.
-    """
-
-    system_prompt = prompt if prompt else _render_prompt("format")
     cfg = _resolve_ai_config(config, config.text)
     return await _post_openai_chat_completion(
         cfg,
         [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": prompt or _render_prompt("format")},
             {"role": "user", "content": text},
         ],
     )
 
 
-app = FastAPI(title="TextKit Backend v0.0.0")
-
-
 def _error_payload(error: str) -> dict[str, str | int | None]:
-    """Build the standard response shape for failed OCR requests."""
-
     return {"text": "", "model": "", "tokens_used": 0, "error": error}
 
 
 _AI_ENDPOINTS = {"/ocr", "/dedup", "/translate", "/format"}
+_LIMITED_ENDPOINTS = _AI_ENDPOINTS | {"/prompts"}
 
 
 def _origin_matches_configured_host(origin: str, configured_host: str) -> bool:
-    """Return whether an HTTP(S) origin targets the configured backend host."""
-
     try:
         parsed = urlsplit(origin)
     except ValueError:
         return False
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    return bool(
+        parsed.scheme in {"http", "https"}
+        and parsed.hostname
+        and parsed.hostname.lower() == configured_host.strip().strip("[]").lower()
+    )
+
+
+def _constant_time_token_matches(supplied: str | None, configured: str) -> bool:
+    return bool(configured and supplied and hmac.compare_digest(supplied, configured))
+
+
+async def _authorize_extension_origin(request: Request, config: AppConfig) -> bool:
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
         return False
-    normalized_host = configured_host.strip().strip("[]").lower()
-    return parsed.hostname.lower() == normalized_host
+    if parsed.scheme == "chrome-extension" and parsed.netloc:
+        extension_id = parsed.netloc.lower()
+        if extension_id in config.allowed_extension_ids:
+            return True
+        token = _resolve_secret(config.extension_token)
+        return _constant_time_token_matches(request.headers.get(EXTENSION_HEADER), token)
+    return _origin_matches_configured_host(origin, config.host)
+
+
+async def _acquire_request_slot(request: Request, config: AppConfig) -> JSONResponse | None:
+    global _active_requests
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    async with _limit_lock:
+        events = _rate_events[key]
+        while events and now - events[0] >= 60:
+            events.popleft()
+        if len(events) >= config.requests_per_minute:
+            return JSONResponse(status_code=429, content=_error_payload("Rate limit exceeded"), headers={"Retry-After": "60"})
+        if _active_requests >= config.max_concurrent_requests:
+            return JSONResponse(status_code=429, content=_error_payload("Too many concurrent requests"), headers={"Retry-After": "1"})
+        events.append(now)
+        _active_requests += 1
+    return None
+
+
+async def _release_request_slot() -> None:
+    global _active_requests
+    async with _limit_lock:
+        _active_requests = max(0, _active_requests - 1)
+
+
+def _private_debug_dir() -> Path:
+    global _debug_dir
+    if _debug_dir is None:
+        _debug_dir = Path(tempfile.mkdtemp(prefix="textkit-debug-"))
+        _debug_dir.chmod(0o700)
+    return _debug_dir
+
+
+def _write_private_file(name: str, data: bytes) -> None:
+    path = _private_debug_dir() / name
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as output:
+        output.write(data)
+
+
+async def _debug_dump(config: AppConfig, name: str, data: bytes | str) -> None:
+    if not config.debug:
+        return
+    raw = data.encode("utf-8") if isinstance(data, str) else data
+    await asyncio.to_thread(_write_private_file, name, raw)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    config = await _get_config()
+    await _get_http_client()
+    if config.debug:
+        await asyncio.to_thread(_private_debug_dir)
+    logger.info("TextKit backend started on %s:%s", config.host, config.port, extra={"event": "server.start"})
+    try:
+        yield
+    finally:
+        global _http_client
+        if _http_client is not None:
+            await _http_client.aclose()
+            _http_client = None
+        logger.info("TextKit backend stopped", extra={"event": "server.stop"})
+
+
+app = FastAPI(title="TextKit Backend v0.0.0", lifespan=lifespan)
 
 
 @app.middleware("http")
-async def validate_ai_request_origin(request: Request, call_next: Any) -> Response:
-    """Block browser pages from invoking the local AI endpoints."""
-
-    if request.url.path not in _AI_ENDPOINTS:
-        return await call_next(request)
-
-    origin = request.headers.get("origin")
-    if not origin:
-        return await call_next(request)
-
+async def security_and_limits(request: Request, call_next: Any) -> Response:
     try:
-        parsed_origin = urlsplit(origin)
-    except ValueError:
-        parsed_origin = None
-    if parsed_origin and parsed_origin.scheme == "chrome-extension" and parsed_origin.netloc:
-        return await call_next(request)
-
-    try:
-        configured_host = load_config().host
+        config = await _get_config()
     except RuntimeError as exc:
         return JSONResponse(status_code=500, content=_error_payload(str(exc)))
-    if _origin_matches_configured_host(origin, configured_host):
-        return await call_next(request)
 
-    return JSONResponse(
-        status_code=403,
-        content=_error_payload(f"Origin not allowed for AI endpoint: {origin}"),
-    )
+    if request.method in {"POST", "PUT", "PATCH"}:
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                body_limit = (
+                    config.max_upload_bytes + 64 * 1024
+                    if request.url.path == "/ocr"
+                    else config.max_request_body_bytes
+                )
+                too_large = int(content_length) > body_limit
+            except ValueError:
+                return JSONResponse(status_code=400, content=_error_payload("Invalid Content-Length header"))
+            if too_large:
+                return JSONResponse(status_code=413, content=_error_payload("Request body is too large"))
+
+    if request.url.path in _AI_ENDPOINTS and not await _authorize_extension_origin(request, config):
+        return JSONResponse(status_code=403, content=_error_payload("Extension origin is not authorized"))
+
+    is_prompt_put = request.method == "PUT" and request.url.path.startswith("/prompts/")
+    if is_prompt_put:
+        configured = _resolve_secret(config.admin_token)
+        supplied = request.headers.get(ADMIN_HEADER)
+        authorization = request.headers.get("authorization", "")
+        if not supplied and authorization.lower().startswith("bearer "):
+            supplied = authorization[7:].strip()
+        if not configured:
+            return JSONResponse(status_code=503, content=_error_payload("Prompt administration is disabled until admin_token is configured"))
+        if not _constant_time_token_matches(supplied, configured):
+            return JSONResponse(status_code=401, content=_error_payload("Prompt administrator authentication required"))
+
+    limited = request.url.path in _AI_ENDPOINTS or is_prompt_put
+    if not limited:
+        return await call_next(request)
+    rejected = await _acquire_request_slot(request, config)
+    if rejected:
+        return rejected
+    try:
+        return await call_next(request)
+    finally:
+        await _release_request_slot()
 
 
 @app.exception_handler(HTTPException)
 async def http_error_handler(_request: Request, exc: HTTPException) -> JSONResponse:
-    """Return HTTP errors in the standard OCR response envelope."""
-
     return JSONResponse(status_code=exc.status_code, content=_error_payload(str(exc.detail)))
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
-    """Return request validation errors in the standard OCR response envelope."""
-
     return JSONResponse(status_code=400, content=_error_payload(str(exc)))
 
 
 @app.exception_handler(Exception)
-async def catch_all_handler(_request: Request, exc: Exception) -> JSONResponse:
-    """Catch-all: ensure the backend ALWAYS returns a response.
-    
-    Catches anything the route handlers or other exception handlers miss
-    (e.g. MemoryError during large JSON parsing, serialization failures).
-    Without this, an unhandled exception can leave uvicorn waiting for a
-    response that never comes, causing the client to hang on "Translating...".
-    """
-    import traceback
+async def catch_all_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("Unhandled request error for %s", request.url.path, extra={"event": "request.error"})
+    return JSONResponse(status_code=500, content=_error_payload("Internal server error"))
 
-    traceback.print_exc()
-    return JSONResponse(
-        status_code=500,
-        content=_error_payload("Internal server error"),
-    )
+
+@app.get("/healthz")
+async def healthz() -> dict[str, str]:
+    return {"status": "ok"}
 
 
 @app.post("/ocr", response_model=OCRResponse)
 async def ocr(
     image: UploadFile | None = File(default=None),
-    prompt: str = Form(None),
+    prompt: Annotated[str | None, Form(max_length=DEFAULT_MAX_PROMPT_CHARS)] = None,
 ) -> OCRResponse:
-    """Accept an image upload and return text transcribed by the configured AI model."""
-
     if image is None:
         raise HTTPException(status_code=400, detail='Missing required form file field "image"')
-
-    try:
-        config = load_config()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
+    config = await _get_config()
     if config.ai is None:
         raise HTTPException(status_code=500, detail="AI provider configuration is missing")
-
+    _validate_optional_prompt(prompt, config)
     image_bytes = await _read_limited_upload(image, config.max_upload_bytes)
-    _debug("ocr", f"request: {len(image_bytes)} bytes", enabled=config.debug)
-
-    # Debug: save last screenshot for manual inspection
-    if config.debug:
-        try:
-            Path("/tmp/last_screenshot.png").write_bytes(image_bytes)
-        except OSError:
-            pass
-
-    data_url = _image_to_data_url(image_bytes, image.content_type)
-    _debug("ocr", f"calling model={config.ai.model} ocr_model={config.ai.ocr.model if config.ai.ocr else '-'}", enabled=config.debug)
+    await _debug_dump(config, "last_screenshot.png", image_bytes)
+    data_url = await asyncio.to_thread(_image_to_data_url, image_bytes, image.content_type, config.max_image_pixels)
     result = await transcribe_image(config.ai, data_url, prompt)
-    _debug("ocr", f"response: {len(result.text)} chars model={result.model}", enabled=config.debug)
-
-    # Debug: save last OCR text (before dedup) for manual inspection
-    if config.debug:
-        try:
-            Path("/tmp/last_ocr.txt").write_text(result.text, encoding="utf-8")
-        except OSError:
-            pass
-
+    await _debug_dump(config, "last_ocr.txt", result.text)
     return result
 
 
-@app.post("/dedup", response_model=None)
-async def dedup(request: DedupRequest) -> Response:
-    """Accept merged OCR text and return deduplicated text from the configured AI model."""
-
-    try:
-        config = load_config()
-    except RuntimeError as exc:
-        return JSONResponse(status_code=500, content=_error_payload(str(exc)))
-
+@app.post("/dedup")
+async def dedup(request: DedupRequest) -> dict[str, str | int]:
+    config = await _get_config()
     if config.ai is None:
-        return JSONResponse(status_code=500, content=_error_payload("AI provider configuration is missing"))
-
+        raise HTTPException(status_code=500, detail="AI provider configuration is missing")
     _validate_text_size(request.text, config)
-    _debug("dedup", f"request: {len(request.text)} chars", enabled=config.debug)
-    # Debug: save pre-dedup text for retry troubleshooting
-    if config.debug:
-        try:
-            Path("/tmp/pre_dedup.txt").write_text(request.text, encoding="utf-8")
-        except OSError:
-            pass
-    _debug("dedup", "calling provider...", enabled=config.debug)
+    _validate_optional_prompt(request.prompt, config)
+    await _debug_dump(config, "pre_dedup.txt", request.text)
     result = await deduplicate_text(config.ai, request.text, request.prompt)
-    _debug("dedup", f"AI returned {len(result.text)} chars model={result.model}", enabled=config.debug)
-    # Debug: save post-dedup text for quick comparison
-    if config.debug:
-        try:
-            Path("/tmp/after_dedup.txt").write_text(result.text, encoding="utf-8")
-        except OSError:
-            pass
-    body = {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
-    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    _debug("dedup", f"sending {len(body_bytes)} byte response", enabled=config.debug)
-    return Response(
-        content=body_bytes,
-        media_type="application/json",
-        headers={"Connection": "close"},
-    )
+    await _debug_dump(config, "after_dedup.txt", result.text)
+    return {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
 
 
-@app.post("/translate", response_model=None)
-async def translate(request: TranslateRequest) -> Response:
-    """Accept text and return a translation from the configured AI model."""
-
-    try:
-        config = load_config()
-    except RuntimeError as exc:
-        return JSONResponse(status_code=500, content=_error_payload(str(exc)))
-
+@app.post("/translate")
+async def translate(request: TranslateRequest) -> dict[str, Any]:
+    config = await _get_config()
     if config.ai is None:
-        return JSONResponse(status_code=500, content=_error_payload("AI provider configuration is missing"))
-
+        raise HTTPException(status_code=500, detail="AI provider configuration is missing")
     _validate_text_size(request.text, config)
-    _debug("translate", f"request: {len(request.text)} chars lang={request.language}", enabled=config.debug)
-
-    skip, reason, detected_iso = _should_skip_translation(
+    _validate_optional_prompt(request.prompt, config)
+    skip, reason, detected_iso = await asyncio.to_thread(
+        _should_skip_translation,
         request.text,
         request.language,
         request.prompt,
         debug=config.debug,
     )
     if skip:
-        body = {
+        return {
             "text": request.text,
             "model": "",
             "tokens_used": 0,
@@ -891,164 +911,91 @@ async def translate(request: TranslateRequest) -> Response:
             "detected_language": detected_iso,
             "skip_reason": reason,
         }
-    else:
-        _debug("translate", "calling provider...", enabled=config.debug)
-        result = await translate_text(config.ai, request.text, request.language, request.prompt)
-        _debug("translate", f"AI returned {len(result.text)} chars model={result.model}", enabled=config.debug)
-        body = {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
-
-    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    _debug("translate", f"sending {len(body_bytes)} byte response", enabled=config.debug)
-    return Response(
-        content=body_bytes,
-        media_type="application/json",
-        headers={"Connection": "close"},
-    )
+    result = await translate_text(config.ai, request.text, request.language, request.prompt)
+    return {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
 
 
-@app.post("/format", response_model=None)
-async def format_text_endpoint(request: FormatRequest) -> Response:
-    """Accept text and a custom prompt, return formatted text from the configured AI model."""
-
-    try:
-        config = load_config()
-    except RuntimeError as exc:
-        return JSONResponse(status_code=500, content=_error_payload(str(exc)))
-
+@app.post("/format")
+async def format_text_endpoint(request: FormatRequest) -> dict[str, str | int]:
+    config = await _get_config()
     if config.ai is None:
-        return JSONResponse(status_code=500, content=_error_payload("AI provider configuration is missing"))
-
+        raise HTTPException(status_code=500, detail="AI provider configuration is missing")
     _validate_text_size(request.text, config)
-    _debug("format", f"request: {len(request.text)} chars custom_prompt={request.prompt is not None}", enabled=config.debug)
-    _debug("format", "calling provider...", enabled=config.debug)
+    _validate_optional_prompt(request.prompt, config)
     result = await format_text(config.ai, request.text, request.prompt)
-    _debug("format", f"AI returned {len(result.text)} chars model={result.model}", enabled=config.debug)
-    body = {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
-    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    _debug("format", f"sending {len(body_bytes)} byte response", enabled=config.debug)
-    return Response(
-        content=body_bytes,
-        media_type="application/json",
-        headers={"Connection": "close"},
-    )
+    return {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
 
 
-def _read_prompt_direct(name: str, language: str | None = None) -> str | None:
-    """Read a prompt file directly from disk, bypassing the cache.
-
-    Returns None when no file exists (caller should use _DEFAULT_PROMPTS fallback).
-    """
-    if language:
-        specific_path = PROMPTS_DIR / f"{name}.{language}.txt"
-        if specific_path.is_file():
-            return specific_path.read_text(encoding="utf-8").strip()
-    prompt_path = PROMPTS_DIR / f"{name}.txt"
-    if prompt_path.is_file():
-        return prompt_path.read_text(encoding="utf-8").strip()
-    return None
-
-
-def _fallback_prompt(name: str, language: str | None = None) -> tuple[str, str]:
-    """Return the server-side fallback template and its source tier."""
-    template = _read_prompt_direct(name, language)
-    if template is not None:
-        return template, "file"
-    return _DEFAULT_PROMPTS.get(name, ""), "hardcoded"
+def _validate_prompt_request(name: str, language: str | None) -> str | None:
+    if name not in _DEFAULT_PROMPTS:
+        raise HTTPException(status_code=404, detail=f"Unknown prompt: '{name}'")
+    if language is None:
+        return None
+    normalized = language.strip()
+    if normalized.lower() not in SUPPORTED_LANGUAGES - {"original"}:
+        raise HTTPException(status_code=400, detail="Unsupported language parameter")
+    if name != "translate":
+        raise HTTPException(status_code=400, detail="The language parameter is only supported for the translate prompt")
+    return normalized.title()
 
 
 @app.get("/prompts")
 async def list_prompts() -> dict[str, dict[str, str]]:
-    """Return the four canonical prompt templates."""
-    prompts = {
-        name: (_read_prompt_direct(name) or default)
-        for name, default in _DEFAULT_PROMPTS.items()
-    }
+    prompts = await asyncio.to_thread(
+        lambda: {name: (_read_prompt_direct(name) or default) for name, default in _DEFAULT_PROMPTS.items()}
+    )
     return {"prompts": prompts}
 
 
 @app.get("/prompts/{name}/fallback")
 async def get_prompt_fallback(name: str, request: Request) -> Response:
-    """Preview the prompt used when a request supplies no custom prompt."""
-    language: str | None = request.query_params.get("language")
-    if language and any(c in language for c in ("/", "\\", "..")):
-        raise HTTPException(status_code=400, detail="Invalid language parameter")
-    if name not in _DEFAULT_PROMPTS:
-        raise HTTPException(status_code=404, detail=f"Unknown prompt: '{name}'")
-
-    selected_language = language if name == "translate" else None
-    template, source = _fallback_prompt(name, selected_language)
+    language = _validate_prompt_request(name, request.query_params.get("language"))
+    template, source = await asyncio.to_thread(_fallback_prompt, name, language if name == "translate" else None)
     version = hashlib.sha256(template.encode("utf-8")).hexdigest()
     etag = f'"{version}"'
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers={"ETag": etag})
-    return JSONResponse(
-        content={"template": template, "source": source, "version": version},
-        headers={"ETag": etag},
-    )
+    return JSONResponse(content={"template": template, "source": source, "version": version}, headers={"ETag": etag})
 
 
 @app.api_route("/prompts/{name}", methods=["GET", "PUT"])
 async def get_prompt(name: str, request: Request) -> dict[str, object]:
-    """Return a specific prompt template (GET) or update it (PUT).
-
-    The optional ``?language=`` query parameter selects a language-specific
-    file (e.g. ``?language=French`` writes ``translate.French.txt``).
-    """
-    language: str | None = request.query_params.get("language")
-    if language and any(c in language for c in ("/", "\\", "..")):
-        raise HTTPException(status_code=400, detail="Invalid language parameter")
-    if name not in _DEFAULT_PROMPTS:
-        raise HTTPException(status_code=404, detail=f"Unknown prompt: '{name}'")
-    if language and name != "translate":
-        raise HTTPException(
-            status_code=400,
-            detail="The language parameter is only supported for the translate prompt",
-        )
+    language = _validate_prompt_request(name, request.query_params.get("language"))
     if request.method == "PUT":
         try:
             body = await request.json()
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="Malformed JSON request body") from exc
         try:
-            if hasattr(PromptUpdate, "model_validate"):
-                update = PromptUpdate.model_validate(body)
-            else:  # pragma: no cover - compatibility with Pydantic v1
-                update = PromptUpdate.parse_obj(body)
+            update = PromptUpdate.model_validate(body)
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        filename = f"{name}.{language}.txt" if language else f"{name}.txt"
-        prompt_path = PROMPTS_DIR / filename
+        config = await _get_config()
+        _validate_prompt_template(name, update.template, config.max_prompt_chars)
+        path = _prompt_path(name, language)
         try:
-            PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
-            prompt_path.write_text(update.template, encoding="utf-8")
+            await asyncio.to_thread(_atomic_write_prompt, path, update.template)
         except OSError as exc:
-            raise HTTPException(
-                status_code=500, detail=f"Failed to save prompt: {exc.strerror or exc}"
-            ) from exc
+            raise HTTPException(status_code=500, detail=f"Failed to save prompt: {exc.strerror or exc}") from exc
         _prompt_cache.clear()
-        template = _load_prompt(name, language)
-        result: dict[str, object] = {
-            "name": name,
-            "template": template,
-            "has_language_param": "{language}" in template,
-        }
-        if language:
-            result["language"] = language
-        return result
-    template = _read_prompt_direct(name, language)
-    if template is None:
-        template = _DEFAULT_PROMPTS.get(name, "")
-    result = {
+        template = await asyncio.to_thread(_load_prompt, name, language)
+    else:
+        template = await asyncio.to_thread(_read_prompt_direct, name, language)
+        if template is None:
+            template = _DEFAULT_PROMPTS.get(name, "")
+    result: dict[str, object] = {
         "name": name,
         "template": template,
+        "version": hashlib.sha256(template.encode("utf-8")).hexdigest(),
         "has_language_param": "{language}" in template,
     }
     if language:
         result["language"] = language
     return result
 
+
 if __name__ == "__main__":
     import uvicorn
 
     cfg = load_config()
-    uvicorn.run(app, host=cfg.host, port=cfg.port)
+    uvicorn.run(app, host=cfg.host, port=cfg.port, log_config=None)

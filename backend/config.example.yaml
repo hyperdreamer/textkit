@@ -5,14 +5,28 @@ host: "127.0.0.1"
 # Server port. Defaults to 8765 when omitted.
 port: 8765
 
-# Save requests are constrained to this directory. Relative save paths are
-# resolved under this root, and absolute paths must also stay inside it.
-save_root: "~"
-
 # Basic request limits to avoid unbounded memory use and accidental large
 # provider calls.
 max_upload_bytes: 15728640
+max_image_pixels: 40000000
 max_text_chars: 200000
+max_prompt_chars: 20000
+max_request_body_bytes: 2097152
+
+# In-process abuse controls for AI calls and prompt updates. For multi-worker
+# deployments, put an equivalent shared limiter at the reverse proxy as well.
+requests_per_minute: 60
+max_concurrent_requests: 4
+
+# Chrome-extension origins must either appear in this exact allowlist or send
+# X-TextKit-Token with this shared secret. Environment references are resolved
+# lazily, so the server can still start before the secret is provisioned.
+extension_token: "$TEXTKIT_EXTENSION_TOKEN"
+# allowed_extension_ids: ["abcdefghijklmnopqrstuvwxyzabcdef"]
+
+# Required for PUT /prompts/{name}; send as X-TextKit-Admin-Token or Bearer.
+# Prompt administration remains disabled if this secret is unavailable.
+admin_token: "$TEXTKIT_ADMIN_TOKEN"
 
 # Enable debug logging to stderr for OCR / dedup / translate requests.
 # debug: false
@@ -46,6 +60,8 @@ ai:
   #   api_key: "$OTHER_PROXY_API_KEY"
   #   model: "claude-sonnet-4-20250514"
 
+  # Non-loopback providers must use HTTPS. Plain HTTP is accepted only for
+  # localhost, 127.0.0.1, and ::1 development providers.
   # Per-phase HTTP timeouts for AI API calls (all in seconds).
   # Omit any key to use its default.  Increase ``read`` when translating
   # very long text that may take the model several minutes to process.
