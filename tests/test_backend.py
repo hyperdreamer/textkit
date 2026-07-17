@@ -341,6 +341,22 @@ def test_image_pixel_limit_is_checked_before_decode() -> None:
     assert exc_info.value.status_code == 413
 
 
+def test_zero_image_pixel_limit_disables_check() -> None:
+    buffer = BytesIO()
+    Image.new("RGB", (4, 4), color="white").save(buffer, format="PNG")
+
+    assert main._image_to_data_url(
+        buffer.getvalue(), "image/png", max_pixels=0
+    ).startswith("data:image/png;base64,")
+
+
+@pytest.mark.asyncio
+async def test_zero_upload_limit_reads_entire_upload() -> None:
+    upload = main.UploadFile(file=BytesIO(b"complete upload"), filename="test.txt")
+
+    assert await main._read_limited_upload(upload, 0) == b"complete upload"
+
+
 def test_non_loopback_provider_requires_https() -> None:
     with pytest.raises(main.ValidationError, match="must use HTTPS"):
         main.AIConfig(api_base="http://provider.example", api_key="key", model="model")
@@ -433,6 +449,61 @@ def test_chunked_request_body_is_limited_without_content_length(
     )
 
     assert response.status_code == 413
+
+
+def test_zero_request_and_character_limits_disable_checks(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _app_config().model_copy(
+        update={
+            "max_request_body_bytes": 0,
+            "max_text_chars": 0,
+            "max_prompt_chars": 0,
+        }
+    )
+    monkeypatch.setattr(main, "load_config", lambda: config)
+
+    async def fake_format(
+        _config: main.AIConfig, text: str, _prompt: str | None = None
+    ) -> main.OCRResponse:
+        return main.OCRResponse(text=text, model="test-model", tokens_used=1)
+
+    monkeypatch.setattr(main, "format_text", fake_format)
+    text = "x" * (main.DEFAULT_MAX_TEXT_CHARS + 1)
+    prompt = "p" * (main.DEFAULT_MAX_PROMPT_CHARS + 1)
+
+    response = client.post("/format", json={"text": text, "prompt": prompt})
+
+    assert response.status_code == 200
+    assert response.json()["text"] == text
+
+
+def test_config_schema_accepts_zero_for_all_limits() -> None:
+    values = {
+        "max_upload_bytes": 0,
+        "max_image_pixels": 0,
+        "max_text_chars": 0,
+        "max_prompt_chars": 0,
+        "max_request_body_bytes": 0,
+        "requests_per_minute": 0,
+        "max_concurrent_requests": 0,
+    }
+
+    config = main.AppConfig(**values)
+
+    assert all(getattr(config, name) == 0 for name in values)
+
+
+@pytest.mark.asyncio
+async def test_zero_rate_limits_disable_limiter_state() -> None:
+    config = _app_config().model_copy(
+        update={"requests_per_minute": 0, "max_concurrent_requests": 0}
+    )
+    request = main.Request({"type": "http", "client": ("127.0.0.1", 1234)})
+
+    assert await main._acquire_request_slot(request, config) is None
+    assert not main._rate_events
+    assert main._active_requests == 0
 
 
 def test_config_schema_rejects_invalid_ranges(

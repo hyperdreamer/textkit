@@ -12,7 +12,6 @@ import os
 import re
 import tempfile
 import time
-import warnings
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -58,10 +57,9 @@ SUPPORTED_LANGUAGES = frozenset(
 ADMIN_HEADER = "x-textkit-admin-token"
 EXTENSION_HEADER = "x-textkit-token"
 
-# Pillow checks this while parsing image headers. Treat warnings as hard errors,
-# then also enforce the (possibly lower) per-installation max_image_pixels value.
-Image.MAX_IMAGE_PIXELS = DEFAULT_MAX_IMAGE_PIXELS
-warnings.simplefilter("error", Image.DecompressionBombWarning)
+# Enforce the configurable pixel limit ourselves after Pillow parses the image
+# header, so max_image_pixels=0 can explicitly disable the check.
+Image.MAX_IMAGE_PIXELS = None
 
 
 _DEFAULT_PROMPTS: dict[str, str] = {
@@ -186,13 +184,13 @@ class AppConfig(FrozenModel):
 
     host: str = DEFAULT_HOST
     port: int = Field(default=DEFAULT_PORT, ge=1, le=65535)
-    max_upload_bytes: int = Field(default=DEFAULT_MAX_UPLOAD_BYTES, ge=1024, le=100 * 1024 * 1024)
-    max_image_pixels: int = Field(default=DEFAULT_MAX_IMAGE_PIXELS, ge=1, le=200_000_000)
-    max_text_chars: int = Field(default=DEFAULT_MAX_TEXT_CHARS, ge=1, le=2_000_000)
-    max_prompt_chars: int = Field(default=DEFAULT_MAX_PROMPT_CHARS, ge=1, le=100_000)
-    max_request_body_bytes: int = Field(default=DEFAULT_MAX_REQUEST_BODY_BYTES, ge=1024, le=20 * 1024 * 1024)
-    requests_per_minute: int = Field(default=60, ge=1, le=10_000)
-    max_concurrent_requests: int = Field(default=4, ge=1, le=100)
+    max_upload_bytes: int = Field(default=DEFAULT_MAX_UPLOAD_BYTES, ge=0, le=100 * 1024 * 1024)
+    max_image_pixels: int = Field(default=DEFAULT_MAX_IMAGE_PIXELS, ge=0, le=200_000_000)
+    max_text_chars: int = Field(default=DEFAULT_MAX_TEXT_CHARS, ge=0, le=2_000_000)
+    max_prompt_chars: int = Field(default=DEFAULT_MAX_PROMPT_CHARS, ge=0, le=100_000)
+    max_request_body_bytes: int = Field(default=DEFAULT_MAX_REQUEST_BODY_BYTES, ge=0, le=20 * 1024 * 1024)
+    requests_per_minute: int = Field(default=60, ge=0, le=10_000)
+    max_concurrent_requests: int = Field(default=4, ge=0, le=100)
     debug: bool = False
     extension_token: str = ""
     admin_token: str = ""
@@ -217,8 +215,7 @@ class AppConfig(FrozenModel):
         return normalized
 
 
-BoundedText = Annotated[str, Field(min_length=1, max_length=2_000_000)]
-BoundedPrompt = Annotated[str, Field(max_length=DEFAULT_MAX_PROMPT_CHARS)]
+BoundedText = Annotated[str, Field(min_length=1)]
 
 
 class OCRResponse(BaseModel):
@@ -231,14 +228,14 @@ class OCRResponse(BaseModel):
 class DedupRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: BoundedText
-    prompt: BoundedPrompt | None = None
+    prompt: str | None = None
 
 
 class TranslateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: BoundedText
     language: Annotated[str, Field(min_length=1, max_length=MAX_LANGUAGE_CHARS)]
-    prompt: BoundedPrompt | None = None
+    prompt: str | None = None
 
     @field_validator("language")
     @classmethod
@@ -251,13 +248,13 @@ class TranslateRequest(BaseModel):
 
 class PromptUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    template: Annotated[str, Field(min_length=1, max_length=DEFAULT_MAX_PROMPT_CHARS)]
+    template: Annotated[str, Field(min_length=1)]
 
 
 class FormatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: BoundedText
-    prompt: BoundedPrompt | None = None
+    prompt: str | None = None
 
 
 class _PromptCacheEntry(FrozenModel):
@@ -406,7 +403,7 @@ def _render_prompt(name: str, **kwargs: str) -> str:
 def _validate_prompt_template(name: str, template: str, max_chars: int) -> None:
     if not template.strip():
         raise HTTPException(status_code=422, detail="Prompt template must not be empty")
-    if len(template) > max_chars:
+    if max_chars and len(template) > max_chars:
         raise HTTPException(status_code=413, detail=f"Prompt exceeds configured limit of {max_chars} characters")
     if "\x00" in template:
         raise HTTPException(status_code=422, detail="Prompt template contains a NUL character")
@@ -454,18 +451,18 @@ def _fallback_prompt(name: str, language: str | None = None) -> tuple[str, str]:
 
 
 def _validate_text_size(text: str, config: AppConfig) -> None:
-    if len(text) > config.max_text_chars:
+    if config.max_text_chars and len(text) > config.max_text_chars:
         raise HTTPException(status_code=413, detail=f"Text exceeds configured limit of {config.max_text_chars} characters")
 
 
 def _validate_optional_prompt(prompt: str | None, config: AppConfig) -> None:
-    if prompt is not None and len(prompt) > config.max_prompt_chars:
+    if prompt is not None and config.max_prompt_chars and len(prompt) > config.max_prompt_chars:
         raise HTTPException(status_code=413, detail=f"Prompt exceeds configured limit of {config.max_prompt_chars} characters")
 
 
 async def _read_limited_upload(image: UploadFile, max_bytes: int) -> bytes:
-    image_bytes = await image.read(max_bytes + 1)
-    if len(image_bytes) > max_bytes:
+    image_bytes = await image.read(max_bytes + 1) if max_bytes else await image.read()
+    if max_bytes and len(image_bytes) > max_bytes:
         raise HTTPException(status_code=413, detail=f"Image exceeds configured limit of {max_bytes} bytes")
     return image_bytes
 
@@ -483,7 +480,7 @@ def _image_to_data_url(
         with Image.open(BytesIO(image_bytes)) as image:
             inferred_format = (image.format or "").upper()
             width, height = image.size
-            if width <= 0 or height <= 0 or width * height > max_pixels:
+            if width <= 0 or height <= 0 or (max_pixels and width * height > max_pixels):
                 raise HTTPException(status_code=413, detail=f"Image exceeds configured pixel limit of {max_pixels}")
             image.verify()
         with Image.open(BytesIO(image_bytes)) as image:
@@ -735,20 +732,25 @@ async def _acquire_request_slot(request: Request, config: AppConfig) -> JSONResp
     key = request.client.host if request.client else "unknown"
     now = time.monotonic()
     async with _limit_lock:
-        events = _rate_events[key]
-        while events and now - events[0] >= 60:
-            events.popleft()
-        if len(events) >= config.requests_per_minute:
+        events = _rate_events[key] if config.requests_per_minute else None
+        if events is not None:
+            while events and now - events[0] >= 60:
+                events.popleft()
+        if events is not None and len(events) >= config.requests_per_minute:
             return JSONResponse(status_code=429, content=_error_payload("Rate limit exceeded"), headers={"Retry-After": "60"})
-        if _active_requests >= config.max_concurrent_requests:
+        if config.max_concurrent_requests and _active_requests >= config.max_concurrent_requests:
             return JSONResponse(status_code=429, content=_error_payload("Too many concurrent requests"), headers={"Retry-After": "1"})
-        events.append(now)
-        _active_requests += 1
+        if events is not None:
+            events.append(now)
+        if config.max_concurrent_requests:
+            _active_requests += 1
     return None
 
 
-async def _release_request_slot() -> None:
+async def _release_request_slot(config: AppConfig) -> None:
     global _active_requests
+    if not config.max_concurrent_requests:
+        return
     async with _limit_lock:
         _active_requests = max(0, _active_requests - 1)
 
@@ -793,6 +795,12 @@ async def lifespan(_app: FastAPI):
         logger.info("TextKit backend stopped", extra={"event": "server.stop"})
 
 
+def _request_body_limit(config: AppConfig, path: str) -> int:
+    if path == "/ocr":
+        return config.max_upload_bytes + 64 * 1024 if config.max_upload_bytes else 0
+    return config.max_request_body_bytes
+
+
 class RequestBodyLimitMiddleware:
     """Limit streamed/chunked bodies before Starlette buffers or parses them."""
 
@@ -808,17 +816,13 @@ class RequestBodyLimitMiddleware:
         except RuntimeError as exc:
             await JSONResponse(status_code=500, content=_error_payload(str(exc)))(scope, receive, send)
             return
-        limit = (
-            config.max_upload_bytes + 64 * 1024
-            if scope.get("path") == "/ocr"
-            else config.max_request_body_bytes
-        )
+        limit = _request_body_limit(config, scope.get("path", ""))
         headers = {key.lower(): value for key, value in scope.get("headers", [])}
         try:
             declared_length = int(headers.get(b"content-length", b"0"))
         except ValueError:
             declared_length = 0
-        if declared_length > limit:
+        if limit and declared_length > limit:
             await JSONResponse(status_code=413, content=_error_payload("Request body is too large"))(scope, receive, send)
             return
 
@@ -831,7 +835,7 @@ class RequestBodyLimitMiddleware:
                 break
             if message.get("type") == "http.request":
                 received += len(message.get("body", b""))
-                if received > limit:
+                if limit and received > limit:
                     await JSONResponse(status_code=413, content=_error_payload("Request body is too large"))(scope, receive, send)
                     return
                 if not message.get("more_body", False):
@@ -863,13 +867,9 @@ async def security_and_limits(request: Request, call_next: Any) -> Response:
 
     if request.method in {"POST", "PUT", "PATCH"}:
         content_length = request.headers.get("content-length")
-        if content_length:
+        body_limit = _request_body_limit(config, request.url.path)
+        if body_limit and content_length:
             try:
-                body_limit = (
-                    config.max_upload_bytes + 64 * 1024
-                    if request.url.path == "/ocr"
-                    else config.max_request_body_bytes
-                )
                 too_large = int(content_length) > body_limit
             except ValueError:
                 return JSONResponse(status_code=400, content=_error_payload("Invalid Content-Length header"))
@@ -894,19 +894,23 @@ async def security_and_limits(request: Request, call_next: Any) -> Response:
     limited = request.url.path in _AI_ENDPOINTS or is_prompt_put
     if not limited:
         return await call_next(request)
-    rejected = await _acquire_request_slot(request, config)
-    if rejected:
-        return rejected
+    limiter_enabled = bool(config.requests_per_minute or config.max_concurrent_requests)
+    if limiter_enabled:
+        rejected = await _acquire_request_slot(request, config)
+        if rejected:
+            return rejected
     operation_id = request.headers.get("x-textkit-operation-id", "").strip()
     if operation_id and (len(operation_id) > 200 or not re.fullmatch(r"[A-Za-z0-9:._-]+", operation_id)):
-        await _release_request_slot()
+        if limiter_enabled:
+            await _release_request_slot(config)
         return JSONResponse(status_code=400, content=_error_payload("Invalid operation ID"))
     operation_token = _operation_id.set(operation_id)
     try:
         return await call_next(request)
     finally:
         _operation_id.reset(operation_token)
-        await _release_request_slot()
+        if limiter_enabled:
+            await _release_request_slot(config)
 
 
 @app.exception_handler(HTTPException)
@@ -933,7 +937,7 @@ async def healthz() -> dict[str, str]:
 @app.post("/ocr", response_model=OCRResponse)
 async def ocr(
     image: UploadFile | None = File(default=None),
-    prompt: Annotated[str | None, Form(max_length=DEFAULT_MAX_PROMPT_CHARS)] = None,
+    prompt: Annotated[str | None, Form()] = None,
 ) -> OCRResponse:
     if image is None:
         raise HTTPException(status_code=400, detail='Missing required form file field "image"')

@@ -6,16 +6,23 @@ host: "127.0.0.1"
 port: 8765
 
 # Basic request limits to avoid unbounded memory use and accidental large
-# provider calls.
+# provider calls. Set a limit to 0 to disable it.
+# Valid range: 0-104857600 bytes; 0 disables the upload limit.
 max_upload_bytes: 15728640
+# Valid range: 0-200000000 pixels; 0 disables the image pixel limit.
 max_image_pixels: 40000000
+# Valid range: 0-2000000 characters; 0 disables the text limit.
 max_text_chars: 200000
+# Valid range: 0-100000 characters; 0 disables the prompt limit.
 max_prompt_chars: 20000
+# Valid range: 0-20971520 bytes; 0 disables the request body limit.
 max_request_body_bytes: 2097152
 
 # In-process abuse controls for AI calls and prompt updates. For multi-worker
 # deployments, put an equivalent shared limiter at the reverse proxy as well.
+# Valid range: 0-10000; 0 disables the per-minute request limit.
 requests_per_minute: 60
+# Valid range: 0-100; 0 disables the concurrent request limit.
 max_concurrent_requests: 4
 
 # Chrome-extension origins must either appear in this exact allowlist or send
