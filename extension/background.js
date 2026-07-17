@@ -54,7 +54,7 @@ async function getFileBridgeEndpoint(path) {
 }
 
 async function getBackendHeaders(contentType, operationId = '') {
-  const { backendToken } = await chrome.storage.sync.get({ backendToken: '' });
+  const { backendToken } = await chrome.storage.local.get({ backendToken: '' });
   const headers = {};
   if (contentType) headers['Content-Type'] = contentType;
   if (String(backendToken || '').trim()) headers['X-TextKit-Token'] = String(backendToken).trim();
@@ -63,7 +63,7 @@ async function getBackendHeaders(contentType, operationId = '') {
 }
 
 async function getFileBridgeHeaders(contentType = 'application/json') {
-  const { fileBridgeToken } = await chrome.storage.sync.get({ fileBridgeToken: '' });
+  const { fileBridgeToken } = await chrome.storage.local.get({ fileBridgeToken: '' });
   const token = String(fileBridgeToken || '').trim();
   if (!token) throw new Error('File bridge token is required. Configure it in Settings.');
   return {

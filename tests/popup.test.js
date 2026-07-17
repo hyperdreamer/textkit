@@ -79,8 +79,10 @@ function createElement(id = '') {
 
 function createPopupHarness(options = {}) {
   const elements = new Map();
-  const localData = { ...(options.localData || {}) };
-  const syncData = { fileBridgeToken: 'bridge-secret', ...(options.syncData || {}) };
+  const localData = { fileBridgeToken: 'bridge-secret', ...(options.localData || {}) };
+  const syncData = { ...(options.syncData || {}) };
+  const runtimeMessages = [];
+  const syncWrites = [];
   let timerId = 0;
   const timers = new Map();
 
@@ -106,7 +108,10 @@ function createPopupHarness(options = {}) {
     runtime: {
       lastError: options.runtimeLastError,
       onMessage: runtimeMessage,
-      sendMessage() { return Promise.resolve({ ok: true }); }
+      sendMessage(message) {
+        runtimeMessages.push(message);
+        return options.runtimeSendMessage ? options.runtimeSendMessage(message) : Promise.resolve({ ok: true });
+      }
     },
     storage: {
       local: {
@@ -135,7 +140,7 @@ function createPopupHarness(options = {}) {
       },
       sync: {
         get(defaults) { return Promise.resolve({ ...defaults, ...syncData }); },
-        set(values) { Object.assign(syncData, values); return Promise.resolve(); },
+        set(values) { syncWrites.push(values); Object.assign(syncData, values); return Promise.resolve(); },
         remove(keys) {
           for (const key of Array.isArray(keys) ? keys : [keys]) delete syncData[key];
           return Promise.resolve();
@@ -183,7 +188,7 @@ function createPopupHarness(options = {}) {
     await Promise.all(callbacks.map((callback) => callback()));
   }
 
-  return { context, elements, localData, runTimers, runtimeMessage, syncData };
+  return { context, elements, localData, runTimers, runtimeMessage, runtimeMessages, syncData, syncWrites };
 }
 
 test('prompt refresh rejects stale generations and dirty textareas', () => {
@@ -239,17 +244,20 @@ test('fallback preview stays separate and can be copied or reset', async () => {
   });
   const config = vm.runInContext('PROMPT_CONFIGS.ocr', harness.context);
   const prompt = harness.elements.get('ocr-prompt');
+  const preview = harness.elements.get('ocr-fallback-preview');
 
   await harness.context.refreshFallback(config, { force: true });
-  assert.equal(prompt.value, 'Server OCR default');
+  assert.equal(prompt.value, '');
+  assert.equal(preview.textContent, 'Server OCR default');
 
   // Simulate user edit: typing marks dirty and saves to localStorage
-  prompt.value = 'Server OCR default';
+  prompt.value = 'Custom OCR prompt';
   prompt.dispatch('input');
-  assert.equal(harness.localData.ocrPrompt, 'Server OCR default');
+  assert.equal(harness.localData.ocrPrompt, 'Custom OCR prompt');
 
   await harness.context.resetPromptToFallback(config);
-  assert.equal(prompt.value, 'Server OCR default');
+  assert.equal(prompt.value, '');
+  assert.equal(preview.textContent, 'Server OCR default');
   assert.equal(Object.hasOwn(harness.localData, 'ocrPrompt'), false);
 });
 
@@ -267,6 +275,28 @@ test('prompt edits save immediately without writing backend prompts', async () =
 
   assert.equal(harness.localData.dedupPrompt, 'Final edit');
   assert.equal(fetchCalls.length, 0);
+});
+
+test('server fallback previews are never sent as custom prompts', async () => {
+  const harness = createPopupHarness({
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ template: 'Server fallback', source: 'file', version: 'v1' })
+    })
+  });
+  const config = vm.runInContext('PROMPT_CONFIGS.ocr', harness.context);
+  await harness.context.refreshFallback(config, { force: true });
+
+  await harness.context.startCapture();
+  const first = harness.runtimeMessages.find((message) => message.type === 'popup:start');
+  assert.equal(Object.hasOwn(first, 'prompts'), false);
+
+  harness.elements.get('ocr-prompt').value = 'Explicit override';
+  await harness.context.startCapture();
+  const starts = harness.runtimeMessages.filter((message) => message.type === 'popup:start');
+  assert.equal(starts.at(-1).prompts.ocr, 'Explicit override');
+  assert.equal(Object.hasOwn(starts.at(-1).prompts, 'dedup'), false);
 });
 
 test('stale forced fallback response cannot overwrite the current cache', async () => {
@@ -302,7 +332,8 @@ test('stale forced fallback response cannot overwrite the current cache', async 
 
   const cacheKey = 'promptFallback:localhost:8765:ocr:';
   assert.equal(harness.localData[cacheKey].template, 'new prompt');
-  assert.equal(prompt.value, 'new prompt');
+  assert.equal(prompt.value, '');
+  assert.equal(harness.elements.get('ocr-fallback-preview').textContent, 'new prompt');
 });
 
 test('path suggestions fall back to local history when the backend fails', async () => {
@@ -382,6 +413,73 @@ test('slow path response cannot overwrite newer suggestions', async () => {
     harness.elements.get('tl2-path-suggestions').children.map((option) => option.value),
     ['new/result.txt']
   );
+});
+
+test('path suggestion requests abort after the timeout', async () => {
+  const harness = createPopupHarness({
+    localData: { tl2PathHistory: ['notes/fallback.txt'] },
+    fetch: async (_url, options) => new Promise((_resolve, reject) => {
+      if (options.signal.aborted) {
+        reject(new Error('aborted'));
+        return;
+      }
+      options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    })
+  });
+
+  const request = harness.context.fetchPathSuggestions('notes/');
+  await harness.runTimers();
+  await request;
+
+  assert.deepEqual(
+    harness.elements.get('tl2-path-suggestions').children.map((option) => option.value),
+    ['notes/fallback.txt']
+  );
+});
+
+test('path setting writes are debounced and flush on blur', async () => {
+  const harness = createPopupHarness({
+    fetch: async () => ({ ok: true, json: async () => ({ paths: [] }) })
+  });
+  const input = harness.elements.get('tl2-autosave-path');
+
+  input.value = 'n';
+  input.dispatch('input');
+  input.value = 'notes/out.txt';
+  input.dispatch('input');
+  assert.equal(harness.syncWrites.length, 0);
+
+  input.dispatch('blur');
+  await delay();
+  assert.equal(harness.syncWrites.length, 1);
+  assert.equal(harness.syncData.tl2AutoSavePath, 'notes/out.txt');
+});
+
+test('OCR edits and format path settings flush only on commit events', async () => {
+  const harness = createPopupHarness({
+    fetch: async () => ({ ok: true, json: async () => ({ paths: [] }) })
+  });
+  vm.runInContext('currentTabId = 1', harness.context);
+  const result = harness.elements.get('result');
+  const formatPath = harness.elements.get('fmt-save-path');
+
+  result.value = 'draft';
+  result.dispatch('input');
+  result.value = 'final OCR edit';
+  result.dispatch('input');
+  formatPath.value = 'draft.md';
+  formatPath.dispatch('input');
+  formatPath.value = 'notes/final.md';
+  formatPath.dispatch('input');
+
+  assert.equal(Object.hasOwn(harness.localData, 'lastResult:1'), false);
+  assert.equal(Object.hasOwn(harness.syncData, 'fmtSavePath'), false);
+  result.dispatch('change');
+  formatPath.dispatch('blur');
+  await delay();
+
+  assert.equal(harness.localData['lastResult:1'], 'final OCR edit');
+  assert.equal(harness.syncData.fmtSavePath, 'notes/final.md');
 });
 
 test('manual clipboard failure is reported instead of silently succeeding', async () => {

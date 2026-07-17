@@ -37,9 +37,8 @@
         border-bottom-color: #2563eb;
       }
 
-      main {
-        padding: 14px;
-      }
+      main { padding: 0; }
+      .panel { padding: 14px; }
 
       h1 {
         margin: 0 0 12px;
@@ -324,6 +323,26 @@
       .prompt-editor textarea.server-default {
         color: #94a3b8;
       }
+      .prompt-fallback {
+        min-height: 34px;
+        margin-top: 7px;
+        padding: 7px 8px;
+        border: 1px dashed #cbd5e1;
+        border-radius: 5px;
+        color: #64748b;
+        background: #f8fafc;
+        font: 10px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        white-space: pre-wrap;
+      }
+      .prompt-fallback::before {
+        display: block;
+        margin-bottom: 3px;
+        color: #94a3b8;
+        content: "Server default preview";
+        font-family: system-ui, sans-serif;
+        font-weight: 600;
+        text-transform: uppercase;
+      }
       .hidden { display: none; }
     </style>
   </head>
@@ -352,22 +371,23 @@
       <span class="hint">Leave the file bridge host blank to use localhost with the configured file bridge port.</span>
     </div>
 
-    <div class="tab-bar">
-      <button class="tab active" data-panel="ocr-panel">OCR</button>
-      <button class="tab" data-panel="translation-panel">Translation</button>
-      <button class="tab" data-panel="format-panel">Format</button>
-      <button class="tab" data-panel="translate-panel">Prompts</button>
+    <div class="tab-bar" role="tablist" aria-label="TextKit tools">
+      <button id="ocr-tab" class="tab active" role="tab" aria-selected="true" aria-controls="ocr-panel" data-panel="ocr-panel">OCR</button>
+      <button id="translation-tab" class="tab" role="tab" aria-selected="false" aria-controls="translation-panel" data-panel="translation-panel">Translation</button>
+      <button id="format-tab" class="tab" role="tab" aria-selected="false" aria-controls="format-panel" data-panel="format-panel">Format</button>
+      <button id="prompts-tab" class="tab" role="tab" aria-selected="false" aria-controls="translate-panel" data-panel="translate-panel">Prompts</button>
     </div>
 
+    <main id="app-main">
     <!-- OCR Panel -->
-    <main id="ocr-panel">
+    <section id="ocr-panel" class="panel" role="tabpanel" aria-labelledby="ocr-tab">
       <section class="stats" aria-label="Capture status">
         <div class="stat"><span class="label">Status</span><span id="status" class="value">Idle</span></div>
         <div class="stat"><span class="label">Current page</span><span id="current-page" class="value">0</span></div>
         <div class="stat"><span class="label">Fragments</span><span id="fragments" class="value">0</span></div>
         <div class="stat"><span class="label">Progress</span><span id="short-progress" class="value">Ready</span></div>
       </section>
-      <div id="progress">Ready</div>
+      <div id="progress" role="status" aria-live="polite">Ready</div>
       <div class="option-row">
         <label><input id="ocr-autoscroll" type="checkbox" checked> Auto-scroll</label>
         <label>Capture interval (ms) <input id="ocr-capture-interval" type="number" min="50" max="2000" value="100"></label>
@@ -381,10 +401,10 @@
         <button id="download" type="button" disabled>Download</button>
       </div>
       <div id="last-region"></div>
-    </main>
+    </section>
 
     <!-- Prompt editor panel -->
-    <main id="translate-panel" class="hidden">
+    <section id="translate-panel" class="panel hidden" role="tabpanel" aria-labelledby="prompts-tab" hidden>
       <h1>Prompts</h1>
       <p class="prompt-intro">Edit prompts below. Server defaults are shown in monospace.</p>
       <div class="prompt-accordion">
@@ -392,6 +412,7 @@
           <summary>OCR</summary>
           <div class="prompt-editor">
             <textarea id="ocr-prompt" placeholder="Optional custom OCR prompt"></textarea>
+            <div id="ocr-fallback-preview" class="prompt-fallback"></div>
             <div class="prompt-controls"><button id="ocr-reset-default" type="button" class="secondary">Reset to server default</button></div>
           </div>
         </details>
@@ -399,6 +420,7 @@
           <summary>Dedup</summary>
           <div class="prompt-editor">
             <textarea id="dedup-prompt" placeholder="Optional custom dedup prompt"></textarea>
+            <div id="dedup-fallback-preview" class="prompt-fallback"></div>
             <div class="prompt-controls"><button id="dedup-reset-default" type="button" class="secondary">Reset to server default</button></div>
           </div>
         </details>
@@ -420,6 +442,7 @@
               </label>
             </div>
             <textarea id="translate-prompt" placeholder="Optional custom translation prompt for this language"></textarea>
+            <div id="translate-fallback-preview" class="prompt-fallback"></div>
             <span id="translate-prompt-hint" class="hint hidden"></span>
             <div class="prompt-controls"><button id="translate-reset-default" type="button" class="secondary">Reset to server default</button></div>
           </div>
@@ -428,14 +451,15 @@
           <summary>Format</summary>
           <div class="prompt-editor">
             <textarea id="format-prompt" placeholder="Optional custom formatting prompt"></textarea>
+            <div id="format-fallback-preview" class="prompt-fallback"></div>
             <div class="prompt-controls"><button id="format-reset-default" type="button" class="secondary">Reset to server default</button></div>
           </div>
         </details>
       </div>
-    </main>
+    </section>
 
     <!-- Translation Panel -->
-    <main id="translation-panel" class="hidden">
+    <section id="translation-panel" class="panel hidden" role="tabpanel" aria-labelledby="translation-tab" hidden>
       <h1>Translation</h1>
       <div class="settings">
         <label>Language
@@ -453,7 +477,7 @@
       </div>
       <div id="tl2-status" class="stat" style="margin-bottom:8px">
         <span class="label">Status</span>
-        <span id="tl2-status-text" class="value">Ready</span>
+        <span id="tl2-status-text" class="value" role="status" aria-live="polite">Ready</span>
       </div>
       <textarea id="tl2-result" readonly placeholder="Translation will appear here."></textarea>
       <div id="tl2-autosave-path-row" style="margin-bottom:8px">
@@ -473,10 +497,10 @@
         <button id="tl2-save" type="button" disabled>Save</button>
         <button id="tl2-download" type="button" disabled>Download</button>
       </div>
-    </main>
+    </section>
 
     <!-- Format Panel -->
-    <main id="format-panel" class="hidden">
+    <section id="format-panel" class="panel hidden" role="tabpanel" aria-labelledby="format-tab" hidden>
       <h1>Format</h1>
       <div class="settings" style="margin-bottom:8px">
         <label>Source
@@ -488,7 +512,7 @@
       </div>
       <div id="fmt-status" class="stat" style="margin-bottom:8px">
         <span class="label">Status</span>
-        <span id="fmt-status-text" class="value">Ready</span>
+        <span id="fmt-status-text" class="value" role="status" aria-live="polite">Ready</span>
       </div>
       <textarea id="fmt-result" readonly placeholder="Formatted text will appear here."></textarea>
       <div id="fmt-save-path-row" style="margin-bottom:8px">
@@ -507,6 +531,7 @@
         <button id="fmt-save" type="button" disabled>Save</button>
         <button id="fmt-download" type="button" disabled>Download</button>
       </div>
+    </section>
     </main>
 
 

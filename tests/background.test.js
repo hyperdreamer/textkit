@@ -954,7 +954,7 @@ test('file bridge saves require safe paths, authentication, and explicit success
   let fetchCalls = 0;
   let requestHeaders;
   const harness = createBackgroundHarness({
-    syncValues: { fileBridgeToken: 'bridge-secret' },
+    localData: { fileBridgeToken: 'bridge-secret' },
     fetch: async (_url, options) => {
       fetchCalls += 1;
       requestHeaders = options.headers;
@@ -975,7 +975,7 @@ test('file bridge saves require safe paths, authentication, and explicit success
 test('file bridge empty or implicit-success responses are rejected', async () => {
   let responseBody = '';
   const harness = createBackgroundHarness({
-    syncValues: { fileBridgeToken: 'bridge-secret' },
+    localData: { fileBridgeToken: 'bridge-secret' },
     fetch: async () => ({ ok: true, text: async () => responseBody })
   });
 

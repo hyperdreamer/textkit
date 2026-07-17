@@ -417,6 +417,24 @@ def test_request_and_model_fields_are_bounded(
     assert unsupported_language.status_code == 400
 
 
+def test_chunked_request_body_is_limited_without_content_length(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        main,
+        "load_config",
+        lambda: _app_config().model_copy(update={"max_request_body_bytes": 1024}),
+    )
+
+    response = client.post(
+        "/format",
+        content=(chunk for chunk in (b'{"text":"', b"x" * 1200, b'"}')),
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 413
+
+
 def test_config_schema_rejects_invalid_ranges(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

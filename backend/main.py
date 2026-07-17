@@ -604,12 +604,13 @@ async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str
 
 
 async def _call_openai(config: AIConfig, data_url: str, prompt: str | None = None) -> OCRResponse:
+    effective_prompt = prompt or await asyncio.to_thread(_render_prompt, "ocr")
     return await _post_openai_chat_completion(
         config,
         [{
             "role": "user",
             "content": [
-                {"type": "text", "text": prompt or _render_prompt("ocr")},
+                {"type": "text", "text": effective_prompt},
                 {"type": "image_url", "image_url": {"url": data_url}},
             ],
         }],
@@ -622,10 +623,11 @@ async def transcribe_image(config: AIConfig, data_url: str, prompt: str | None =
 
 async def deduplicate_text(config: AIConfig, text: str, prompt: str | None = None) -> OCRResponse:
     cfg = _resolve_ai_config(config, config.text)
+    effective_prompt = prompt or await asyncio.to_thread(_render_prompt, "dedup")
     return await _post_openai_chat_completion(
         cfg,
         [
-            {"role": "system", "content": prompt or _render_prompt("dedup")},
+            {"role": "system", "content": effective_prompt},
             {"role": "user", "content": text},
         ],
     )
@@ -665,10 +667,11 @@ def _should_skip_translation(
 
 async def translate_text(config: AIConfig, text: str, language: str, prompt: str | None = None) -> OCRResponse:
     cfg = _resolve_ai_config(config, config.text)
+    effective_prompt = prompt or await asyncio.to_thread(_render_prompt, "translate", language=language)
     return await _post_openai_chat_completion(
         cfg,
         [
-            {"role": "system", "content": prompt or _render_prompt("translate", language=language)},
+            {"role": "system", "content": effective_prompt},
             {"role": "user", "content": text},
         ],
     )
@@ -676,10 +679,11 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
 
 async def format_text(config: AIConfig, text: str, prompt: str | None = None) -> OCRResponse:
     cfg = _resolve_ai_config(config, config.text)
+    effective_prompt = prompt or await asyncio.to_thread(_render_prompt, "format")
     return await _post_openai_chat_completion(
         cfg,
         [
-            {"role": "system", "content": prompt or _render_prompt("format")},
+            {"role": "system", "content": effective_prompt},
             {"role": "user", "content": text},
         ],
     )
@@ -774,6 +778,7 @@ async def _debug_dump(config: AppConfig, name: str, data: bytes | str) -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     config = await _get_config()
+    await asyncio.to_thread(lambda: [_load_prompt(name) for name in _DEFAULT_PROMPTS])
     await _get_http_client()
     if config.debug:
         await asyncio.to_thread(_private_debug_dir)
@@ -788,7 +793,65 @@ async def lifespan(_app: FastAPI):
         logger.info("TextKit backend stopped", extra={"event": "server.stop"})
 
 
+class RequestBodyLimitMiddleware:
+    """Limit streamed/chunked bodies before Starlette buffers or parses them."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or scope.get("method") not in {"POST", "PUT", "PATCH"}:
+            await self.app(scope, receive, send)
+            return
+        try:
+            config = await _get_config()
+        except RuntimeError as exc:
+            await JSONResponse(status_code=500, content=_error_payload(str(exc)))(scope, receive, send)
+            return
+        limit = (
+            config.max_upload_bytes + 64 * 1024
+            if scope.get("path") == "/ocr"
+            else config.max_request_body_bytes
+        )
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        try:
+            declared_length = int(headers.get(b"content-length", b"0"))
+        except ValueError:
+            declared_length = 0
+        if declared_length > limit:
+            await JSONResponse(status_code=413, content=_error_payload("Request body is too large"))(scope, receive, send)
+            return
+
+        messages: list[dict[str, Any]] = []
+        received = 0
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message.get("type") == "http.disconnect":
+                break
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    await JSONResponse(status_code=413, content=_error_payload("Request body is too large"))(scope, receive, send)
+                    return
+                if not message.get("more_body", False):
+                    break
+
+        message_index = 0
+
+        async def replay_receive() -> dict[str, Any]:
+            nonlocal message_index
+            if message_index < len(messages):
+                message = messages[message_index]
+                message_index += 1
+                return message
+            return {"type": "http.disconnect"}
+
+        await self.app(scope, replay_receive, send)
+
+
 app = FastAPI(title="TextKit Backend v0.0.0", lifespan=lifespan)
+app.add_middleware(RequestBodyLimitMiddleware)
 
 
 @app.middleware("http")

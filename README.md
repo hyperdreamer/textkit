@@ -39,11 +39,13 @@ Edit `config.yaml` for your provider, model, and API key.
 
 ```sh
 export OCR_API_KEY="your-api-key"
-pip install -r requirements.txt
+export TEXTKIT_EXTENSION_TOKEN="a-long-random-shared-secret"
+export TEXTKIT_ADMIN_TOKEN="a-different-admin-secret"
+pip install --require-hashes -r requirements.lock
 python main.py
 ```
 
-By default, the server binds to `127.0.0.1:8765`. Change `host` in `config.yaml` to `0.0.0.0` to listen on all interfaces.
+By default, the server binds to `127.0.0.1:8765`. Keep the loopback bind unless the service is placed behind an authenticated TLS reverse proxy with equivalent shared rate limits.
 
 ### Extension
 
@@ -51,7 +53,7 @@ By default, the server binds to `127.0.0.1:8765`. Change `host` in `config.yaml`
 2. Enable Developer mode.
 3. Click Load unpacked.
 4. Select the `extension/` directory.
-5. Open the extension popup and confirm the backend host and port, usually `localhost` and `8765`.
+5. Open the extension popup, confirm the backend host and port, paste the same extension token configured by `TEXTKIT_EXTENSION_TOKEN`, and grant the requested optional localhost access.
 
 ## Backend API
 
@@ -155,7 +157,7 @@ Every AI endpoint (`/ocr`, `/dedup`, `/translate`, `/format`) accepts an optiona
 2. **Backend file** — `backend/prompts/{name}.txt`, or `translate.{Language}.txt` before the base translate file.
 3. **Hardcoded failsafe** — the matching entry in `_DEFAULT_PROMPTS` when no prompt file exists.
 
-The extension never writes canonical backend prompt files. Its Prompts tab leaves an empty editor empty, shows the server fallback separately, and offers **Use as custom** and **Reset to server default** actions.
+The extension never writes canonical backend prompt files. Its Prompts tab leaves an empty editor empty, shows the server fallback separately, and sends a prompt only after the user enters an explicit override. **Reset to server default** removes that override.
 
 ### `GET /prompts`
 
@@ -201,10 +203,11 @@ curl "http://localhost:8765/prompts/translate?language=French"
 # Administrative write
 curl -X PUT "http://localhost:8765/prompts/ocr" \
   -H "Content-Type: application/json" \
+  -H "X-TextKit-Admin-Token: $TEXTKIT_ADMIN_TOKEN" \
   -d '{"template": "Transcribe all visible text in Japanese"}'
 ```
 
-Administrative PUTs are persisted to `backend/prompts/*.txt` on disk and survive backend restarts. Extension-local prompt overrides remain in Chrome storage and are sent only with individual AI requests.
+Administrative PUTs require the configured admin token, are atomically persisted to `backend/prompts/*.txt`, and survive backend restarts. Extension-local prompt overrides remain in Chrome storage and are sent only with individual AI requests.
 
 ### Configuration
 
@@ -220,6 +223,8 @@ Example:
 ```yaml
 host: "127.0.0.1"
 port: 8765
+extension_token: "$TEXTKIT_EXTENSION_TOKEN"
+admin_token: "$TEXTKIT_ADMIN_TOKEN"
 
 ai:
   api_base: "https://api.openai.com"
@@ -235,7 +240,7 @@ ai:
 
 Supported `ai` fields:
 
-- `api_base`: base provider URL without a trailing slash. Must expose `/v1/chat/completions`.
+- `api_base`: base provider URL without a trailing slash. Must expose `/v1/chat/completions`. Non-loopback providers must use HTTPS.
 - `api_key`: the API key. Plaintext values are used directly. Prefix with `$` to treat the value as an environment variable name (e.g. `$OCR_API_KEY`). `api_key_env` is also accepted.
 - `model`: the model name to send to the provider. Fallback model used for all operations unless per-task overrides are set.
 - `ocr` (optional): nested section to override model/endpoint for vision (OCR) requests. Fields: `api_base`, `api_key`, `model`. Empty fields inherit from the parent `ai` section.
@@ -257,6 +262,8 @@ python main.py
 
 `main.py` reads `config.yaml` and starts Uvicorn with the configured `host` and `port`.
 
+`GET /healthz` returns `{"status":"ok"}` for local health checks. Logs are emitted as structured JSON. Production installs should use the hash-locked `requirements.lock`; `requirements.txt` records the pinned direct dependencies used to generate it.
+
 ## Extension
 
 The extension lives in `extension/` and uses Manifest V3.
@@ -268,6 +275,8 @@ Main files:
 - `background.js`: capture orchestration, backend calls, fragment merging, retry state, and persistence.
 - `content.js`: selection overlay, saved-region editing, viewport reporting, and page scrolling.
 - `overlay.css`: region selection overlay styling.
+
+Backend and file-bridge hosts are optional permissions requested when the user confirms settings or starts an operation. The backend token is sent as `X-TextKit-Token`. The separate file bridge must require `X-TextKit-Bridge-Token`, constrain all relative paths to its configured root, and return an explicit `{"success":true,"path":"..."}` save response; paste that bridge secret into the popup's File bridge token field.
 
 ### Popup tabs
 
@@ -339,12 +348,16 @@ Settings persisted to Chrome sync storage:
 Settings persisted to Chrome local storage:
 
 - Last region size and position.
+- Backend and file-bridge shared tokens (kept local rather than Chrome Sync).
 - Per-tab: OCR result, translation result, format result, status messages.
 - OCR prompt and dedup prompt (extension-local user overrides).
 - Format prompt (extension-local user override).
 - Translation prompts (extension-local, per-language user overrides).
 - Cached server fallback previews and their SHA-256 versions.
 - Save path autocomplete — queried in real time from file-bridge (with local history fallback).
+- Bounded, versioned checkpoints for active MV3 capture/translate/format operations so a restarted service worker can resume safely.
+
+High-frequency text and path edits are debounced and flushed on blur/change to avoid exhausting Chrome storage write quotas.
 
 ## Development Notes
 
@@ -352,7 +365,7 @@ Install backend dependencies with:
 
 ```sh
 cd backend
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock
 ```
 
 The backend dependencies are:
@@ -374,6 +387,7 @@ Run tests from the repository root:
 ```sh
 python -m pytest tests/ -v
 node tests/background.test.js && node tests/popup.test.js && node tests/content.test.js
+node tests/extension_e2e.test.js
 ```
 
 ## Troubleshooting
@@ -388,12 +402,12 @@ export OCR_API_KEY="your-api-key"
 
 ### Extension cannot reach the backend
 
-Check the popup Host and Port fields. For the default backend config, use:
+Check the popup Host, Port, and Backend token fields. For the default backend config, use:
 
 - Host: `localhost`
 - Port: `8765`
 
-Also confirm that the backend is running and listening on the configured port.
+The token must match `TEXTKIT_EXTENSION_TOKEN`. Confirm that optional localhost access was granted when Chrome prompted, and that the backend is running on the configured loopback port.
 
 ### Region selection does not open
 

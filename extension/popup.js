@@ -113,12 +113,16 @@ let userEditedResult = false;
 let lastStoredStatus = '';
 let promptEditorLanguage = 'original';
 let _tlSaveTimer = null;
+let _ocrTextSaveTimer = null;
+let _tl2SettingsSaveTimer = null;
+let _formatSettingsSaveTimer = null;
 const LOCAL_BACKEND_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 const FILE_BRIDGE_DEFAULT_PORT = 8766;
 
 function fallbackElements(config) {
   return {
-    reset: document.getElementById(`${config.name}-reset-default`)
+    reset: document.getElementById(`${config.name}-reset-default`),
+    preview: document.getElementById(`${config.name}-fallback-preview`)
   };
 }
 
@@ -132,19 +136,14 @@ function fallbackStorageKey(identity) {
 }
 
 function updatePromptUi(config) {
-  const state = _getPromptRefreshState(config.element);
   let backend;
   try { backend = normalizeBackendSettings(hostInput.value, portInput.value); } catch { backend = null; }
   const fallback = backend ? _fallbackData.get(fallbackIdentity(config, backend)) : null;
   const elements = fallbackElements(config);
-  const hasCustom = state.dirty && config.element.value.trim().length > 0;
+  const hasCustom = config.element.value.trim().length > 0;
   elements.reset.disabled = !hasCustom;
-  if (!state.dirty && fallback) {
-    if (config.element.value !== fallback.template) config.element.value = fallback.template;
-    config.element.classList.add('server-default');
-  } else {
-    config.element.classList.remove('server-default');
-  }
+  elements.preview.textContent = fallback?.template || 'Server default unavailable.';
+  config.element.classList.remove('server-default');
   if (config.name === 'translate') updateTranslateHintFromValue();
 }
 
@@ -227,6 +226,7 @@ function refreshAllFallbacks(options = {}) {
 async function resetPromptToFallback(config) {
   _beginPromptRefresh(config.element, { resetDirty: true });
   await chrome.storage.local.remove(config.storageKey());
+  config.element.value = '';
   updatePromptUi(config);
   await refreshFallback(config, { force: true });
 }
@@ -234,10 +234,18 @@ async function resetPromptToFallback(config) {
 // ── Tab switching ─────────────────────────────────────────────
 tabs.forEach(tab => {
   tab.addEventListener('click', () => {
-    tabs.forEach(t => t.classList.remove('active'));
+    tabs.forEach(t => {
+      t.classList.remove('active');
+      t.setAttribute('aria-selected', 'false');
+    });
     tab.classList.add('active');
-    Object.values(panels).forEach(p => p.classList.add('hidden'));
+    tab.setAttribute('aria-selected', 'true');
+    Object.values(panels).forEach(p => {
+      p.classList.add('hidden');
+      p.hidden = true;
+    });
     panels[tab.dataset.panel].classList.remove('hidden');
+    panels[tab.dataset.panel].hidden = false;
   });
 });
 
@@ -262,7 +270,9 @@ stopButton.addEventListener('click', stopCapture);
 retryButton.addEventListener('click', retryCapture);
 copyButton.addEventListener('click', copyOcrText);
 downloadButton.addEventListener('click', downloadOcrText);
-resultEl.addEventListener('input', saveOcrText);
+resultEl.addEventListener('input', scheduleOcrTextSave);
+resultEl.addEventListener('blur', flushOcrTextSave);
+resultEl.addEventListener('change', flushOcrTextSave);
 hostInput.addEventListener('change', saveSettings);
 portInput.addEventListener('change', saveSettings);
 backendTokenInput.addEventListener('change', saveSettings);
@@ -295,9 +305,11 @@ tl2AutocopyCheckbox.addEventListener('change', saveTl2Settings);
 tl2AutosaveCheckbox.addEventListener('change', saveTl2Settings);
 tl2AutotranslateCheckbox.addEventListener('change', saveTl2Settings);
 tl2AutosavePath.addEventListener('input', () => {
-  saveTl2Settings();
+  scheduleTl2SettingsSave();
   updatePathSuggestions(tl2AutosavePath.value);
 });
+tl2AutosavePath.addEventListener('blur', flushTl2SettingsSave);
+tl2AutosavePath.addEventListener('change', flushTl2SettingsSave);
 
 // ── Format panel listeners ─────────────────────────────────────
 fmtFormat.addEventListener('click', doFormat);
@@ -320,9 +332,11 @@ Object.values(PROMPT_CONFIGS).forEach((config) => {
   elements.reset.addEventListener('click', () => resetPromptToFallback(config));
 });
 fmtSavePath.addEventListener('input', () => {
-  saveFormatSettings();
+  scheduleFormatSettingsSave();
   updatePathSuggestions(fmtSavePath.value);
 });
+fmtSavePath.addEventListener('blur', flushFormatSettingsSave);
+fmtSavePath.addEventListener('change', flushFormatSettingsSave);
 fmtAutocopy.addEventListener('change', saveFormatSettings);
 fmtAutosave.addEventListener('change', saveFormatSettings);
 fmtAutoformat.addEventListener('change', saveFormatSettings);
@@ -399,8 +413,8 @@ async function init() {
   currentTabId = tab?.id || null;
 
   const items = await chrome.storage.sync.get({
-    backendHost: 'localhost', backendPort: 8765, backendToken: '',
-    fileBridgeHost: '', fileBridgePort: FILE_BRIDGE_DEFAULT_PORT, fileBridgeToken: '',
+    backendHost: 'localhost', backendPort: 8765,
+    fileBridgeHost: '', fileBridgePort: FILE_BRIDGE_DEFAULT_PORT,
     ocrAutoscroll: true,
     captureIntervalMs: 100,
     ocrHost: null, ocrPort: null
@@ -417,8 +431,9 @@ async function init() {
   }
   fileBridgeHostInput.value = items.fileBridgeHost || '';
   fileBridgePortInput.value = items.fileBridgePort || FILE_BRIDGE_DEFAULT_PORT;
-  backendTokenInput.value = items.backendToken || '';
-  fileBridgeTokenInput.value = items.fileBridgeToken || '';
+  const secrets = await chrome.storage.local.get({ backendToken: '', fileBridgeToken: '' });
+  backendTokenInput.value = secrets.backendToken || '';
+  fileBridgeTokenInput.value = secrets.fileBridgeToken || '';
   tlLanguage.value = tlLanguage.value || 'original';
   tl2Language.value = tl2Language.value || 'original';
   autoscrollCheckbox.checked = items.ocrAutoscroll;
@@ -645,13 +660,19 @@ async function saveSettings() {
   const intervalVal = parseInt(captureIntervalInput.value, 10);
   const captureIntervalMs = (Number.isFinite(intervalVal) && intervalVal >= 50 && intervalVal <= 2000)
     ? intervalVal : 100;
-  await chrome.storage.sync.set({
-    backendHost: backend.host,
-    backendPort: backend.port,
-    backendToken: backendTokenInput.value.trim(),
-    ocrAutoscroll: autoscrollCheckbox.checked,
-    captureIntervalMs
-  });
+  if (!await ensureHostPermission(backend.host)) {
+    progressEl.textContent = 'Permission to contact the backend was not granted.';
+    return;
+  }
+  await Promise.all([
+    chrome.storage.sync.set({
+      backendHost: backend.host,
+      backendPort: backend.port,
+      ocrAutoscroll: autoscrollCheckbox.checked,
+      captureIntervalMs
+    }),
+    chrome.storage.local.set({ backendToken: backendTokenInput.value.trim() })
+  ]);
   hostInput.value = backend.host;
   portInput.value = backend.port;
   await refreshAllFallbacks({ force: true });
@@ -667,11 +688,14 @@ async function saveFileBridgeSettings() {
       progressEl.textContent = e.message;
       return;
     }
-    await chrome.storage.sync.set({
-      fileBridgeHost: '',
-      fileBridgePort: port,
-      fileBridgeToken: fileBridgeTokenInput.value.trim()
-    });
+    if (!await ensureHostPermission('localhost')) {
+      progressEl.textContent = 'Permission to contact the file bridge was not granted.';
+      return;
+    }
+    await Promise.all([
+      chrome.storage.sync.set({ fileBridgeHost: '', fileBridgePort: port }),
+      chrome.storage.local.set({ fileBridgeToken: fileBridgeTokenInput.value.trim() })
+    ]);
     fileBridgeHostInput.value = '';
     fileBridgePortInput.value = port;
     return;
@@ -684,13 +708,29 @@ async function saveFileBridgeSettings() {
     progressEl.textContent = e.message;
     return;
   }
-  await chrome.storage.sync.set({
-    fileBridgeHost: fileBridge.host,
-    fileBridgePort: fileBridge.port,
-    fileBridgeToken: fileBridgeTokenInput.value.trim()
-  });
+  if (!await ensureHostPermission(fileBridge.host)) {
+    progressEl.textContent = 'Permission to contact the file bridge was not granted.';
+    return;
+  }
+  await Promise.all([
+    chrome.storage.sync.set({ fileBridgeHost: fileBridge.host, fileBridgePort: fileBridge.port }),
+    chrome.storage.local.set({ fileBridgeToken: fileBridgeTokenInput.value.trim() })
+  ]);
   fileBridgeHostInput.value = fileBridge.host;
   fileBridgePortInput.value = fileBridge.port;
+}
+
+async function ensureHostPermission(host) {
+  if (!chrome.permissions?.contains || !chrome.permissions?.request) return true;
+  const origins = [`http://${host}/*`];
+  if (await chrome.permissions.contains({ origins })) return true;
+  return chrome.permissions.request({ origins });
+}
+
+async function ensureConfiguredFileBridgePermission() {
+  const host = fileBridgeHostInput.value.trim() || 'localhost';
+  const bridge = normalizeBackendSettings(host, fileBridgePortInput.value || FILE_BRIDGE_DEFAULT_PORT);
+  return ensureHostPermission(bridge.host);
 }
 
 // ── OCR actions ───────────────────────────────────────────────
@@ -703,6 +743,26 @@ async function saveOcrText() {
   copyButton.disabled = !hasText;
   downloadButton.disabled = !hasText;
   updateTranslationButtons();
+}
+
+function scheduleOcrTextSave() {
+  userEditedResult = true;
+  clearTimeout(_ocrTextSaveTimer);
+  _ocrTextSaveTimer = setTimeout(() => {
+    _ocrTextSaveTimer = null;
+    saveOcrText().catch((error) => { progressEl.textContent = `Save failed: ${error.message}`; });
+  }, 300);
+  const hasText = resultEl.value.trim().length > 0;
+  copyButton.disabled = !hasText;
+  downloadButton.disabled = !hasText;
+  updateTranslationButtons();
+}
+
+function flushOcrTextSave() {
+  if (!_ocrTextSaveTimer) return Promise.resolve();
+  clearTimeout(_ocrTextSaveTimer);
+  _ocrTextSaveTimer = null;
+  return saveOcrText();
 }
 
 async function refreshState() {
@@ -720,6 +780,14 @@ async function refreshState() {
 }
 
 async function startCapture() {
+  let backend;
+  try {
+    backend = normalizeBackendSettings(hostInput.value, portInput.value);
+    if (!await ensureHostPermission(backend.host)) throw new Error('Backend permission was not granted.');
+  } catch (error) {
+    progressEl.textContent = error.message;
+    return;
+  }
   userEditedResult = false;
   resultEl.value = '';
   copyButton.disabled = true;
@@ -733,12 +801,12 @@ async function startCapture() {
   startButton.disabled = true;
   progressEl.textContent = 'Starting region selection.';
   try {
+    const prompts = {};
+    if (ocrPromptEl.value.trim()) prompts.ocr = ocrPromptEl.value;
+    if (dedupPromptEl.value.trim()) prompts.dedup = dedupPromptEl.value;
     const response = await chrome.runtime.sendMessage({
       type: 'popup:start',
-      prompts: {
-        ocr: ocrPromptEl.value,
-        dedup: dedupPromptEl.value
-      }
+      ...(Object.keys(prompts).length ? { prompts } : {})
     });
     if (!response?.ok) {
       progressEl.textContent = response?.error || 'Unable to start capture.';
@@ -858,6 +926,7 @@ async function doTranslation() {
   let backend;
   try {
     backend = normalizeBackendSettings(hostInput.value, portInput.value);
+    if (!await ensureHostPermission(backend.host)) throw new Error('Backend permission was not granted.');
   } catch (e) {
     setTl2Progress(e.message);
     return;
@@ -872,15 +941,16 @@ async function doTranslation() {
   // Fire-and-forget: the background service worker handles the fetch
   // and sends translation:update / tl2:translating when done.
   // Don't await — the popup must stay responsive so Stop works.
-  chrome.runtime.sendMessage({
+  const message = {
     type: 'translate:start',
     tabId: currentTabId,
     text,
     language,
-    prompt,
     host: backend.host,
     port: backend.port
-  }).then((response) => {
+  };
+  if (String(prompt || '').trim()) message.prompt = prompt;
+  chrome.runtime.sendMessage(message).then((response) => {
     if (!response?.ok) {
       tl2Translate.textContent = 'Translate';
       tl2Translate.classList.remove('danger');
@@ -955,6 +1025,7 @@ async function doFormat() {
   let backend;
   try {
     backend = normalizeBackendSettings(hostInput.value, portInput.value);
+    if (!await ensureHostPermission(backend.host)) throw new Error('Backend permission was not granted.');
   } catch (e) {
     setFmtProgress(e.message);
     return;
@@ -967,14 +1038,15 @@ async function doFormat() {
   setFmtProgress('Formatting...');
 
   // Fire-and-forget: the background service worker handles the fetch
-  chrome.runtime.sendMessage({
+  const message = {
     type: 'format:start',
     tabId: currentTabId,
     text,
-    prompt,
     host: backend.host,
     port: backend.port
-  }).then((response) => {
+  };
+  if (String(prompt || '').trim()) message.prompt = prompt;
+  chrome.runtime.sendMessage(message).then((response) => {
     if (!response?.ok) {
       fmtFormat.textContent = 'Format';
       fmtFormat.classList.remove('danger');
@@ -1024,6 +1096,7 @@ async function saveFormatResult() {
   }
 
   try {
+    if (!await ensureConfiguredFileBridgePermission()) throw new Error('File bridge permission was not granted.');
     const response = await chrome.runtime.sendMessage({
       type: 'save:translation',
       text,
@@ -1054,13 +1127,28 @@ async function saveFormatResult() {
 }
 
 function saveFormatSettings() {
-  chrome.storage.sync.set({
+  return chrome.storage.sync.set({
     fmtSavePath: fmtSavePath.value.trim(),
     fmtAutoCopy: fmtAutocopy.checked,
     fmtAutoSave: fmtAutosave.checked,
     fmtAutoFormat: fmtAutoformat.checked,
     fmtSourceVal: fmtSource.value
   });
+}
+
+function scheduleFormatSettingsSave() {
+  clearTimeout(_formatSettingsSaveTimer);
+  _formatSettingsSaveTimer = setTimeout(() => {
+    _formatSettingsSaveTimer = null;
+    saveFormatSettings().catch((error) => setFmtProgress(`Settings save failed: ${error.message}`));
+  }, 300);
+}
+
+function flushFormatSettingsSave() {
+  if (!_formatSettingsSaveTimer) return Promise.resolve();
+  clearTimeout(_formatSettingsSaveTimer);
+  _formatSettingsSaveTimer = null;
+  return saveFormatSettings();
 }
 
 async function saveTranslation() {
@@ -1073,6 +1161,7 @@ async function saveTranslation() {
   }
 
   try {
+    if (!await ensureConfiguredFileBridgePermission()) throw new Error('File bridge permission was not granted.');
     const response = await chrome.runtime.sendMessage({
       type: 'save:translation',
       text,
@@ -1147,6 +1236,21 @@ async function saveTl2Settings() {
   });
 }
 
+function scheduleTl2SettingsSave() {
+  clearTimeout(_tl2SettingsSaveTimer);
+  _tl2SettingsSaveTimer = setTimeout(() => {
+    _tl2SettingsSaveTimer = null;
+    saveTl2Settings().catch((error) => setTl2Progress(`Settings save failed: ${error.message}`));
+  }, 300);
+}
+
+function flushTl2SettingsSave() {
+  if (!_tl2SettingsSaveTimer) return Promise.resolve();
+  clearTimeout(_tl2SettingsSaveTimer);
+  _tl2SettingsSaveTimer = null;
+  return saveTl2Settings();
+}
+
 // ── Filepath autocompletion ───────────────────────────────────
 
 const PATH_HISTORY_KEY = 'tl2PathHistory';
@@ -1165,12 +1269,11 @@ async function fetchPathSuggestions(prefix, generation = ++_pathSuggestionGenera
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), PATH_REQUEST_TIMEOUT_MS);
   try {
-    const items = await chrome.storage.sync.get({
-      fileBridgeHost: '',
-      fileBridgePort: FILE_BRIDGE_DEFAULT_PORT,
-      fileBridgeToken: ''
-    });
-    const token = String(items.fileBridgeToken || '').trim();
+    const [items, secrets] = await Promise.all([
+      chrome.storage.sync.get({ fileBridgeHost: '', fileBridgePort: FILE_BRIDGE_DEFAULT_PORT }),
+      chrome.storage.local.get({ fileBridgeToken: '' })
+    ]);
+    const token = String(secrets.fileBridgeToken || '').trim();
     if (!token) throw new Error('File bridge token is required.');
     const safePrefix = normalizePathPrefix(prefix);
     const hasFileBridgeHost = String(items.fileBridgeHost || '').trim().length > 0;
@@ -1230,19 +1333,20 @@ function populatePathSuggestions(paths) {
 
 function updatePathSuggestions(current) {
   const generation = ++_pathSuggestionGeneration;
-  // Save to history for offline fallback
-  if (current) {
-    chrome.storage.local.get(PATH_HISTORY_KEY, (r) => {
-      let history = r[PATH_HISTORY_KEY] || [];
-      history = history.filter(p => p !== current);
-      history.unshift(current);
-      if (history.length > MAX_PATH_HISTORY) history = history.slice(0, MAX_PATH_HISTORY);
-      chrome.storage.local.set({ [PATH_HISTORY_KEY]: history });
-    });
-  }
-  // Debounce: fetch real filesystem paths after typing stops
   clearTimeout(_pathDebounceTimer);
-  _pathDebounceTimer = setTimeout(() => fetchPathSuggestions(current, generation), 300);
+  _pathDebounceTimer = setTimeout(async () => {
+    _pathDebounceTimer = null;
+    if (current && isSafeRelativePath(current)) await rememberPath(current);
+    await fetchPathSuggestions(current, generation);
+  }, 300);
+}
+
+async function rememberPath(current) {
+  const stored = await chrome.storage.local.get(PATH_HISTORY_KEY);
+  let history = Array.isArray(stored[PATH_HISTORY_KEY]) ? stored[PATH_HISTORY_KEY] : [];
+  history = history.filter((path) => path !== current && isSafeRelativePath(path));
+  history.unshift(current);
+  await chrome.storage.local.set({ [PATH_HISTORY_KEY]: history.slice(0, MAX_PATH_HISTORY) });
 }
 
 function normalizeBackendSettings(host, port) {
