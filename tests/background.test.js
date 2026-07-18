@@ -345,6 +345,23 @@ const REGION = {
   viewportHeight: 100
 };
 
+test('abortable retry sleep wakes on abort without rejecting', async () => {
+  const harness = createBackgroundHarness();
+  const controller = new AbortController();
+  const sleepPromise = vm.runInContext('abortableSleep', harness.context)(60_000, controller.signal);
+
+  controller.abort();
+  await Promise.race([
+    sleepPromise,
+    delay(100).then(() => assert.fail('abortable sleep did not wake promptly'))
+  ]);
+});
+
+test('abortable retry sleep tolerates an absent signal', async () => {
+  const harness = createBackgroundHarness();
+  await vm.runInContext('abortableSleep', harness.context)(0);
+});
+
 test('safe capture accepts a frame when the target stays active', async () => {
   const harness = createBackgroundHarness();
   await harness.context.runCaptureLoop({ id: 1, windowId: 10, active: true }, REGION);

@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
@@ -260,7 +261,9 @@ _prompt_cache: dict[str, _PromptCacheEntry | str] = {}
 _config_cache: tuple[tuple[int, int] | None, AppConfig] | None = None
 _config_lock = asyncio.Lock()
 _http_client: httpx.AsyncClient | None = None
+_http_client_lock = asyncio.Lock()
 _debug_dir: Path | None = None
+_debug_dir_lock = threading.Lock()
 _rate_events: defaultdict[str, deque[float]] = defaultdict(deque)
 _active_requests = 0
 _limit_lock = asyncio.Lock()
@@ -498,7 +501,9 @@ def _extract_openai_text(payload: dict[str, Any]) -> str:
 async def _get_http_client() -> httpx.AsyncClient:
     global _http_client
     if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
+        async with _http_client_lock:
+            if _http_client is None or _http_client.is_closed:
+                _http_client = httpx.AsyncClient(limits=httpx.Limits(max_connections=20, max_keepalive_connections=10))
     return _http_client
 
 
@@ -686,8 +691,10 @@ async def _release_request_slot(config: AppConfig) -> None:
 def _private_debug_dir() -> Path:
     global _debug_dir
     if _debug_dir is None:
-        _debug_dir = Path(tempfile.mkdtemp(prefix="textkit-debug-"))
-        _debug_dir.chmod(0o700)
+        with _debug_dir_lock:
+            if _debug_dir is None:
+                _debug_dir = Path(tempfile.mkdtemp(prefix="textkit-debug-"))
+                _debug_dir.chmod(0o700)
     return _debug_dir
 
 

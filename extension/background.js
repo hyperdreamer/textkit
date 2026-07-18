@@ -1287,7 +1287,7 @@ async function executeCaptureLoop({
               break capturePages;
             }
             updateState(tabId, { progress: `Retrying page ${pageNumber} (attempt ${attempt + 1})...` });
-            await sleep(2000);
+            await abortableSleep(2000, controller.signal);
           }
         }
 
@@ -1610,7 +1610,7 @@ async function finalizePostCapture(tabId, mergedText, fragmentsOrCount) {
         break;
       }
       updateState(tabId, { progress: `Retrying dedup (${attempt + 1})...` });
-      await sleep(2000);
+      await abortableSleep(2000, signal);
     }
   }
 
@@ -1953,6 +1953,25 @@ async function fetchWithTimeout(url, options = {}, externalSignal) {
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+function abortableSleep(ms, signal) {
+  if (!signal) return sleep(ms);
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      resolve();
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function sleep(ms) {
