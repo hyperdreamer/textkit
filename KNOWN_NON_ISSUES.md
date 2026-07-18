@@ -124,3 +124,77 @@ viewport height. Future audits should not report this as a defect.
 ## 15. Config limits accept 0 to mean "unlimited"
 
 **Decision:** All `max_*` and rate/currency settings (`requests_per_minute`, `max_concurrent_requests`) accept 0 to disable the check entirely. Defaults are conservative; run with limits at 0 for unrestricted local use.
+
+---
+
+## 16. `_prompt_cache` can perform duplicate reads on concurrent cache misses
+
+**File:** `backend/main.py` (`_load_prompt`)
+
+Two `asyncio.to_thread` calls can miss `_prompt_cache` concurrently, both read the
+same small prompt file, and then store equivalent values. CPython protects the
+individual dictionary operations, so this does not corrupt state or return an
+incorrect prompt.
+
+**Decision:** NOT fixing. The only consequence is an occasional duplicate read of
+a tiny local file. Adding synchronization would increase complexity without a
+meaningful correctness or performance benefit.
+
+---
+
+## 17. Worker recovery reads all extension-local storage
+
+**File:** `extension/background.js` (`recoverPersistedOperations`)
+
+Worker startup uses `chrome.storage.local.get(null)` and filters keys beginning
+with `operation:` because Chrome storage has no prefix-query API. Maintaining a
+separate active-operation index would avoid the scan, but would require migration
+and atomic consistency handling across operation creation, completion, crashes,
+and service-worker termination.
+
+**Decision:** NOT fixing. Startup recovery correctness is more important than the
+small local-storage read cost. A stale or incomplete index could silently prevent
+recovery of interrupted operations.
+
+---
+
+## 18. Popup fallback Maps have no eviction
+
+**File:** `extension/popup.js` (`_fallbackRequests`, `_fallbackData`)
+
+Changing backend settings repeatedly can leave entries for old endpoints in these
+Maps during the current popup session.
+
+**Decision:** NOT fixing. A Chrome extension popup is a short-lived context and the
+Maps are destroyed when it closes. There is no realistic persistent memory leak.
+
+---
+
+## 19. Rate-limit counter does not drift across config hot reloads
+
+**File:** `backend/main.py` (`request_controls`, `_acquire_request_slot`,
+`_release_request_slot`)
+
+An audit claimed that changing `max_concurrent_requests` while a request is in
+flight could make acquisition increment `_active_requests` while release skips the
+decrement. This cannot occur: `request_controls` obtains one immutable `AppConfig`
+object at request entry, computes `limiter_enabled` from it, and passes that same
+object to both acquisition and release. A hot reload creates a new config object;
+it does not mutate the request-local snapshot.
+
+**Decision:** FALSE POSITIVE — do not change the release logic. Unconditionally
+decrementing would obscure the acquire/release invariant without fixing a real
+failure.
+
+---
+
+## 20. Origin validation remains a deferred item, not a non-issue
+
+**File:** `AUDIT_TODO.md`
+
+Origin/Fetch Metadata validation for CORS-safelisted OCR requests was deliberately
+excluded from the completed safe-fix loop because it needs a separately designed
+compatibility decision.
+
+**Decision:** Keep deferred in `AUDIT_TODO.md`; do not report it as a newly
+undocumented finding or silently implement it during unrelated audit fixes.
