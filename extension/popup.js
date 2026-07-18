@@ -124,7 +124,7 @@ let _ocrTextSaveTimer = null;
 let _tl2SettingsSaveTimer = null;
 let _formatSettingsSaveTimer = null;
 const LOCAL_BACKEND_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
-const FILE_BRIDGE_DEFAULT_PORT = 8766;
+const FILE_BRIDGE_DEFAULT_PORT = 8964;
 
 function fallbackElements(config) {
   return {

@@ -101,7 +101,7 @@ function createPopupHarness(options = {}) {
   document.getElementById('backend-host').value = 'localhost';
   document.getElementById('backend-port').value = '8765';
   document.getElementById('file-bridge-host').value = '';
-  document.getElementById('file-bridge-port').value = '8766';
+  document.getElementById('file-bridge-port').value = '8964';
   document.getElementById('tl-language').value = 'original';
   document.getElementById('tl2-language').value = 'original';
 

@@ -336,7 +336,7 @@ Every result panel (OCR, Translation, Format) supports:
 Settings persisted to Chrome sync storage:
 
 - Backend host and port.
-- File-bridge host and port. A blank host uses `localhost` with the configured file-bridge port (default `8766`), independently of the main backend settings.
+- File-bridge host and port. A blank host uses `localhost` with the configured file-bridge port (default `8964`), independently of the main backend settings.
 - Auto-scroll on/off.
 - Translation auto-copy, auto-save, auto-translate toggles and save path.
 - Format auto-copy, auto-save, auto-format toggles, save path, and source selector (Translation or OCR Result).
