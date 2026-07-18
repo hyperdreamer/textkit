@@ -37,6 +37,8 @@ cp config.example.yaml config.yaml
 
 Edit `config.yaml` for your provider, model, and API key.
 
+The backend supports Python 3.10 through Python 3.14.
+
 ```sh
 export OCR_API_KEY="your-api-key"
 pip install --require-hashes -r requirements.lock
@@ -359,7 +361,7 @@ Install backend dependencies with:
 
 ```sh
 cd backend
-pip install -r requirements-dev.lock
+pip install --require-hashes -r requirements-dev.lock
 ```
 
 The backend dependencies are:
@@ -372,7 +374,7 @@ The backend dependencies are:
 - `pillow`
 - `langdetect`
 - `pytest`
-- `pytest-asyncio`
+- `httpx2` (for Starlette's test client)
 
 The extension does not require a build step. Load the `extension/` folder directly as an unpacked extension.
 

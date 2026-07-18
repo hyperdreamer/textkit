@@ -214,6 +214,18 @@ function createPopupHarness(options = {}) {
   };
 }
 
+test('popup backend ports must be complete decimal strings', () => {
+  const harness = createPopupHarness();
+
+  assert.equal(harness.context.normalizeBackendSettings('localhost', ' 8765 ').port, 8765);
+  for (const malformed of ['8765junk', '1e3', '8765.9', '', '  ']) {
+    assert.throws(
+      () => harness.context.normalizeBackendSettings('localhost', malformed),
+      /Backend port must be between 1 and 65535/
+    );
+  }
+});
+
 test('prompt refresh rejects stale generations and dirty textareas', () => {
   const harness = createPopupHarness();
   const prompt = harness.elements.get('ocr-prompt');

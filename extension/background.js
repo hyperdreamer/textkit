@@ -145,7 +145,8 @@ function normalizeBackendSettings(host, port) {
     throw new Error('Backend host must be localhost, 127.0.0.1, or ::1.');
   }
 
-  const normalizedPort = Number.parseInt(port, 10);
+  const portText = String(port ?? '').trim();
+  const normalizedPort = /^\d+$/.test(portText) ? Number(portText) : NaN;
   if (!Number.isInteger(normalizedPort) || normalizedPort < 1 || normalizedPort > 65535) {
     throw new Error('Backend port must be between 1 and 65535.');
   }
@@ -265,7 +266,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     tabDocumentGenerations.set(tabId, (tabDocumentGenerations.get(tabId) || 0) + 1);
   }
   const state = states.get(tabId);
-  if (!state?.captureInFlight || state.collectionComplete) return;
+  if (!state?.captureInFlight) return;
   if (changeInfo.status !== 'loading' && (!changeInfo.url || !state.captureUrl || changeInfo.url === state.captureUrl)) return;
   markTargetNavigated(tabId, state);
 });
@@ -337,6 +338,8 @@ chrome.commands.onCommand.addListener(async (command) => {
     if (!await ensureBackendPermission()) throw new Error('Backend permission was not granted.');
     await abortDownstreamOperations(tab.id);
     await ensureContentScript(tab.id);
+    state.operationBackend = await snapshotBackendSettings();
+    invalidateBackendEndpointCache();
     state.operationPrompts = await snapshotCapturePrompts();
     state.selectionToken = createSelectionToken();
 
@@ -497,7 +500,7 @@ async function handleCaptureLoopFailure(tabId, error, logPrefix) {
       state.partialReason = 'error';
       state.partialError = error.message || 'Capture failed.';
       updateState(tabId, { error: state.partialError });
-      await finalizePostCapture(tabId, state.checkpointText, state.fragmentsCollected);
+      await runDedupLifecycle(tabId, state.checkpointText, state.fragmentsCollected);
       if (state.captureOperationId) await clearOperation('capture', tabId, state.captureOperationId).catch(() => {});
       return;
     } catch (finalizeError) {
@@ -554,7 +557,7 @@ async function handleRetry() {
   if (state.retryStage === 'dedup') {
     const pendingText = state.pendingText;
     updateState(tab.id, { active: true, status: 'Deduplicating', progress: 'Retrying dedup...', error: '' });
-    finalizePostCapture(tab.id, pendingText, state.fragmentsCollected || 0)
+    runDedupLifecycle(tab.id, pendingText, state.fragmentsCollected || 0)
       .catch((error) => handleRetryFailure(tab.id, error));
     return { ok: true };
   }
@@ -569,7 +572,7 @@ async function handleRetry() {
       ? normalizeBackendSettings(rs.backendSnapshot.host, rs.backendSnapshot.port)
       : await snapshotBackendSettings();
     updateState(tab.id, { active: true, status: 'Deduplicating', progress: 'Retrying dedup...', error: '' });
-    finalizePostCapture(
+    runDedupLifecycle(
       tab.id,
       rs.mergedText || mergeFragments(rs.fragments || []),
       rs.fragmentsCollected ?? (rs.fragments || []).length
@@ -1013,18 +1016,24 @@ async function handleFormatStop(tabId) {
 }
 
 async function autoFormatIfEnabled(tabId, text, host, port, source = 'translation') {
+  const state = getState(tabId);
+  const captureAutomation = source === 'ocr' || state.captureInFlight;
+  const canStart = () => !captureAutomation || canStartPostCaptureAutomation(state);
+  if (!canStart()) return;
   const [settings, prompt] = await Promise.all([
     chrome.storage.sync.get({ fmtAutoFormat: false, fmtSourceVal: 'translation' }),
     chrome.storage.local.get('formatPrompt')
   ]);
   if (!settings.fmtAutoFormat) return;
   if (settings.fmtSourceVal !== source) return;
+  if (!canStart()) return;
   // Fall back to sync storage if caller didn't provide host/port (e.g. auto-translate path)
   if (!host || port === undefined) {
     const backend = await chrome.storage.sync.get({ backendHost: 'localhost', backendPort: 8765 });
     host = backend.backendHost;
     port = backend.backendPort;
   }
+  if (!canStart()) return;
   return handleFormatStart({ tabId, text, prompt: prompt.formatPrompt, host, port });
 }
 
@@ -1091,6 +1100,44 @@ async function resumeCaptureLoop(rs) {
   });
 }
 
+async function runCaptureLifecycle(tabId, operationId, operation) {
+  const state = getState(tabId);
+  if (state.captureInFlight) throw new Error('Capture already in progress for this tab.');
+
+  state.captureInFlight = true;
+  const controller = new AbortController();
+  captureControllers.set(tabId, controller);
+  captureOperationIds.set(tabId, operationId);
+  startKeepAlive();
+
+  let completed = false;
+  try {
+    const result = await operation(controller, state);
+    completed = true;
+    return result;
+  } finally {
+    state.captureInFlight = false;
+    if (captureControllers.get(tabId) === controller) captureControllers.delete(tabId);
+    if (isCurrentOperation(captureOperationIds, tabId, operationId)) captureOperationIds.delete(tabId);
+    if (completed) await clearOperation('capture', tabId, operationId).catch(() => {});
+    maybeStopKeepAlive();
+    if (state.targetRemoved) await cleanupClosedTab(tabId).catch(() => {});
+  }
+}
+
+function runDedupLifecycle(tabId, mergedText, fragmentsOrCount) {
+  const state = getState(tabId);
+  const operationId = state.captureOperationId
+    || state.retryState?.operationId
+    || createOperationId('capture', tabId);
+  state.captureOperationId = operationId;
+  return runCaptureLifecycle(
+    tabId,
+    operationId,
+    () => finalizePostCapture(tabId, mergedText, fragmentsOrCount)
+  );
+}
+
 async function executeCaptureLoop({
   tabId,
   region,
@@ -1105,176 +1152,187 @@ async function executeCaptureLoop({
   operationId: recoveredOperationId,
   captureDocumentId: recoveredDocumentId = null
 }) {
-  const state = getState(tabId);
-
-  // Prevent concurrent captures on the same tab
-  if (state.captureInFlight) throw new Error('Capture already in progress for this tab.');
-  state.captureInFlight = true;
-
-  const controller = new AbortController();
   const operationId = recoveredOperationId || createOperationId('capture', tabId);
-  captureControllers.set(tabId, controller);
-  captureOperationIds.set(tabId, operationId);
-  startKeepAlive();
+  return runCaptureLifecycle(tabId, operationId, async (controller, state) => {
+    const accumulator = new IncrementalFragmentMerger(mergedText || '');
+    let fragmentCount = Number(fragmentsCollected) || 0;
+    let scrollLocked = false;
+    let fixedAutoscroll;
+    try {
+      backendSnapshot = backendSnapshot || state.operationBackend || await snapshotBackendSettings();
+      if (resetBeforeStart) {
+        resetState(tabId);
+        state.operationPrompts = normalizeCapturePrompts(promptSnapshot);
+        state.operationBackend = normalizeBackendSettings(backendSnapshot.host, backendSnapshot.port);
+        updateState(tabId, { active: true, status: 'Capturing', progress: 'Starting capture loop.' });
+      } else if (!state.operationPrompts) {
+        state.operationPrompts = normalizeCapturePrompts(promptSnapshot);
+      }
+      if (!state.operationBackend) {
+        state.operationBackend = normalizeBackendSettings(backendSnapshot.host, backendSnapshot.port);
+      }
 
-  const accumulator = new IncrementalFragmentMerger(mergedText || '');
-  let fragmentCount = Number(fragmentsCollected) || 0;
-  let scrollLocked = false;
-  let fixedAutoscroll;
-  let completed = false;
-  try {
-    backendSnapshot = backendSnapshot || state.operationBackend || await snapshotBackendSettings();
-    if (resetBeforeStart) {
-      resetState(tabId);
-      state.operationPrompts = normalizeCapturePrompts(promptSnapshot);
-      state.operationBackend = normalizeBackendSettings(backendSnapshot.host, backendSnapshot.port);
-      updateState(tabId, { active: true, status: 'Capturing', progress: 'Starting capture loop.' });
-    } else if (!state.operationPrompts) {
-      state.operationPrompts = normalizeCapturePrompts(promptSnapshot);
-    }
-    if (!state.operationBackend) {
-      state.operationBackend = normalizeBackendSettings(backendSnapshot.host, backendSnapshot.port);
-    }
+      const initialTab = await getLiveTargetTab(tabId);
+      state.captureUrl = captureUrl || initialTab?.url || state.captureUrl || null;
+      state.captureDocumentGeneration = tabDocumentGenerations.get(tabId) || 0;
+      const identity = await chrome.tabs.sendMessage(tabId, { type: 'page:get-document-id' }).catch(() => null);
+      if (recoveredDocumentId && identity?.documentId && recoveredDocumentId !== identity.documentId) {
+        state.navigationChanged = true;
+        state.partialReason = 'navigation';
+      }
+      state.captureDocumentId = recoveredDocumentId || identity?.documentId || null;
+      state.captureOperationId = operationId;
+      state.checkpointText = accumulator.text;
 
-    const initialTab = await getLiveTargetTab(tabId);
-    state.captureUrl = captureUrl || initialTab?.url || state.captureUrl || null;
-    state.captureDocumentGeneration = tabDocumentGenerations.get(tabId) || 0;
-    const identity = await chrome.tabs.sendMessage(tabId, { type: 'page:get-document-id' }).catch(() => null);
-    if (recoveredDocumentId && identity?.documentId && recoveredDocumentId !== identity.documentId) {
-      state.navigationChanged = true;
-      state.partialReason = 'navigation';
-    }
-    state.captureDocumentId = recoveredDocumentId || identity?.documentId || null;
-    state.captureOperationId = operationId;
-    state.checkpointText = accumulator.text;
+      let scrollY = lastScrollY;
+      let atBottom = false;
 
-    let scrollY = lastScrollY;
-    let atBottom = false;
-
-    const persistCheckpoint = async (stage = 'capture') => {
-      const input = {
-        region,
-        mergedText: accumulator.text,
-        fragmentsCollected: fragmentCount,
-        lastScrollY: scrollY,
-        captureUrl: state.captureUrl,
-        captureDocumentId: state.captureDocumentId,
-        promptSnapshot: state.operationPrompts,
-        ...(state.operationBackend ? { backendSnapshot: state.operationBackend } : {}),
-        stage
+      const persistCheckpoint = async (stage = 'capture') => {
+        const input = {
+          region,
+          mergedText: accumulator.text,
+          fragmentsCollected: fragmentCount,
+          lastScrollY: scrollY,
+          captureUrl: state.captureUrl,
+          captureDocumentId: state.captureDocumentId,
+          promptSnapshot: state.operationPrompts,
+          ...(state.operationBackend ? { backendSnapshot: state.operationBackend } : {}),
+          stage
+        };
+        await persistOperation('capture', tabId, operationId, input);
+        return input;
       };
-      await persistOperation('capture', tabId, operationId, input);
-      return input;
-    };
-    await persistCheckpoint();
+      await persistCheckpoint();
 
-    capturePages: while (true) {
-      if (state.stopRequested || state.targetRemoved || state.navigationChanged) break;
-      if (fixedAutoscroll === undefined || refreshAutoscroll) {
-        const settings = await chrome.storage.sync.get({ ocrAutoscroll: true });
-        fixedAutoscroll = settings.ocrAutoscroll;
-      }
-      const ocrAutoscroll = fixedAutoscroll;
-      const { captureIntervalMs } = await chrome.storage.sync.get({
-        captureIntervalMs: DEFAULT_CAPTURE_INTERVAL_MS
-      });
-      if (!ocrAutoscroll && fragmentCount > 0) {
-        updateState(tabId, { progress: 'Single capture complete (autoscroll off).' });
-        break;
-      }
-      const pageNumber = fragmentCount + 1;
-      updateState(tabId, {
-        currentPage: pageNumber,
-        fragmentsCollected: fragmentCount,
-        progress: `Capturing page ${pageNumber}...`
-      });
-
-      if (!scrollLocked) {
-        const lockResult = await sendMessageToActiveTarget(tabId, state, controller.signal, {
-          type: 'page:lock-scroll'
-        }, `Capturing page ${pageNumber}...`);
-        if (lockResult.status !== 'sent') break;
-        scrollLocked = true;
-      }
-
-      const frame = await captureTargetFrame(tabId, state, controller.signal, `Capturing page ${pageNumber}...`);
-      if (frame.status !== 'accepted') break;
-      const dataUrl = frame.dataUrl;
-      const croppedBlob = await cropVisibleCapture(dataUrl, region);
-
-      updateState(tabId, { progress: `Sending page ${pageNumber} to OCR...` });
-      const checkpoint = await persistCheckpoint('ocr');
-      state.retryState = {
-        stage: 'ocr',
-        tabId,
-        operationId,
-        ...checkpoint
-      };
-      await chrome.storage.local.set({ [`retryState:${tabId}`]: state.retryState });
-      for (let attempt = 1; ; attempt++) {
-        const target = await waitForTargetActive(
-          tabId,
-          state,
-          controller.signal,
-          attempt === 1
-            ? `Sending page ${pageNumber} to OCR...`
-            : `Retrying page ${pageNumber} (attempt ${attempt})...`
-        );
-        if (target.status !== 'active') {
-          await clearRetryState(tabId, state);
-          break capturePages;
+      capturePages: while (true) {
+        if (state.stopRequested || state.targetRemoved || state.navigationChanged) break;
+        if (fixedAutoscroll === undefined || refreshAutoscroll) {
+          const settings = await chrome.storage.sync.get({ ocrAutoscroll: true });
+          fixedAutoscroll = settings.ocrAutoscroll;
         }
-        try {
-          const text = await postImageForOcr(
-            croppedBlob,
-            pageNumber,
-            controller.signal,
-            state.operationPrompts?.ocr,
-            operationId,
-            state.operationBackend
-          );
-          accumulator.append(text);
-          fragmentCount += 1;
-          state.checkpointText = accumulator.text;
-          await clearRetryState(tabId, state);
-          await persistCheckpoint();
+        const ocrAutoscroll = fixedAutoscroll;
+        const { captureIntervalMs } = await chrome.storage.sync.get({
+          captureIntervalMs: DEFAULT_CAPTURE_INTERVAL_MS
+        });
+        if (!ocrAutoscroll && fragmentCount > 0) {
+          updateState(tabId, { progress: 'Single capture complete (autoscroll off).' });
           break;
-        } catch (e) {
-          if (e?.code === 'TEXT_LIMIT') {
-            state.partialReason = 'text_limit';
-            state.partialError = e.message;
-            await clearRetryState(tabId, state);
-            break capturePages;
-          }
-          if (state.stopRequested || state.targetRemoved || controller.signal.aborted) {
-            await clearRetryState(tabId, state);
-            break capturePages;
-          }
-          updateState(tabId, { progress: `Retrying page ${pageNumber} (attempt ${attempt + 1})...` });
-          await sleep(2000);
         }
-      }
+        const pageNumber = fragmentCount + 1;
+        updateState(tabId, {
+          currentPage: pageNumber,
+          fragmentsCollected: fragmentCount,
+          progress: `Capturing page ${pageNumber}...`
+        });
 
-      updateState(tabId, {
-        fragmentsCollected: fragmentCount,
-        progress: `Collected ${fragmentCount} fragment${fragmentCount === 1 ? '' : 's'}.`
-      });
+        if (!scrollLocked) {
+          const lockResult = await sendMessageToActiveTarget(tabId, state, controller.signal, {
+            type: 'page:lock-scroll'
+          }, `Capturing page ${pageNumber}...`);
+          if (lockResult.status !== 'sent') break;
+          scrollLocked = true;
+        }
 
-      await sleep(AFTER_SEND_DELAY_MS);
+        const frame = await captureTargetFrame(tabId, state, controller.signal, `Capturing page ${pageNumber}...`);
+        if (frame.status !== 'accepted') break;
+        const dataUrl = frame.dataUrl;
+        const croppedBlob = await cropVisibleCapture(dataUrl, region);
 
-      if (!ocrAutoscroll) break;
+        updateState(tabId, { progress: `Sending page ${pageNumber} to OCR...` });
+        const checkpoint = await persistCheckpoint('ocr');
+        state.retryState = {
+          stage: 'ocr',
+          tabId,
+          operationId,
+          ...checkpoint
+        };
+        await chrome.storage.local.set({ [`retryState:${tabId}`]: state.retryState });
+        for (let attempt = 1; ; attempt++) {
+          const target = await waitForTargetActive(
+            tabId,
+            state,
+            controller.signal,
+            attempt === 1
+              ? `Sending page ${pageNumber} to OCR...`
+              : `Retrying page ${pageNumber} (attempt ${attempt})...`
+          );
+          if (target.status !== 'active') {
+            await clearRetryState(tabId, state);
+            break capturePages;
+          }
+          try {
+            const text = await postImageForOcr(
+              croppedBlob,
+              pageNumber,
+              controller.signal,
+              state.operationPrompts?.ocr,
+              operationId,
+              state.operationBackend
+            );
+            accumulator.append(text);
+            fragmentCount += 1;
+            state.checkpointText = accumulator.text;
+            await clearRetryState(tabId, state);
+            await persistCheckpoint();
+            break;
+          } catch (e) {
+            if (e?.code === 'TEXT_LIMIT') {
+              state.partialReason = 'text_limit';
+              state.partialError = e.message;
+              await clearRetryState(tabId, state);
+              break capturePages;
+            }
+            if (state.stopRequested || state.targetRemoved || controller.signal.aborted) {
+              await clearRetryState(tabId, state);
+              break capturePages;
+            }
+            updateState(tabId, { progress: `Retrying page ${pageNumber} (attempt ${attempt + 1})...` });
+            await sleep(2000);
+          }
+        }
 
-      if (atBottom) {
-        await sleep(500);
-        const recheckResult = await sendMessageToActiveTarget(tabId, state, controller.signal, {
+        updateState(tabId, {
+          fragmentsCollected: fragmentCount,
+          progress: `Collected ${fragmentCount} fragment${fragmentCount === 1 ? '' : 's'}.`
+        });
+
+        await sleep(AFTER_SEND_DELAY_MS);
+
+        if (!ocrAutoscroll) break;
+
+        if (atBottom) {
+          await sleep(500);
+          const recheckResult = await sendMessageToActiveTarget(tabId, state, controller.signal, {
+            type: 'page:scroll-down',
+            overlapPx: OVERLAP_PX
+          }, `Rechecking page ${pageNumber}...`);
+          if (recheckResult.status !== 'sent') break;
+          const recheck = requireScrollResponse(recheckResult.response);
+          if (recheck?.changed) {
+            atBottom = false;
+            scrollY = recheck.scrollY;
+            if (fragmentCount >= MAX_CAPTURE_PAGES) {
+              state.partialReason = 'page_limit';
+              state.partialError = `Capture truncated at the ${MAX_CAPTURE_PAGES}-page limit.`;
+              updateState(tabId, { progress: state.partialError });
+              break;
+            }
+            await sleep(captureIntervalMs);
+            continue;
+          }
+          break;
+        }
+
+        const sentScroll = await sendMessageToActiveTarget(tabId, state, controller.signal, {
           type: 'page:scroll-down',
           overlapPx: OVERLAP_PX
-        }, `Rechecking page ${pageNumber}...`);
-        if (recheckResult.status !== 'sent') break;
-        const recheck = requireScrollResponse(recheckResult.response);
-        if (recheck?.changed) {
-          atBottom = false;
-          scrollY = recheck.scrollY;
+        }, `Scrolling after page ${pageNumber}...`);
+        if (sentScroll.status !== 'sent') break;
+        const scrollResult = requireScrollResponse(sentScroll.response);
+
+        if (scrollResult?.atBottom) {
+          if (!scrollResult.changed && fragmentCount > 0) break;
+          atBottom = true;
           if (fragmentCount >= MAX_CAPTURE_PAGES) {
             state.partialReason = 'page_limit';
             state.partialError = `Capture truncated at the ${MAX_CAPTURE_PAGES}-page limit.`;
@@ -1284,19 +1342,7 @@ async function executeCaptureLoop({
           await sleep(captureIntervalMs);
           continue;
         }
-        break;
-      }
-
-      const sentScroll = await sendMessageToActiveTarget(tabId, state, controller.signal, {
-        type: 'page:scroll-down',
-        overlapPx: OVERLAP_PX
-      }, `Scrolling after page ${pageNumber}...`);
-      if (sentScroll.status !== 'sent') break;
-      const scrollResult = requireScrollResponse(sentScroll.response);
-
-      if (scrollResult?.atBottom) {
-        if (!scrollResult.changed && fragmentCount > 0) break;
-        atBottom = true;
+        scrollY = scrollResult.scrollY;
         if (fragmentCount >= MAX_CAPTURE_PAGES) {
           state.partialReason = 'page_limit';
           state.partialError = `Capture truncated at the ${MAX_CAPTURE_PAGES}-page limit.`;
@@ -1304,42 +1350,26 @@ async function executeCaptureLoop({
           break;
         }
         await sleep(captureIntervalMs);
-        continue;
       }
-      scrollY = scrollResult.scrollY;
-      if (fragmentCount >= MAX_CAPTURE_PAGES) {
-        state.partialReason = 'page_limit';
-        state.partialError = `Capture truncated at the ${MAX_CAPTURE_PAGES}-page limit.`;
-        updateState(tabId, { progress: state.partialError });
-        break;
-      }
-      await sleep(captureIntervalMs);
-    }
 
-    state.collectionComplete = true;
-    const finalMergedText = accumulator.text;
-    if (state.navigationChanged) state.partialReason = 'navigation';
-    else if (state.stopRequested) state.partialReason = 'stopped';
-    else if (state.targetRemoved) state.partialReason = 'tab_closed';
-    if (state.partialReason) {
-      // An interrupted capture preserves every fragment collected so far but
-      // must not present or automate the result as a complete capture.
-      await finalizeCapture(tabId, finalMergedText, fragmentCount);
-    } else {
-      updateState(tabId, { progress: 'Deduplicating merged text...' });
-      await finalizePostCapture(tabId, finalMergedText, fragmentCount);
+      state.collectionComplete = true;
+      const finalMergedText = accumulator.text;
+      if (state.navigationChanged) state.partialReason = 'navigation';
+      else if (state.stopRequested) state.partialReason = 'stopped';
+      else if (state.targetRemoved) state.partialReason = 'tab_closed';
+      if (state.partialReason) {
+        // An interrupted capture preserves every fragment collected so far but
+        // must not present or automate the result as a complete capture.
+        await finalizeCapture(tabId, finalMergedText, fragmentCount);
+      } else {
+        updateState(tabId, { progress: 'Deduplicating merged text...' });
+        await finalizePostCapture(tabId, finalMergedText, fragmentCount);
+      }
+    } finally {
+      // Unlock page scroll
+      if (scrollLocked) chrome.tabs.sendMessage(tabId, { type: 'page:unlock-scroll' }).catch(() => {});
     }
-    completed = true;
-  } finally {
-    state.captureInFlight = false;
-    if (captureControllers.get(tabId) === controller) captureControllers.delete(tabId);
-    if (isCurrentOperation(captureOperationIds, tabId, operationId)) captureOperationIds.delete(tabId);
-    if (completed) await clearOperation('capture', tabId, operationId).catch(() => {});
-    maybeStopKeepAlive();
-    // Unlock page scroll
-    if (scrollLocked) chrome.tabs.sendMessage(tabId, { type: 'page:unlock-scroll' }).catch(() => {});
-    if (state.targetRemoved) await cleanupClosedTab(tabId).catch(() => {});
-  }
+  });
 }
 
 async function getLiveTargetTab(tabId) {
@@ -1356,6 +1386,7 @@ function markTargetNavigated(tabId, state = getState(tabId)) {
   state.navigationChanged = true;
   state.partialReason = 'navigation';
   captureControllers.get(tabId)?.abort();
+  abortDownstreamOperations(tabId).catch(() => {});
   updateState(tabId, {
     progress: 'Capture stopped because the page navigated. Preserving collected fragments.'
   });
@@ -1511,6 +1542,21 @@ function fragmentCountOf(fragmentsOrCount) {
   return Array.isArray(fragmentsOrCount) ? fragmentsOrCount.length : Math.max(0, Number(fragmentsOrCount) || 0);
 }
 
+function captureCancellationRequested(state, signal) {
+  return Boolean(
+    state.stopRequested
+    || state.targetRemoved
+    || state.navigationChanged
+    || signal?.aborted
+  );
+}
+
+function applyCaptureCancellationReason(state, signal) {
+  if (state.navigationChanged) state.partialReason = 'navigation';
+  else if (state.targetRemoved) state.partialReason = 'tab_closed';
+  else if (state.stopRequested || signal?.aborted) state.partialReason = 'stopped';
+}
+
 async function finalizePostCapture(tabId, mergedText, fragmentsOrCount) {
   const state = getState(tabId);
   const fragmentCount = fragmentCountOf(fragmentsOrCount);
@@ -1540,7 +1586,8 @@ async function finalizePostCapture(tabId, mergedText, fragmentsOrCount) {
   }
   let finalText;
   for (let attempt = 1; ; attempt++) {
-    if (state.stopRequested) {
+    if (captureCancellationRequested(state, signal)) {
+      applyCaptureCancellationReason(state, signal);
       await clearRetryState(tabId, state);
       finalText = null;
       break;
@@ -1556,7 +1603,8 @@ async function finalizePostCapture(tabId, mergedText, fragmentsOrCount) {
       await clearRetryState(tabId, state);
       break;
     } catch (e) {
-      if (state.stopRequested) {
+      if (captureCancellationRequested(state, signal)) {
+        applyCaptureCancellationReason(state, signal);
         await clearRetryState(tabId, state);
         finalText = null;
         break;
@@ -1573,6 +1621,10 @@ async function finalizePostCapture(tabId, mergedText, fragmentsOrCount) {
   }
 
   await finalizeCapture(tabId, finalText, fragmentCount);
+}
+
+function canStartPostCaptureAutomation(state) {
+  return !state.targetRemoved && !state.stopRequested && !state.partialReason;
 }
 
 async function finalizeCapture(tabId, finalText, fragmentsOrCount) {
@@ -1657,16 +1709,18 @@ async function finalizeCapture(tabId, finalText, fragmentsOrCount) {
   }
 
   // Run post-capture automation only for a normally completed capture.
-  if (!isPartial) {
+  if (canStartPostCaptureAutomation(state)) {
     await autoFormatIfEnabled(tabId, finalText, undefined, undefined, 'ocr');
-    try {
-      await autoTranslateIfEnabled(tabId, finalText);
-    } catch (error) {
-      const message = error?.message || 'Auto-translation failed.';
-      await chrome.storage.local.set({ [`tl2Status:${tabId}`]: message }).catch((storageError) => {
-        console.error('Failed to persist auto-translation error:', storageError);
-      });
-      console.error('Auto-translation failed after capture completed:', error);
+    if (canStartPostCaptureAutomation(state)) {
+      try {
+        await autoTranslateIfEnabled(tabId, finalText);
+      } catch (error) {
+        const message = error?.message || 'Auto-translation failed.';
+        await chrome.storage.local.set({ [`tl2Status:${tabId}`]: message }).catch((storageError) => {
+          console.error('Failed to persist auto-translation error:', storageError);
+        });
+        console.error('Auto-translation failed after capture completed:', error);
+      }
     }
   }
 
@@ -1674,15 +1728,18 @@ async function finalizeCapture(tabId, finalText, fragmentsOrCount) {
 }
 
 async function autoTranslateIfEnabled(tabId, originalText) {
+  const state = getState(tabId);
+  if (!canStartPostCaptureAutomation(state)) return;
   const { ocrAutoTranslate } = await chrome.storage.sync.get({
     ocrAutoTranslate: false
   });
   if (!ocrAutoTranslate) return;
 
   const tl2Lang = await chrome.storage.local.get('tl2Language');
+  if (!canStartPostCaptureAutomation(state)) return;
   const language = tl2Lang.tl2Language || 'original';
-  const state = getState(tabId);
   const backend = state.operationBackend || await snapshotBackendSettings();
+  if (!canStartPostCaptureAutomation(state)) return;
   const result = await handleTranslateStart({
     tabId,
     text: originalText,
@@ -2234,23 +2291,12 @@ async function recoverPersistedOperations() {
         captureDocumentId: input.captureDocumentId || null
       });
       if (input.stage === 'dedup') {
-        const controller = new AbortController();
-        captureControllers.set(operation.tabId, controller);
-        captureOperationIds.set(operation.tabId, operation.operationId);
-        startKeepAlive();
-        finalizePostCapture(
+        runDedupLifecycle(
           operation.tabId,
           input.mergedText || '',
           input.fragmentsCollected || 0
         ).then(() => clearOperation('capture', operation.tabId, operation.operationId))
           .catch((error) => console.error('Dedup recovery failed:', error))
-          .finally(() => {
-            if (captureControllers.get(operation.tabId) === controller) captureControllers.delete(operation.tabId);
-            if (isCurrentOperation(captureOperationIds, operation.tabId, operation.operationId)) {
-              captureOperationIds.delete(operation.tabId);
-            }
-            maybeStopKeepAlive();
-          });
       } else {
         resumeCaptureLoop({ ...input, tabId: operation.tabId, operationId: operation.operationId })
           .catch((error) => handleCaptureLoopFailure(operation.tabId, error, 'Capture recovery failed:'));

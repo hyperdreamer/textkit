@@ -140,6 +140,12 @@ def _validate_api_base_value(value: str) -> str:
         raise ValueError("api_base must be a valid absolute HTTP(S) URL") from exc
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("api_base must be a valid absolute HTTP(S) URL")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("api_base must include a valid port between 1 and 65535") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("api_base must include a valid port between 1 and 65535")
     if (
         "?" in normalized
         or "#" in normalized

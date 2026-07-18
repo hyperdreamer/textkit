@@ -1094,6 +1094,21 @@ test('keyboard capture requests backend permission before starting selection', a
   );
 });
 
+test('keyboard capture snapshots current backend settings when selection starts', async () => {
+  const harness = createBackgroundHarness({
+    syncValues: { backendHost: '127.0.0.1', backendPort: 9876 }
+  });
+  harness.context.getState(1).operationBackend = { host: 'localhost', port: 8765 };
+
+  harness.events.command.emit('start-region-capture');
+  await waitFor(() => harness.context.getState(1).status === 'Selecting', 'selection did not start');
+
+  assert.deepEqual(
+    { ...harness.context.getState(1).operationBackend },
+    { host: '127.0.0.1', port: 9876 }
+  );
+});
+
 test('Stop cancels an in-progress selection', async () => {
   const harness = createBackgroundHarness();
   harness.context.updateState(1, { active: true, status: 'Selecting' });
@@ -1192,6 +1207,65 @@ test('capture checkpoints are cleared before downstream automation', async () =>
     JSON.parse(JSON.stringify(harness.context.__checkpointStateDuringAutomation)),
     { retry: false, operation: false }
   );
+});
+
+test('tab closure during dedup is terminal and cleans up the shared capture lifecycle', async () => {
+  let dedupCalls = 0;
+  const harness = createBackgroundHarness({ useRealPipeline: true });
+  harness.context.__testDedup = (_text, signal) => {
+    dedupCalls += 1;
+    return new Promise((_resolve, reject) => {
+      signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+    });
+  };
+  vm.runInContext('postTextForDedup = (...args) => __testDedup(...args);', harness.context);
+
+  const operation = harness.context.runDedupLifecycle(1, 'raw text', 1);
+  await waitFor(() => dedupCalls === 1, 'dedup request did not start');
+  assert.equal(harness.context.getState(1).captureInFlight, true);
+
+  harness.removeTab(1);
+  await operation;
+
+  assert.equal(dedupCalls, 1);
+  assert.equal(vm.runInContext('states.has(1)', harness.context), false);
+  assert.equal(Object.keys(harness.localData).some((key) => key.endsWith(':1')), false);
+});
+
+test('tab closure during auto-format prevents auto-translation from starting', async () => {
+  const format = deferred();
+  const harness = createBackgroundHarness();
+  harness.context.__format = format.promise;
+  harness.context.__translateCalls = 0;
+  vm.runInContext(`
+    autoFormatIfEnabled = () => __format;
+    autoTranslateIfEnabled = async () => { __translateCalls += 1; };
+  `, harness.context);
+
+  const operation = harness.context.runCaptureLifecycle(
+    1,
+    'capture:1:automation-close',
+    () => harness.originalFinalizeCapture(1, 'final text', 1)
+  );
+  await delay();
+  harness.removeTab(1);
+  format.resolve();
+  await operation;
+
+  assert.equal(harness.context.__translateCalls, 0);
+  assert.equal(vm.runInContext('states.has(1)', harness.context), false);
+});
+
+test('backend ports must be complete decimal strings', () => {
+  const harness = createBackgroundHarness();
+
+  assert.equal(harness.context.normalizeBackendSettings('localhost', ' 8765 ').port, 8765);
+  for (const malformed of ['8765junk', '1e3', '8765.9', '', '  ']) {
+    assert.throws(
+      () => harness.context.normalizeBackendSettings('localhost', malformed),
+      /Backend port must be between 1 and 65535/
+    );
+  }
 });
 
 test('terminal capture failure clears its persisted operation checkpoint', async () => {

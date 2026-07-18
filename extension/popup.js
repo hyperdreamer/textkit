@@ -1437,7 +1437,8 @@ function normalizeBackendSettings(host, port) {
     throw new Error('Backend host must be localhost, 127.0.0.1, or ::1.');
   }
 
-  const normalizedPort = Number.parseInt(port, 10);
+  const portText = String(port ?? '').trim();
+  const normalizedPort = /^\d+$/.test(portText) ? Number(portText) : NaN;
   if (!Number.isInteger(normalizedPort) || normalizedPort < 1 || normalizedPort > 65535) {
     throw new Error('Backend port must be between 1 and 65535.');
   }

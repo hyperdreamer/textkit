@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 from io import BytesIO
@@ -273,11 +274,10 @@ def test_animated_images_are_rejected_for_ocr() -> None:
     assert exc_info.value.detail == "Animated images are not supported for OCR"
 
 
-@pytest.mark.asyncio
-async def test_zero_upload_limit_reads_entire_upload() -> None:
+def test_zero_upload_limit_reads_entire_upload() -> None:
     upload = main.UploadFile(file=BytesIO(b"complete upload"), filename="test.txt")
 
-    assert await main._read_limited_upload(upload, 0) == b"complete upload"
+    assert asyncio.run(main._read_limited_upload(upload, 0)) == b"complete upload"
 
 
 def test_non_loopback_provider_requires_https() -> None:
@@ -286,6 +286,15 @@ def test_non_loopback_provider_requires_https() -> None:
 
     config = main.AIConfig(api_base="http://127.0.0.1:8000", api_key="key", model="model")
     assert config.api_base == "http://127.0.0.1:8000"
+
+
+@pytest.mark.parametrize(
+    "api_base",
+    ["https://example.com:bad", "https://example.com:0", "https://example.com:70000"],
+)
+def test_provider_rejects_invalid_ports(api_base: str) -> None:
+    with pytest.raises(main.ValidationError, match="valid port between 1 and 65535"):
+        main.AIConfig(api_base=api_base, api_key="key", model="model")
 
 
 def test_provider_response_requires_choices() -> None:
@@ -393,14 +402,13 @@ def test_config_schema_accepts_zero_for_all_limits() -> None:
     assert all(getattr(config, name) == 0 for name in values)
 
 
-@pytest.mark.asyncio
-async def test_zero_rate_limits_disable_limiter_state() -> None:
+def test_zero_rate_limits_disable_limiter_state() -> None:
     config = _app_config().model_copy(
         update={"requests_per_minute": 0, "max_concurrent_requests": 0}
     )
     request = main.Request({"type": "http", "client": ("127.0.0.1", 1234)})
 
-    assert await main._acquire_request_slot(request, config) is None
+    assert asyncio.run(main._acquire_request_slot(request, config)) is None
     assert not main._rate_events
     assert main._active_requests == 0
 
@@ -433,8 +441,7 @@ def test_credentials_are_resolved_lazily_per_operation(
         main._resolve_ai_api_key(main._resolve_ai_config(config, config.text))
 
 
-@pytest.mark.asyncio
-async def test_operation_id_is_forwarded_as_provider_idempotency_key() -> None:
+def test_operation_id_is_forwarded_as_provider_idempotency_key() -> None:
     seen_headers: httpx.Headers | None = None
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -449,18 +456,21 @@ async def test_operation_id_is_forwarded_as_provider_idempotency_key() -> None:
             },
         )
 
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    previous = main._http_client
-    token = main._operation_id.set("translate:1:stable-id")
-    main._http_client = client
-    try:
-        result = await main._post_openai_chat_completion(
-            _ai_config(), [{"role": "user", "content": "hello"}]
-        )
-    finally:
-        main._operation_id.reset(token)
-        main._http_client = previous
-        await client.aclose()
+    async def run_request() -> main.OCRResponse:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        previous = main._http_client
+        token = main._operation_id.set("translate:1:stable-id")
+        main._http_client = client
+        try:
+            return await main._post_openai_chat_completion(
+                _ai_config(), [{"role": "user", "content": "hello"}]
+            )
+        finally:
+            main._operation_id.reset(token)
+            main._http_client = previous
+            await client.aclose()
+
+    result = asyncio.run(run_request())
 
     assert result.text == "done"
     assert seen_headers is not None
