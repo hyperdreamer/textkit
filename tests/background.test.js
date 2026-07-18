@@ -1481,12 +1481,12 @@ test('persisted translation resumes after a service worker restart', async () =>
   assert.equal(Object.hasOwn(harness.localData, 'operation:translate:1'), false);
 });
 
-test('file bridge saves require safe paths and explicit success', async () => {
+test('file bridge saves require safe paths and explicit ok', async () => {
   let fetchCalls = 0;
   const harness = createBackgroundHarness({
     fetch: async (_url, options) => {
       fetchCalls += 1;
-      return { ok: true, text: async () => JSON.stringify({ success: true, path: '/ignored' }) };
+      return { ok: true, text: async () => JSON.stringify({ ok: true, path: '/ignored' }) };
     }
   });
 
@@ -1513,7 +1513,7 @@ test('save paths reject Windows drive-relative, UNC, device, and colon forms', (
   assert.equal(harness.context.normalizeSavePath('notes/safe.txt'), 'notes/safe.txt');
 });
 
-test('file bridge empty or implicit-success responses are rejected', async () => {
+test('file bridge empty or implicit-ok responses are rejected', async () => {
   let responseBody = '';
   const harness = createBackgroundHarness({
     fetch: async () => ({ ok: true, text: async () => responseBody })
@@ -1600,7 +1600,7 @@ test('auto-save logs a user-visible failure when file bridge permission was revo
     permissionContains: async () => false,
     fetch: async () => {
       fetchCalls += 1;
-      return { ok: true, text: async () => JSON.stringify({ success: true }) };
+      return { ok: true, text: async () => JSON.stringify({ ok: true }) };
     }
   });
 

@@ -874,7 +874,7 @@ async function handleSaveTranslation(msg) {
   } catch (error) {
     return { ok: false, error: error.message };
   }
-  if (!response.ok || payload.success !== true) {
+  if (!response.ok || payload.ok !== true) {
     return { ok: false, error: payload.error || payload.detail || `HTTP ${response.status}` };
   }
   return { ok: true, path: normalizedPath };
