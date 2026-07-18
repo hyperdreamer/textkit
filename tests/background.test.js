@@ -1904,3 +1904,77 @@ test('fake backend workflow covers selection, capture, dedup, automation, Stop, 
   );
   assert.equal(recoveryHarness.context.getState(1).status, 'Partial');
 });
+test('explicit stopTranslateOperation emits tl2:translating false', async () => {
+  const harness = createBackgroundHarness({
+    fetch: (_url, options) => new Promise((_resolve, reject) => {
+      const abort = () => reject(new DOMException('Aborted', 'AbortError'));
+      if (options.signal.aborted) abort();
+      else options.signal.addEventListener('abort', abort, { once: true });
+    })
+  });
+
+  const operation = harness.context.handleTranslateStart({
+    tabId: 1,
+    text: 'source',
+    language: 'French'
+  });
+
+  await waitFor(
+    () => vm.runInContext('translateControllers.has(1)', harness.context),
+    'translate controller was not registered'
+  );
+
+  const pre = harness.runtimeMessages.filter(
+    (m) => m.type === 'tl2:translating' && m.tabId === 1 && m.value === false
+  ).length;
+
+  await harness.context.handleTranslateStop(1);
+
+  const result = await operation;
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'Translation superseded.');
+  assert.equal(vm.runInContext('translateControllers.has(1)', harness.context), false);
+  assert.equal(vm.runInContext('translateOperationIds.has(1)', harness.context), false);
+
+  const count = harness.runtimeMessages.filter(
+    (m) => m.type === 'tl2:translating' && m.tabId === 1 && m.value === false
+  ).length;
+  assert.equal(count - pre, 1);
+});
+
+test('explicit stopFormatOperation emits fmt:formatting false', async () => {
+  const harness = createBackgroundHarness({
+    fetch: (_url, options) => new Promise((_resolve, reject) => {
+      const abort = () => reject(new DOMException('Aborted', 'AbortError'));
+      if (options.signal.aborted) abort();
+      else options.signal.addEventListener('abort', abort, { once: true });
+    })
+  });
+
+  const operation = harness.context.handleFormatStart({
+    tabId: 1,
+    text: 'source'
+  });
+
+  await waitFor(
+    () => vm.runInContext('formatControllers.has(1)', harness.context),
+    'format controller was not registered'
+  );
+
+  const pre = harness.runtimeMessages.filter(
+    (m) => m.type === 'fmt:formatting' && m.tabId === 1 && m.value === false
+  ).length;
+
+  await harness.context.handleFormatStop(1);
+
+  const result = await operation;
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'Formatting superseded.');
+  assert.equal(vm.runInContext('formatControllers.has(1)', harness.context), false);
+  assert.equal(vm.runInContext('formatOperationIds.has(1)', harness.context), false);
+
+  const count = harness.runtimeMessages.filter(
+    (m) => m.type === 'fmt:formatting' && m.tabId === 1 && m.value === false
+  ).length;
+  assert.equal(count - pre, 1);
+});

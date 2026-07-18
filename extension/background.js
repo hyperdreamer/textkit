@@ -845,6 +845,7 @@ async function stopTranslateOperation(tabId) {
     chrome.storage.local.remove(`tl2Translating:${tabId}`),
     operationId ? clearOperation('translate', tabId, operationId) : Promise.resolve()
   ]);
+  chrome.runtime.sendMessage({ type: 'tl2:translating', tabId, value: false }).catch(() => {});
 }
 
 async function handleTranslateStop(tabId) {
@@ -1008,6 +1009,7 @@ async function stopFormatOperation(tabId) {
     chrome.storage.local.remove(`fmtFormatting:${tabId}`),
     operationId ? clearOperation('format', tabId, operationId) : Promise.resolve()
   ]);
+  chrome.runtime.sendMessage({ type: 'fmt:formatting', tabId, value: false }).catch(() => {});
 }
 
 async function handleFormatStop(tabId) {
