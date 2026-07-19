@@ -241,7 +241,7 @@ function createBackgroundHarness(options = {}) {
       ? fetch(url, ...args)
       : (options.fetch || fetch)(url, ...args),
     setInterval: () => 1,
-    setTimeout
+    setTimeout: options.setTimeout || setTimeout
   };
   context.globalThis = context;
   vm.createContext(context);
@@ -1977,4 +1977,94 @@ test('explicit stopFormatOperation emits fmt:formatting false', async () => {
     (m) => m.type === 'fmt:formatting' && m.tabId === 1 && m.value === false
   ).length;
   assert.equal(count - pre, 1);
+});
+
+test('translation has no fixed timeout — Stop still aborts via AbortController', async () => {
+  const scheduledTimeouts = [];
+  const harness = createBackgroundHarness({
+    setTimeout: (callback, delay, ...args) => {
+      scheduledTimeouts.push(delay);
+      return setTimeout(callback, delay, ...args);
+    },
+    fetch: (_url, options) => new Promise((_resolve, reject) => {
+      const abort = () => reject(new DOMException('Aborted', 'AbortError'));
+      if (options.signal.aborted) abort();
+      else options.signal.addEventListener('abort', abort, { once: true });
+    })
+  });
+
+  const operation = harness.context.handleTranslateStart({
+    tabId: 1,
+    text: 'source',
+    language: 'French'
+  });
+
+  await waitFor(
+    () => vm.runInContext('translateControllers.has(1)', harness.context),
+    'translate controller was not registered'
+  );
+
+  assert.equal(
+    scheduledTimeouts.includes(12 * 60 * 1000),
+    false,
+    'translation must not schedule the fixed backend timeout'
+  );
+  assert.equal(
+    vm.runInContext('translateControllers.has(1)', harness.context),
+    true,
+    'translate controller should still be registered (no fixed timeout fired)'
+  );
+
+  // Stop via user path — must still work.
+  await harness.context.handleTranslateStop(1);
+
+  const result = await operation;
+  // After stop, the operation returns superseded since the controller/operationId are cleared.
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'Translation superseded.');
+  assert.equal(vm.runInContext('translateControllers.has(1)', harness.context), false);
+});
+
+test('format has no fixed timeout — Stop still aborts via AbortController', async () => {
+  const scheduledTimeouts = [];
+  const harness = createBackgroundHarness({
+    setTimeout: (callback, delay, ...args) => {
+      scheduledTimeouts.push(delay);
+      return setTimeout(callback, delay, ...args);
+    },
+    fetch: (_url, options) => new Promise((_resolve, reject) => {
+      const abort = () => reject(new DOMException('Aborted', 'AbortError'));
+      if (options.signal.aborted) abort();
+      else options.signal.addEventListener('abort', abort, { once: true });
+    })
+  });
+
+  const operation = harness.context.handleFormatStart({
+    tabId: 1,
+    text: 'source'
+  });
+
+  await waitFor(
+    () => vm.runInContext('formatControllers.has(1)', harness.context),
+    'format controller was not registered'
+  );
+
+  assert.equal(
+    scheduledTimeouts.includes(12 * 60 * 1000),
+    false,
+    'format must not schedule the fixed backend timeout'
+  );
+  assert.equal(
+    vm.runInContext('formatControllers.has(1)', harness.context),
+    true,
+    'format controller should still be registered (no fixed timeout fired)'
+  );
+
+  // Stop via user path — must still work.
+  await harness.context.handleFormatStop(1);
+
+  const result = await operation;
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'Formatting superseded.');
+  assert.equal(vm.runInContext('formatControllers.has(1)', harness.context), false);
 });

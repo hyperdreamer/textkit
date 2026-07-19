@@ -707,8 +707,6 @@ async function handleTranslateStart(msg) {
   }
 
   const controller = new AbortController();
-  let timedOut = false;
-  let timeoutId = null;
 
   try {
     await serializeOperationMutation('translate', tabId, async () => {
@@ -716,10 +714,6 @@ async function handleTranslateStart(msg) {
       translateControllers.set(tabId, controller);
       translateOperationIds.set(tabId, operationId);
       startKeepAlive();
-      timeoutId = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-      }, BACKEND_TIMEOUT_MS);
 
       // Replace the previous checkpoint and visible state as one per-tab
       // mutation, so old cleanup cannot remove the new operation.
@@ -795,16 +789,15 @@ async function handleTranslateStart(msg) {
         return { ok: false, error: 'Translation superseded.' };
       }
       if (e.name === 'AbortError') {
-        const message = timedOut ? 'Translation timed out.' : 'Translation stopped.';
+        const message = 'Translation stopped.';
         const committed = await commitCurrentOperation(
           'translate', translateOperationIds, tabId, operationId, async () => {
             await clearOperation('translate', tabId, operationId).catch(() => {});
             await chrome.storage.local.set({ [`tl2Status:${tabId}`]: message });
-            if (timedOut) chrome.runtime.sendMessage({ type: 'translation:update', tabId, text: '', error: message }).catch(() => {});
           }
         );
         if (!committed) return { ok: false, error: 'Translation superseded.' };
-        return { ok: !timedOut, error: timedOut ? message : undefined };
+        return { ok: true };
       }
       const errorMessage = e.message || 'Translation failed.';
       const committed = await commitCurrentOperation(
@@ -818,7 +811,6 @@ async function handleTranslateStart(msg) {
       return { ok: false, error: errorMessage };
     }
   } finally {
-    clearTimeout(timeoutId);
     await serializeOperationMutation('translate', tabId, async () => {
       if (translateControllers.get(tabId) !== controller
           || !isCurrentOperation(translateOperationIds, tabId, operationId)) return;
@@ -899,8 +891,6 @@ async function handleFormatStart(msg) {
   }
 
   const controller = new AbortController();
-  let timedOut = false;
-  let timeoutId = null;
 
   try {
     await serializeOperationMutation('format', tabId, async () => {
@@ -908,10 +898,6 @@ async function handleFormatStart(msg) {
       formatControllers.set(tabId, controller);
       formatOperationIds.set(tabId, operationId);
       startKeepAlive();
-      timeoutId = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-      }, BACKEND_TIMEOUT_MS);
 
       await persistOperation('format', tabId, operationId, {
         text, host: host || DEFAULT_HOST, port: port || DEFAULT_PORT, prompt
@@ -959,16 +945,15 @@ async function handleFormatStart(msg) {
         return { ok: false, error: 'Formatting superseded.' };
       }
       if (e.name === 'AbortError') {
-        const message = timedOut ? 'Formatting timed out.' : 'Formatting stopped.';
+        const message = 'Formatting stopped.';
         const committed = await commitCurrentOperation(
           'format', formatOperationIds, tabId, operationId, async () => {
             await clearOperation('format', tabId, operationId).catch(() => {});
             await chrome.storage.local.set({ [`fmtStatus:${tabId}`]: message });
-            if (timedOut) chrome.runtime.sendMessage({ type: 'format:update', tabId, text: '', error: message }).catch(() => {});
           }
         );
         if (!committed) return { ok: false, error: 'Formatting superseded.' };
-        return { ok: !timedOut, error: timedOut ? message : undefined };
+        return { ok: true };
       }
       const errorMessage = e.message || 'Formatting failed.';
       const committed = await commitCurrentOperation(
@@ -982,7 +967,6 @@ async function handleFormatStart(msg) {
       return { ok: false, error: errorMessage };
     }
   } finally {
-    clearTimeout(timeoutId);
     await serializeOperationMutation('format', tabId, async () => {
       if (formatControllers.get(tabId) !== controller
           || !isCurrentOperation(formatOperationIds, tabId, operationId)) return;
