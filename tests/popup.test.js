@@ -345,7 +345,6 @@ test('capture start persists and sends one normalized backend snapshot', async (
   harness.elements.get('backend-host').value = 'HTTP://LOCALHOST';
   harness.elements.get('backend-port').value = '9876';
   harness.elements.get('ocr-autoscroll').checked = true;
-  harness.elements.get('ocr-capture-interval').value = '250';
 
   await harness.context.startCapture();
 
@@ -353,7 +352,7 @@ test('capture start persists and sends one normalized backend snapshot', async (
   assert.deepEqual({ ...start.backend }, { host: 'localhost', port: 9876 });
   assert.equal(harness.syncData.backendHost, 'localhost');
   assert.equal(harness.syncData.backendPort, 9876);
-  assert.equal(harness.syncData.captureIntervalMs, 250);
+  assert.equal(harness.syncData.ocrAutoscroll, true);
 });
 
 test('popup restores persisted OCR status before rendering Idle state', async () => {

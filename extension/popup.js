@@ -17,7 +17,6 @@ const fileBridgePortInput = document.getElementById('file-bridge-port');
 const settingsGear = document.getElementById('settings-gear');
 const settingsPanel = document.getElementById('backend-settings-panel');
 const autoscrollCheckbox = document.getElementById('ocr-autoscroll');
-const captureIntervalInput = document.getElementById('ocr-capture-interval');
 const lastRegionEl = document.getElementById('last-region');
 
 // ── Translate panel elements ──────────────────────────────────
@@ -308,7 +307,6 @@ settingsGear.addEventListener('click', () => {
   settingsGear.classList.toggle('active', !isOpen);
 });
 autoscrollCheckbox.addEventListener('change', saveSettings);
-captureIntervalInput.addEventListener('change', saveSettings);
 
 // ── Translate panel listeners ─────────────────────────────────
 tlLanguage.addEventListener('change', () => { onTlLanguageChange(); syncLanguage('prompt'); });
@@ -443,7 +441,6 @@ async function init() {
     backendHost: 'localhost', backendPort: 8765,
     fileBridgeHost: '', fileBridgePort: FILE_BRIDGE_DEFAULT_PORT,
     ocrAutoscroll: true,
-    captureIntervalMs: 100,
     ocrHost: null, ocrPort: null
   });
   // Migrate old storage keys
@@ -461,7 +458,6 @@ async function init() {
   tlLanguage.value = tlLanguage.value || 'original';
   tl2Language.value = tl2Language.value || 'original';
   autoscrollCheckbox.checked = items.ocrAutoscroll;
-  captureIntervalInput.value = items.captureIntervalMs;
 
   const resultKey = currentTabId ? `lastResult:${currentTabId}` : null;
   const statusKey = currentTabId ? `lastStatus:${currentTabId}` : null;
@@ -668,9 +664,6 @@ async function saveSettings() {
     progressEl.textContent = e.message;
     return;
   }
-  const intervalVal = parseInt(captureIntervalInput.value, 10);
-  const captureIntervalMs = (Number.isFinite(intervalVal) && intervalVal >= 50 && intervalVal <= 2000)
-    ? intervalVal : 100;
   if (!await ensureHostPermission(backend.host)) {
     progressEl.textContent = 'Permission to contact the backend was not granted.';
     return;
@@ -678,8 +671,7 @@ async function saveSettings() {
   await chrome.storage.sync.set({
     backendHost: backend.host,
     backendPort: backend.port,
-    ocrAutoscroll: autoscrollCheckbox.checked,
-    captureIntervalMs
+    ocrAutoscroll: autoscrollCheckbox.checked
   });
   hostInput.value = backend.host;
   portInput.value = backend.port;
@@ -797,14 +789,10 @@ async function startCapture() {
   try {
     backend = normalizeBackendSettings(hostInput.value, portInput.value);
     if (!await ensureHostPermission(backend.host)) throw new Error('Backend permission was not granted.');
-    const intervalVal = parseInt(captureIntervalInput.value, 10);
-    const captureIntervalMs = (Number.isFinite(intervalVal) && intervalVal >= 50 && intervalVal <= 2000)
-      ? intervalVal : 100;
     await chrome.storage.sync.set({
       backendHost: backend.host,
       backendPort: backend.port,
-      ocrAutoscroll: autoscrollCheckbox.checked,
-      captureIntervalMs
+      ocrAutoscroll: autoscrollCheckbox.checked
     });
     hostInput.value = backend.host;
     portInput.value = backend.port;

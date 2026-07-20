@@ -3,8 +3,6 @@ const DEFAULT_HOST = 'localhost';
 const DEFAULT_PORT = 8765;
 const FILE_BRIDGE_DEFAULT_PORT = 8964;
 const OVERLAP_PX = 50;
-const AFTER_SEND_DELAY_MS = 0;
-const DEFAULT_CAPTURE_INTERVAL_MS = 100;
 const BACKEND_TIMEOUT_MS = 12 * 60 * 1000;
 const MAX_CAPTURE_PAGES = 500;
 const MAX_SAVE_PATH_CHARS = 1024;
@@ -1197,9 +1195,6 @@ async function executeCaptureLoop({
           fixedAutoscroll = settings.ocrAutoscroll;
         }
         const ocrAutoscroll = fixedAutoscroll;
-        const { captureIntervalMs } = await chrome.storage.sync.get({
-          captureIntervalMs: DEFAULT_CAPTURE_INTERVAL_MS
-        });
         if (!ocrAutoscroll && fragmentCount > 0) {
           updateState(tabId, { progress: 'Single capture complete (autoscroll off).' });
           break;
@@ -1233,109 +1228,127 @@ async function executeCaptureLoop({
           ...checkpoint
         };
         await chrome.storage.local.set({ [`retryState:${tabId}`]: state.retryState });
-        for (let attempt = 1; ; attempt++) {
-          const target = await waitForTargetActive(
-            tabId,
-            state,
-            controller.signal,
-            attempt === 1
-              ? `Sending page ${pageNumber} to OCR...`
-              : `Retrying page ${pageNumber} (attempt ${attempt})...`
-          );
-          if (target.status !== 'active') {
-            await clearRetryState(tabId, state);
-            break capturePages;
-          }
-          try {
-            const text = await postImageForOcr(
-              croppedBlob,
-              pageNumber,
+
+        // OCR latency is the settle window: start OCR, then scroll immediately so
+        // the next viewport is ready by the time this page's OCR returns.
+        const ocrTask = (async () => {
+          for (let attempt = 1; ; attempt++) {
+            const target = await waitForTargetActive(
+              tabId,
+              state,
               controller.signal,
-              state.operationPrompts?.ocr,
-              operationId,
-              state.operationBackend
+              attempt === 1
+                ? `Sending page ${pageNumber} to OCR...`
+                : `Retrying page ${pageNumber} (attempt ${attempt})...`
             );
-            accumulator.append(text);
-            fragmentCount += 1;
-            state.checkpointText = accumulator.text;
-            await clearRetryState(tabId, state);
-            await persistCheckpoint();
-            break;
-          } catch (e) {
-            if (e?.code === 'TEXT_LIMIT') {
-              state.partialReason = 'text_limit';
-              state.partialError = e.message;
+            if (target.status !== 'active') {
               await clearRetryState(tabId, state);
-              break capturePages;
+              return { status: 'stopped' };
             }
-            if (state.stopRequested || state.targetRemoved || controller.signal.aborted) {
+            try {
+              const text = await postImageForOcr(
+                croppedBlob,
+                pageNumber,
+                controller.signal,
+                state.operationPrompts?.ocr,
+                operationId,
+                state.operationBackend
+              );
               await clearRetryState(tabId, state);
-              break capturePages;
+              return { status: 'ok', text };
+            } catch (e) {
+              if (e?.code === 'TEXT_LIMIT') {
+                state.partialReason = 'text_limit';
+                state.partialError = e.message;
+                await clearRetryState(tabId, state);
+                return { status: 'text_limit' };
+              }
+              if (state.stopRequested || state.targetRemoved || controller.signal.aborted) {
+                await clearRetryState(tabId, state);
+                return { status: 'stopped' };
+              }
+              updateState(tabId, { progress: `Retrying page ${pageNumber} (attempt ${attempt + 1})...` });
+              await abortableSleep(2000, controller.signal);
             }
-            updateState(tabId, { progress: `Retrying page ${pageNumber} (attempt ${attempt + 1})...` });
-            await abortableSleep(2000, controller.signal);
+          }
+        })();
+
+        // Scroll decision for whether another capture is needed after this page.
+        // 'continue' = more content expected; 'stop' = finished after this OCR.
+        // 'abort' = target/navigation interrupted mid-scroll.
+        let scrollDecision = ocrAutoscroll ? 'continue' : 'stop';
+        let moreContentRemains = false;
+
+        if (ocrAutoscroll) {
+          if (atBottom) {
+            const recheckResult = await sendMessageToActiveTarget(tabId, state, controller.signal, {
+              type: 'page:scroll-down',
+              overlapPx: OVERLAP_PX
+            }, `Rechecking page ${pageNumber}...`);
+            if (recheckResult.status !== 'sent') {
+              scrollDecision = 'abort';
+            } else {
+              const recheck = requireScrollResponse(recheckResult.response);
+              if (recheck?.changed) {
+                atBottom = false;
+                scrollY = recheck.scrollY;
+                moreContentRemains = true;
+                scrollDecision = 'continue';
+              } else {
+                scrollDecision = 'stop';
+              }
+            }
+          } else {
+            const sentScroll = await sendMessageToActiveTarget(tabId, state, controller.signal, {
+              type: 'page:scroll-down',
+              overlapPx: OVERLAP_PX
+            }, `Scrolling after page ${pageNumber}...`);
+            if (sentScroll.status !== 'sent') {
+              scrollDecision = 'abort';
+            } else {
+              const scrollResult = requireScrollResponse(sentScroll.response);
+              if (scrollResult?.atBottom) {
+                if (!scrollResult.changed) {
+                  // Short page / true bottom: this capture is the last one.
+                  scrollDecision = 'stop';
+                } else {
+                  // Landed on bottom after a real scroll; recheck next loop for lazy content.
+                  atBottom = true;
+                  scrollY = scrollResult.scrollY;
+                  moreContentRemains = true;
+                  scrollDecision = 'continue';
+                }
+              } else {
+                scrollY = scrollResult.scrollY;
+                moreContentRemains = true;
+                scrollDecision = 'continue';
+              }
+            }
           }
         }
 
+        const ocrResult = await ocrTask;
+        if (ocrResult.status !== 'ok') break;
+
+        accumulator.append(ocrResult.text);
+        fragmentCount += 1;
+        state.checkpointText = accumulator.text;
+        await persistCheckpoint();
         updateState(tabId, {
           fragmentsCollected: fragmentCount,
           progress: `Collected ${fragmentCount} fragment${fragmentCount === 1 ? '' : 's'}.`
         });
 
-        await sleep(AFTER_SEND_DELAY_MS);
+        if (scrollDecision === 'abort' || scrollDecision === 'stop') break;
 
-        if (!ocrAutoscroll) break;
-
-        if (atBottom) {
-          await sleep(500);
-          const recheckResult = await sendMessageToActiveTarget(tabId, state, controller.signal, {
-            type: 'page:scroll-down',
-            overlapPx: OVERLAP_PX
-          }, `Rechecking page ${pageNumber}...`);
-          if (recheckResult.status !== 'sent') break;
-          const recheck = requireScrollResponse(recheckResult.response);
-          if (recheck?.changed) {
-            atBottom = false;
-            scrollY = recheck.scrollY;
-            if (fragmentCount >= MAX_CAPTURE_PAGES) {
-              state.partialReason = 'page_limit';
-              state.partialError = `Capture truncated at the ${MAX_CAPTURE_PAGES}-page limit.`;
-              updateState(tabId, { progress: state.partialError });
-              break;
-            }
-            await sleep(captureIntervalMs);
-            continue;
-          }
-          break;
-        }
-
-        const sentScroll = await sendMessageToActiveTarget(tabId, state, controller.signal, {
-          type: 'page:scroll-down',
-          overlapPx: OVERLAP_PX
-        }, `Scrolling after page ${pageNumber}...`);
-        if (sentScroll.status !== 'sent') break;
-        const scrollResult = requireScrollResponse(sentScroll.response);
-
-        if (scrollResult?.atBottom) {
-          if (!scrollResult.changed && fragmentCount > 0) break;
-          atBottom = true;
-          if (fragmentCount >= MAX_CAPTURE_PAGES) {
+        if (fragmentCount >= MAX_CAPTURE_PAGES) {
+          if (moreContentRemains) {
             state.partialReason = 'page_limit';
             state.partialError = `Capture truncated at the ${MAX_CAPTURE_PAGES}-page limit.`;
             updateState(tabId, { progress: state.partialError });
-            break;
           }
-          await sleep(captureIntervalMs);
-          continue;
-        }
-        scrollY = scrollResult.scrollY;
-        if (fragmentCount >= MAX_CAPTURE_PAGES) {
-          state.partialReason = 'page_limit';
-          state.partialError = `Capture truncated at the ${MAX_CAPTURE_PAGES}-page limit.`;
-          updateState(tabId, { progress: state.partialError });
           break;
         }
-        await sleep(captureIntervalMs);
       }
 
       state.collectionComplete = true;

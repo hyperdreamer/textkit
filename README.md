@@ -297,7 +297,7 @@ Backend and file-bridge host/port are stored in Chrome sync storage. The file-br
 
 ### Auto-scroll and page capture
 
-- **Auto-scroll enabled:** the extension captures the selected region, scrolls down by about one viewport with overlap, captures again, and repeats until the page stops scrolling.
+- **Auto-scroll enabled:** the extension captures the selected region, sends that frame to OCR, and immediately scrolls down by about one viewport with overlap while OCR runs. OCR latency is the settle window for the next viewport. After OCR returns, capture repeats until the page stops scrolling.
 - **Auto-scroll disabled:** the extension captures only the current viewport region once.
 
 During capture, the popup shows status, current page, fragment count, and progress. The Stop button requests capture to stop and preserves fragments already collected as a result marked `Partial`; partial results do not trigger automatic translation or formatting. Navigating the capture tab to another URL also stops capture as partial before content from the new document can be accepted.
@@ -308,12 +308,13 @@ For each captured page region, the extension:
 
 1. Captures the visible tab.
 2. Crops the selected region in an `OffscreenCanvas`.
-3. Sends the cropped PNG to `POST /ocr`.
-4. Stores the returned text as a fragment.
-5. Merges fragments locally using line-overlap detection.
-6. Sends the merged text to `POST /dedup`.
-7. If a language other than `Original` is selected, sends the deduplicated text to `POST /translate`.
-8. If auto-format is enabled, sends the selected source (Translation or OCR Result) to `POST /format`, using the extension override when set or the server fallback otherwise.
+3. Starts `POST /ocr` for the cropped PNG.
+4. While that OCR request is in flight, scrolls to the next viewport (when auto-scroll is enabled).
+5. Stores the returned text as a fragment after OCR completes.
+6. Merges fragments locally using line-overlap detection.
+7. Sends the merged text to `POST /dedup`.
+8. If a language other than `Original` is selected, sends the deduplicated text to `POST /translate`.
+9. If auto-format is enabled, sends the selected source (Translation or OCR Result) to `POST /format`, using the extension override when set or the server fallback otherwise.
 
 The popup language dropdown supports `Original`, `Chinese`, `English`, `Japanese`, `Korean`, `French`, `German`, and `Spanish`. Choosing `Original` skips translation.
 

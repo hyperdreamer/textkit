@@ -76,7 +76,6 @@ function createBackgroundHarness(options = {}) {
   const localData = { ...(options.localData || {}) };
   const syncValues = {
     ocrAutoscroll: false,
-    captureIntervalMs: 0,
     ...(options.syncValues || {})
   };
 
@@ -610,7 +609,40 @@ test('a stable captureVisibleTab error surfaces as a genuine error', async () =>
   assert.equal(harness.ocrCalls.length, 0);
 });
 
+test('scroll starts while OCR is in flight and uses OCR latency as settle time', async () => {
+  const firstOcr = deferred();
+  let scrollCalls = 0;
+  const harness = createBackgroundHarness({
+    syncValues: { ocrAutoscroll: true },
+    sendMessage(_tabId, message) {
+      if (message.type !== 'page:scroll-down') return { ok: true };
+      scrollCalls += 1;
+      return scrollCalls === 1
+        ? { changed: true, atBottom: false, scrollY: 100 }
+        : { changed: false, atBottom: true, scrollY: 100 };
+    }
+  });
+  harness.context.__testOcr = async (blob, pageNumber) => {
+    harness.ocrCalls.push({ blob, pageNumber });
+    if (pageNumber === 1) return firstOcr.promise;
+    return `page ${pageNumber}`;
+  };
+
+  const capturePromise = harness.context.runCaptureLoop({ id: 1, windowId: 10, active: true }, REGION);
+  await waitFor(() => scrollCalls === 1, 'scroll did not start while first OCR was pending');
+  assert.equal(harness.ocrCalls.length, 1);
+  assert.equal(harness.context.getState(1).fragmentsCollected, 0);
+
+  firstOcr.resolve('page 1');
+  await capturePromise;
+
+  assert.equal(harness.captureCalls.length, 2);
+  assert.deepEqual(harness.ocrCalls.map((call) => call.pageNumber), [1, 2]);
+  assert.equal(harness.finalized[0].text, 'page 1\npage 2');
+});
+
 test('normal scroll waits for the target to become active again', async () => {
+  const firstOcr = deferred();
   const harness = createBackgroundHarness({
     tabs: [
       { id: 1, windowId: 10, active: true },
@@ -620,21 +652,29 @@ test('normal scroll waits for the target to become active again', async () => {
   });
   harness.context.__testOcr = async (blob, pageNumber) => {
     harness.ocrCalls.push({ blob, pageNumber });
-    harness.setActive(2);
+    if (pageNumber === 1) {
+      // Deactivate before yielding so the parallel scroll path must wait.
+      harness.setActive(2);
+      return firstOcr.promise;
+    }
     return `page ${pageNumber}`;
   };
   const capturePromise = harness.context.runCaptureLoop({ id: 1, windowId: 10, active: true }, REGION);
   await waitFor(() => harness.context.getState(1).status === 'Paused', 'capture did not pause before scroll');
 
-  assert.equal(harness.context.getState(1).fragmentsCollected, 1);
+  assert.equal(harness.ocrCalls.length, 1);
+  assert.equal(harness.context.getState(1).fragmentsCollected, 0);
   assert.equal(harness.messageCalls.filter((call) => call.message.type === 'page:scroll-down').length, 0);
+  firstOcr.resolve('page 1');
   harness.setActive(1);
   await capturePromise;
   assert.equal(harness.messageCalls.filter((call) => call.message.type === 'page:scroll-down').length, 1);
+  assert.equal(harness.context.getState(1).fragmentsCollected, 1);
 });
 
 test('bottom recheck scroll also waits for the active target', async () => {
   let scrollCalls = 0;
+  const secondOcr = deferred();
   const harness = createBackgroundHarness({
     tabs: [
       { id: 1, windowId: 10, active: true },
@@ -648,20 +688,26 @@ test('bottom recheck scroll also waits for the active target', async () => {
       return { changed: false, atBottom: true, scrollY: 100 };
     }
   });
-  vm.runInContext('sleep = async () => {};', harness.context);
   harness.context.__testOcr = async (blob, pageNumber) => {
     harness.ocrCalls.push({ blob, pageNumber });
-    if (pageNumber === 2) harness.setActive(2);
+    if (pageNumber === 2) {
+      // Deactivate before yielding so the parallel bottom-recheck scroll must wait.
+      harness.setActive(2);
+      return secondOcr.promise;
+    }
     return `page ${pageNumber}`;
   };
   const capturePromise = harness.context.runCaptureLoop({ id: 1, windowId: 10, active: true }, REGION);
   await waitFor(() => harness.context.getState(1).status === 'Paused', 'capture did not pause before bottom recheck');
 
   assert.equal(scrollCalls, 1);
-  assert.equal(harness.context.getState(1).fragmentsCollected, 2);
+  assert.equal(harness.ocrCalls.length, 2);
+  assert.equal(harness.context.getState(1).fragmentsCollected, 1);
+  secondOcr.resolve('page 2');
   harness.setActive(1);
   await capturePromise;
   assert.equal(scrollCalls, 2);
+  assert.equal(harness.context.getState(1).fragmentsCollected, 2);
 });
 
 for (const mode of ['run', 'resume']) {
