@@ -331,6 +331,13 @@ def load_config() -> AppConfig:
     except ValidationError as exc:
         raise RuntimeError(f"Invalid config.yaml: {exc}") from exc
     _config_cache = (signature, config)
+    for url in _insecure_api_base_urls(config.ai):
+        host = urlsplit(url).hostname or ""
+        logger.warning(
+            "api_base uses unencrypted HTTP for non-loopback host %s; prefer HTTPS",
+            host,
+            extra={"event": "config.insecure_api_base"},
+        )
     return config
 
 

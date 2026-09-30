@@ -25,6 +25,7 @@ def reset_backend_globals() -> None:
     main._prompt_cache.clear()
     main._rate_events.clear()
     main._active_requests = 0
+    main._config_cache = None
 
 
 def _ai_config() -> main.AIConfig:
@@ -561,6 +562,94 @@ def test_config_schema_rejects_invalid_ranges(
 
     with pytest.raises(RuntimeError, match="Invalid config.yaml"):
         main.load_config()
+
+
+def test_load_config_warns_on_insecure_api_base(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    warnings: list[tuple[str, tuple[object, ...], object]] = []
+
+    def capture(message: str, *args: object, **kwargs: object) -> None:
+        warnings.append((message, args, kwargs.get("extra")))
+
+    monkeypatch.setattr(main.logger, "warning", capture)
+
+    config_path.write_text(
+        "ai:\n"
+        "  api_base: http://provider.example:8080\n"
+        "  text:\n"
+        "    api_base: http://text.example\n",
+        encoding="utf-8",
+    )
+    main._config_cache = None
+    config = main.load_config()
+
+    assert config.ai is not None
+    assert warnings == [
+        (
+            "api_base uses unencrypted HTTP for non-loopback host %s; prefer HTTPS",
+            ("provider.example",),
+            {"event": "config.insecure_api_base"},
+        ),
+        (
+            "api_base uses unencrypted HTTP for non-loopback host %s; prefer HTTPS",
+            ("text.example",),
+            {"event": "config.insecure_api_base"},
+        ),
+    ]
+
+    warnings.clear()
+    config_path.write_text(
+        "ai:\n"
+        "  api_base: https://provider.example\n"
+        "  text:\n"
+        "    api_base: http://127.0.0.1:9000\n",
+        encoding="utf-8",
+    )
+    main._config_cache = None
+    main.load_config()
+
+    assert warnings == []
+
+    warnings.clear()
+    config_path.write_text("ai: null\n", encoding="utf-8")
+    main._config_cache = None
+    config = main.load_config()
+
+    assert config.ai is None
+    assert warnings == []
+
+
+def test_load_config_does_not_rewarn_for_unchanged_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "ai:\n"
+        "  api_base: http://provider.example\n"
+        "  text:\n"
+        "    api_base: http://text.example\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    warnings: list[tuple[str, tuple[object, ...], object]] = []
+
+    def capture(message: str, *args: object, **kwargs: object) -> None:
+        warnings.append((message, args, kwargs.get("extra")))
+
+    monkeypatch.setattr(main.logger, "warning", capture)
+
+    main._config_cache = None
+    config = main.load_config()
+    assert len(warnings) == 2
+
+    assert main.load_config() is config
+    assert len(warnings) == 2
+
+    main._resolve_ai_config(config.ai, config.ai.text)
+    assert len(warnings) == 2
 
 
 def test_credentials_are_resolved_lazily_per_operation(
