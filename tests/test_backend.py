@@ -335,7 +335,13 @@ def test_provider_rejects_invalid_structure(api_base: str, message: str) -> None
 
 @pytest.mark.parametrize(
     "api_base",
-    ["https://example.com:bad", "https://example.com:0", "https://example.com:70000"],
+    [
+        "https://example.com:bad",
+        "https://example.com:0",
+        "https://example.com:70000",
+        "http://example.com:0",
+        "http://example.com:70000",
+    ],
 )
 def test_provider_rejects_invalid_ports(api_base: str) -> None:
     with pytest.raises(main.ValidationError, match="valid port between 1 and 65535"):
@@ -558,10 +564,16 @@ def test_config_schema_rejects_invalid_ranges(
     config_path = tmp_path / "config.yaml"
     config_path.write_text("port: 70000\n", encoding="utf-8")
     monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    warnings: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        main.logger, "warning", lambda *args, **kwargs: warnings.append(args)
+    )
     main._config_cache = None
 
     with pytest.raises(RuntimeError, match="Invalid config.yaml"):
         main.load_config()
+
+    assert warnings == []
 
 
 def test_load_config_warns_on_insecure_api_base(
@@ -620,6 +632,42 @@ def test_load_config_warns_on_insecure_api_base(
 
     assert config.ai is None
     assert warnings == []
+
+
+def test_load_config_caches_before_insecure_warning_pass(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class InsecureWarningRaised(Exception):
+        pass
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "ai:\n  api_base: http://provider.example\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    warning_calls: list[tuple[object, ...]] = []
+
+    def raise_on_warning(*args: object, **kwargs: object) -> None:
+        warning_calls.append(args)
+        raise InsecureWarningRaised(args)
+
+    monkeypatch.setattr(main.logger, "warning", raise_on_warning)
+    main._config_cache = None
+
+    with pytest.raises(InsecureWarningRaised):
+        main.load_config()
+
+    assert len(warning_calls) == 1
+    assert main._config_cache is not None
+    cached = main._config_cache[1]
+    assert isinstance(cached, main.AppConfig)
+    assert cached.ai is not None
+    assert cached.ai.api_base == "http://provider.example"
+
+    second = main.load_config()
+
+    assert second is cached
+    assert len(warning_calls) == 1
 
 
 def test_load_config_does_not_rewarn_for_unchanged_config(
