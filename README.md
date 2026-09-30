@@ -237,7 +237,7 @@ ai:
 
 Supported `ai` fields:
 
-- `api_base`: base provider URL without a trailing slash. Must expose `/v1/chat/completions`. Non-loopback providers must use HTTPS.
+- `api_base`: base provider URL without a trailing slash. Must expose `/v1/chat/completions`. HTTP is accepted for any host, but non-loopback HTTP is unencrypted and the backend logs a startup warning; prefer HTTPS.
 - `api_key`: the API key. Plaintext values are used directly. Prefix with `$` to treat the value as an environment variable name (e.g. `$OCR_API_KEY`). `api_key_env` is also accepted.
 - `model`: the model name to send to the provider. Fallback model used for all operations unless per-task overrides are set.
 - `ocr` (optional): nested section to override model/endpoint for vision (OCR) requests. Fields: `api_base`, `api_key`, `model`. Empty fields inherit from the parent `ai` section.

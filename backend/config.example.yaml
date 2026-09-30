@@ -61,8 +61,8 @@ ai:
   #   api_key: "$OTHER_PROXY_API_KEY"
   #   model: "claude-sonnet-4-20250514"
 
-  # Non-loopback providers must use HTTPS. Plain HTTP is accepted only for
-  # localhost, 127.0.0.1, and ::1 development providers.
+  # HTTP is accepted for any provider host. Non-loopback HTTP is unencrypted and
+  # the backend logs a startup warning at config load; prefer HTTPS.
   # Per-phase HTTP timeouts for AI API calls (all in seconds).
   # Omit any key to use its default.  Increase ``read`` when translating
   # very long text that may take the model several minutes to process.
