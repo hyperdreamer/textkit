@@ -377,7 +377,7 @@ helper. Assert: `== expected`.
 | --- | --- |
 | `AIConfig(api_base="http://provider.example")` | `["http://provider.example"]` |
 | `AIConfig(api_base="https://api.example", text=ProviderOverride(api_base="http://text.example"))` | `["http://text.example"]` |
-| `AIConfig(api_base="https://api.example", ocr=ProviderOverride(api_base="http://ocr.example"), text=ProviderOverride(api_base="http://text.example"))` | `["http://ocr.example", "http://text.example"]` (pins base → ocr → text) |
+| `AIConfig(api_base="http://base.example", ocr=ProviderOverride(api_base="http://ocr.example"), text=ProviderOverride(api_base="http://text.example"))` | `["http://base.example", "http://ocr.example", "http://text.example"]` (pins the full base → ocr → text order) |
 | `AIConfig(api_base="http://provider.example", text=ProviderOverride(api_base="http://provider.example"))` | `["http://provider.example"]` (dedup, base wins) |
 | `AIConfig(api_base="https://api.example", text=ProviderOverride(api_base="   "))` | `[]` (whitespace override skipped) |
 | `AIConfig(api_base="HTTP://PROVIDER.EXAMPLE")` | `["HTTP://PROVIDER.EXAMPLE"]` (uppercase scheme detected; original case preserved) |
@@ -401,11 +401,11 @@ helper. Assert: `== expected`.
         ),
         (
             main.AIConfig(
-                api_base="https://api.example",
+                api_base="http://base.example",
                 ocr=main.ProviderOverride(api_base="http://ocr.example"),
                 text=main.ProviderOverride(api_base="http://text.example"),
             ),
-            ["http://ocr.example", "http://text.example"],
+            ["http://base.example", "http://ocr.example", "http://text.example"],
         ),
         (
             main.AIConfig(
@@ -714,8 +714,9 @@ Run from the repository root unless noted.
    warning. A fresh process run warns again (once per process). Replacing the URL
    with `http://127.0.0.1:8000` or `https://provider.example` prints no warning line.
 6. `git diff --stat <implementation-start-oid>` — the implementation plan pins the
-   OID of the commit containing this spec; the diff must show exactly four tracked
-   files: `backend/main.py`, `backend/config.example.yaml`, `README.md`,
+   OID of the integration-branch tip immediately before the first implementation
+   commit (after the design, spec, and plan commits); the diff must show exactly
+   four tracked files: `backend/main.py`, `backend/config.example.yaml`, `README.md`,
    `tests/test_backend.py`. The spec and design documents are committed before
    implementation and do not appear in the implementation diff.
 

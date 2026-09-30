@@ -222,5 +222,6 @@ Exact replacements:
    (including a missing-prerequisite skip).
 3. Manual smoke: a config with a non-loopback `http://` endpoint logs exactly one
    warning line per process at startup and none on a loopback `http://` config.
-4. `git diff` against the pinned base contains only the validator change, the two
+4. `git diff` from the integration tip at implementation start (the commit after the
+   design, spec, and plan commits) contains only the validator change, the two
    helpers, `load_config` wiring, tests, and the two documentation edits.
