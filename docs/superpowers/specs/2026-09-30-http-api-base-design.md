@@ -158,9 +158,10 @@ Replace `test_non_loopback_provider_requires_https` and add:
 2. `test_provider_override_allows_http` — a direct `ProviderOverride(api_base="http://provider.example")`
    validates (the second named surface).
 3. `test_provider_rejects_invalid_structure` — parameterized regression tests for
-   bad scheme, missing host, query, fragment, and user-info, asserting the existing
-   messages (`must be a valid absolute HTTP(S) URL`, `must not include query,
-   fragment, or user-info components`). The repository currently has none of these.
+   bad scheme, missing host, malformed bracketed IPv6, query, fragment, and
+   user-info, asserting the existing messages (`must be a valid absolute HTTP(S)
+   URL`, `must not include query, fragment, or user-info components`). The
+   repository currently has none of these.
 4. `_insecure_api_base_urls` unit tests: base-only, override-only, both overrides,
    duplicate URL dedup (base vs. override), empty/whitespace override skipped,
    loopback literals `[localhost, LOCALHOST, 127.0.0.1, [::1], [::1]:8000]`
@@ -168,15 +169,19 @@ Replace `test_non_loopback_provider_requires_https` and add:
    included, uppercase `HTTP://PROVIDER.EXAMPLE` included, and `ai=None` → `[]`.
 5. `test_load_config_warns_on_insecure_api_base` — modeled on
    `test_config_schema_rejects_invalid_ranges` (tmp `CONFIG_PATH`, reset
-   `main._config_cache`): one non-loopback `http://` base plus one insecure `text`
-   override with a distinct URL produces two warnings (one per URL, in base → ocr →
-   text order); an all-HTTPS/loopback config produces none; `ai: null` produces none
-   and does not raise. Warning capture patches `main.logger.warning` because
-   `textkit` sets `propagate = False` and `caplog` cannot see it.
+   `main._config_cache`): one non-loopback `http://` base with an explicit port
+   (`http://provider.example:8080`, pinning hostname-not-netloc in the warning
+   argument) plus one insecure `text` override with a distinct URL produces two
+   warnings (one per URL, in base → ocr → text order); an all-HTTPS/loopback config
+   produces none; `ai: null` produces none and does not raise. Warning capture
+   patches `main.logger.warning` because `textkit` sets `propagate = False` and
+   `caplog` cannot see it.
 6. `test_load_config_does_not_rewarn_for_unchanged_config` — a second `load_config()`
    with the same unchanged tmp file adds zero warnings, and
-   `_resolve_ai_config(config, config.text)` with an insecure override adds zero
-   warnings. This is the falsifiable pin against warning-at-validation-time.
+   `_resolve_ai_config(config.ai, config.ai.text)` with an insecure override adds
+   zero warnings; a direct `_insecure_api_base_urls(...)` call also adds zero
+   warnings. This is the falsifiable pin against warning-at-validation-time and
+   helper-side logging. `config` is the `AppConfig` returned by `load_config`.
 
 Test hygiene: add `main._config_cache = None` to the autouse `reset_backend_globals`
 fixture so a tmp-config test cannot leak a cache entry into another test, and reset
