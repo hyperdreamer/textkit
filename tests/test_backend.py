@@ -25,6 +25,7 @@ def reset_backend_globals() -> None:
     main._prompt_cache.clear()
     main._rate_events.clear()
     main._active_requests = 0
+    main._config_cache = None
 
 
 def _ai_config() -> main.AIConfig:
@@ -280,12 +281,56 @@ def test_zero_upload_limit_reads_entire_upload() -> None:
     assert asyncio.run(main._read_limited_upload(upload, 0)) == b"complete upload"
 
 
-def test_non_loopback_provider_requires_https() -> None:
-    with pytest.raises(main.ValidationError, match="must use HTTPS"):
-        main.AIConfig(api_base="http://provider.example", api_key="key", model="model")
+@pytest.mark.parametrize(
+    ("api_base", "expected"),
+    [
+        ("http://provider.example/", "http://provider.example"),
+        ("http://provider.example", "http://provider.example"),
+        ("http://127.0.0.1:8000", "http://127.0.0.1:8000"),
+    ],
+)
+def test_non_loopback_provider_allows_http(api_base: str, expected: str) -> None:
+    config = main.AIConfig(api_base=api_base, api_key="key", model="model")
 
-    config = main.AIConfig(api_base="http://127.0.0.1:8000", api_key="key", model="model")
-    assert config.api_base == "http://127.0.0.1:8000"
+    assert config.api_base == expected
+
+
+def test_provider_override_allows_http() -> None:
+    override = main.ProviderOverride(api_base="http://provider.example")
+
+    assert override.api_base == "http://provider.example"
+
+
+@pytest.mark.parametrize(
+    ("api_base", "message"),
+    [
+        ("http://[bad", "api_base must be a valid absolute HTTP(S) URL"),
+        ("ftp://provider.example", "api_base must be a valid absolute HTTP(S) URL"),
+        ("provider.example", "api_base must be a valid absolute HTTP(S) URL"),
+        ("http://", "api_base must be a valid absolute HTTP(S) URL"),
+        (
+            "http://provider.example/v1?key=1",
+            "api_base must not include query, fragment, or user-info components",
+        ),
+        (
+            "http://provider.example/v1#frag",
+            "api_base must not include query, fragment, or user-info components",
+        ),
+        (
+            "http://user@provider.example",
+            "api_base must not include query, fragment, or user-info components",
+        ),
+        (
+            "http://user:pass@provider.example",
+            "api_base must not include query, fragment, or user-info components",
+        ),
+    ],
+)
+def test_provider_rejects_invalid_structure(api_base: str, message: str) -> None:
+    with pytest.raises(main.ValidationError) as exc_info:
+        main.AIConfig(api_base=api_base, api_key="key", model="model")
+
+    assert message in str(exc_info.value)
 
 
 @pytest.mark.parametrize(
@@ -295,6 +340,100 @@ def test_non_loopback_provider_requires_https() -> None:
 def test_provider_rejects_invalid_ports(api_base: str) -> None:
     with pytest.raises(main.ValidationError, match="valid port between 1 and 65535"):
         main.AIConfig(api_base=api_base, api_key="key", model="model")
+
+
+@pytest.mark.parametrize(
+    ("ai", "expected"),
+    [
+        (
+            main.AIConfig(api_base="http://provider.example"),
+            ["http://provider.example"],
+        ),
+        (
+            main.AIConfig(
+                api_base="https://api.example",
+                text=main.ProviderOverride(api_base="http://text.example"),
+            ),
+            ["http://text.example"],
+        ),
+        (
+            main.AIConfig(
+                api_base="http://base.example",
+                ocr=main.ProviderOverride(api_base="http://ocr.example"),
+                text=main.ProviderOverride(api_base="http://text.example"),
+            ),
+            ["http://base.example", "http://ocr.example", "http://text.example"],
+        ),
+        (
+            main.AIConfig(
+                api_base="http://provider.example",
+                text=main.ProviderOverride(api_base="http://provider.example"),
+            ),
+            ["http://provider.example"],
+        ),
+        (
+            main.AIConfig(
+                api_base="https://api.example",
+                text=main.ProviderOverride(api_base="   "),
+            ),
+            [],
+        ),
+        (
+            main.AIConfig(api_base="HTTP://PROVIDER.EXAMPLE"),
+            ["HTTP://PROVIDER.EXAMPLE"],
+        ),
+        (
+            main.AIConfig(
+                api_base="http://provider.example",
+                text=main.ProviderOverride(api_base="HTTP://PROVIDER.EXAMPLE"),
+            ),
+            ["http://provider.example", "HTTP://PROVIDER.EXAMPLE"],
+        ),
+        (None, []),
+    ],
+)
+def test_insecure_api_base_urls_base_and_override_coverage(
+    ai: main.AIConfig | None, expected: list[str]
+) -> None:
+    assert main._insecure_api_base_urls(ai) == expected
+
+
+@pytest.mark.parametrize(
+    "api_base",
+    [
+        "http://localhost",
+        "http://LOCALHOST",
+        "http://127.0.0.1",
+        "http://[::1]",
+        "http://[::1]:8000",
+    ],
+)
+def test_insecure_api_base_urls_loopback_literals_are_excluded(api_base: str) -> None:
+    assert main._insecure_api_base_urls(main.AIConfig(api_base=api_base)) == []
+
+
+@pytest.mark.parametrize(
+    "api_base",
+    [
+        "http://127.0.0.2",
+        "http://localhost.",
+        "http://[0:0:0:0:0:0:0:1]",
+    ],
+)
+def test_insecure_api_base_urls_non_exempt_forms_are_included(api_base: str) -> None:
+    assert main._insecure_api_base_urls(main.AIConfig(api_base=api_base)) == [api_base]
+
+
+def test_insecure_api_base_urls_emits_no_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warnings: list[object] = []
+    monkeypatch.setattr(main.logger, "warning", lambda *args, **kwargs: warnings.append(args))
+
+    assert main._insecure_api_base_urls(
+        main.AIConfig(api_base="http://provider.example")
+    ) == ["http://provider.example"]
+    assert warnings == []
 
 
 def test_provider_response_requires_choices() -> None:
@@ -423,6 +562,94 @@ def test_config_schema_rejects_invalid_ranges(
 
     with pytest.raises(RuntimeError, match="Invalid config.yaml"):
         main.load_config()
+
+
+def test_load_config_warns_on_insecure_api_base(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    warnings: list[tuple[str, tuple[object, ...], object]] = []
+
+    def capture(message: str, *args: object, **kwargs: object) -> None:
+        warnings.append((message, args, kwargs.get("extra")))
+
+    monkeypatch.setattr(main.logger, "warning", capture)
+
+    config_path.write_text(
+        "ai:\n"
+        "  api_base: http://provider.example:8080\n"
+        "  text:\n"
+        "    api_base: http://text.example\n",
+        encoding="utf-8",
+    )
+    main._config_cache = None
+    config = main.load_config()
+
+    assert config.ai is not None
+    assert warnings == [
+        (
+            "api_base uses unencrypted HTTP for non-loopback host %s; prefer HTTPS",
+            ("provider.example",),
+            {"event": "config.insecure_api_base"},
+        ),
+        (
+            "api_base uses unencrypted HTTP for non-loopback host %s; prefer HTTPS",
+            ("text.example",),
+            {"event": "config.insecure_api_base"},
+        ),
+    ]
+
+    warnings.clear()
+    config_path.write_text(
+        "ai:\n"
+        "  api_base: https://provider.example\n"
+        "  text:\n"
+        "    api_base: http://127.0.0.1:9000\n",
+        encoding="utf-8",
+    )
+    main._config_cache = None
+    main.load_config()
+
+    assert warnings == []
+
+    warnings.clear()
+    config_path.write_text("ai: null\n", encoding="utf-8")
+    main._config_cache = None
+    config = main.load_config()
+
+    assert config.ai is None
+    assert warnings == []
+
+
+def test_load_config_does_not_rewarn_for_unchanged_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "ai:\n"
+        "  api_base: http://provider.example\n"
+        "  text:\n"
+        "    api_base: http://text.example\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    warnings: list[tuple[str, tuple[object, ...], object]] = []
+
+    def capture(message: str, *args: object, **kwargs: object) -> None:
+        warnings.append((message, args, kwargs.get("extra")))
+
+    monkeypatch.setattr(main.logger, "warning", capture)
+
+    main._config_cache = None
+    config = main.load_config()
+    assert len(warnings) == 2
+
+    assert main.load_config() is config
+    assert len(warnings) == 2
+
+    main._resolve_ai_config(config.ai, config.ai.text)
+    assert len(warnings) == 2
 
 
 def test_credentials_are_resolved_lazily_per_operation(

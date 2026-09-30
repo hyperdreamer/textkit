@@ -154,10 +154,12 @@ def _validate_api_base_value(value: str) -> str:
         or parsed.password is not None
     ):
         raise ValueError("api_base must not include query, fragment, or user-info components")
-    loopback = parsed.hostname.lower().strip("[]") in {"localhost", "127.0.0.1", "::1"}
-    if parsed.scheme != "https" and not loopback:
-        raise ValueError("api_base must use HTTPS unless it targets a loopback provider")
     return normalized
+
+
+def _is_loopback_hostname(hostname: str) -> bool:
+    """True only for the exact literals localhost, 127.0.0.1, and ::1."""
+    return hostname.lower().strip("[]") in {"localhost", "127.0.0.1", "::1"}
 
 
 class ProviderOverride(FrozenModel):
@@ -189,6 +191,30 @@ class AIConfig(FrozenModel):
     @classmethod
     def validate_api_base(cls, value: str) -> str:
         return _validate_api_base_value(value)
+
+
+def _insecure_api_base_urls(ai: AIConfig | None) -> list[str]:
+    """Return the deduplicated non-loopback http:// api_base values, base first."""
+
+    if ai is None:
+        return []
+    candidates: list[str] = [ai.api_base]
+    if ai.ocr is not None:
+        candidates.append(ai.ocr.api_base)
+    if ai.text is not None:
+        candidates.append(ai.text.api_base)
+    seen: set[str] = set()
+    insecure: list[str] = []
+    for value in candidates:
+        normalized = value.strip()
+        if not normalized or normalized in seen:
+            continue
+        parsed = urlsplit(normalized)
+        if parsed.scheme != "http" or _is_loopback_hostname(parsed.hostname or ""):
+            continue
+        seen.add(normalized)
+        insecure.append(normalized)
+    return insecure
 
 
 class AppConfig(FrozenModel):
@@ -305,6 +331,13 @@ def load_config() -> AppConfig:
     except ValidationError as exc:
         raise RuntimeError(f"Invalid config.yaml: {exc}") from exc
     _config_cache = (signature, config)
+    for url in _insecure_api_base_urls(config.ai):
+        host = urlsplit(url).hostname or ""
+        logger.warning(
+            "api_base uses unencrypted HTTP for non-loopback host %s; prefer HTTPS",
+            host,
+            extra={"event": "config.insecure_api_base"},
+        )
     return config
 
 
