@@ -1,0 +1,15 @@
+digraph execution_graph {
+  rankdir=TB;
+  node [shape=box, style=rounded, fontname="Helvetica"];
+  edge [fontname="Helvetica"];
+  subgraph cluster_backend_core {
+    label="lane: backend-core";
+    "T1" [label="T1 (plan task 1)\\nAllow HTTP in `_validate_api_base_value` and add the loopback and insecure-URL helpers\\ntier: standard"];
+    "T2" [label="T2 (plan task 2)\\nWarn once per insecure `api_base` from `load_config`\\ntier: standard"];
+  }
+  subgraph cluster_docs {
+    label="lane: docs";
+    "T3" [label="T3 (plan task 3)\\nUpdate the README and example config for HTTP acceptance\\ntier: standard"];
+  }
+  "T1" -> "T2";
+}

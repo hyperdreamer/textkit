@@ -1,0 +1,96 @@
+schema_version: 1
+topic: http-api-base
+run_id: pm-run-20260930-221747-a49886ee
+generated_at: "2026-09-30T22:29:17Z"
+source_plan:
+  path: docs/superpowers/plans/2026-09-30-http-api-base.md
+  sha256: 0d8162a6a7f9dbc25028bed4ae84c05515a68c389a3584fa4572c316791f1f93
+  commit_oid: a6eb60ce9ddb0b2b9f94371f98793ac9e962fdcb
+  parsed_tasks:
+  - 1
+  - 2
+  - 3
+lanes:
+- id: backend-core
+  task_ids:
+  - T1
+  - T2
+- id: docs
+  task_ids:
+  - T3
+tasks:
+- id: T1
+  plan_task: 1
+  title: Allow HTTP in `_validate_api_base_value` and add the loopback and insecure-URL helpers
+  implementer_tier: standard
+  lane: backend-core
+  sequence: 1
+  depends_on: []
+  owns:
+  - backend/main.py
+  - tests/test_backend.py
+  exclusive_resources: []
+  consumes: []
+  produces:
+  - interface: "_validate_api_base_value(value: str) -> str"
+    digest: a29bb626dab4c086268e564673d04d42caf6a9eab116a66ed48b3500b05ac3ad
+  - interface: "_is_loopback_hostname(hostname: str) -> bool"
+    digest: 9c212e4a207c8c308ab7dda4bcc27f6bd062cb1bd18e0215502e93b331956242
+  - interface: "_insecure_api_base_urls(ai: AIConfig | None) -> list[str]"
+    digest: 47af398ed20a0f47e4d441de37e533dcc69ac035523bd7a82c1f90be034849d1
+  validation:
+  - - python
+    - -m
+    - pytest
+    - tests/test_backend.py
+    - -v
+- id: T2
+  plan_task: 2
+  title: Warn once per insecure `api_base` from `load_config`
+  implementer_tier: standard
+  lane: backend-core
+  sequence: 2
+  depends_on:
+  - T1
+  owns:
+  - backend/main.py
+  - tests/test_backend.py
+  exclusive_resources: []
+  consumes:
+  - interface: "_is_loopback_hostname(hostname: str) -> bool"
+    digest: 9c212e4a207c8c308ab7dda4bcc27f6bd062cb1bd18e0215502e93b331956242
+  - interface: "_insecure_api_base_urls(ai: AIConfig | None) -> list[str]"
+    digest: 47af398ed20a0f47e4d441de37e533dcc69ac035523bd7a82c1f90be034849d1
+  produces:
+  - interface: load_config() -> AppConfig with the once-per-config-load insecure-api-base warning pass
+    digest: 6055051c815241eeea7cfe52f1ce718ec42177d4084d50fe5a73ae1dbd23b267
+  validation:
+  - - python
+    - -m
+    - pytest
+    - tests/test_backend.py
+    - -v
+- id: T3
+  plan_task: 3
+  title: Update the README and example config for HTTP acceptance
+  implementer_tier: standard
+  lane: docs
+  sequence: 1
+  depends_on: []
+  owns:
+  - README.md
+  - backend/config.example.yaml
+  exclusive_resources: []
+  consumes: []
+  produces:
+  - interface: "README.md api_base bullet: HTTP accepted for any host; non-loopback HTTP logs a startup\
+      \ warning"
+    digest: 933978261f0e52be57c178f07995053198c2876c1f4843d8e88cf7572345daf4
+  - interface: "backend/config.example.yaml ai comment: HTTP accepted; startup warning documented"
+    digest: 18519366f157012fbe7094f2bac4e7455ef36864f9e54718dd3d4108c6483162
+  validation:
+  - - python
+    - -m
+    - pytest
+    - tests/
+    - -v
