@@ -133,6 +133,8 @@ To save tokens and latency, the endpoint short-circuits the AI call when the inp
 - `detected_language` (string|null) — ISO 639-1 code.
 - `skip_reason` (string) — `"original_target"` or `"same_language"`.
 
+Long input is split into sentence-aligned chunks translated independently, so a provider that stops at its output-token cap cannot return a silently truncated prefix. A chunk the provider still cannot finish is emitted as its source text rather than dropped; a warning is logged with `event: "translate.truncated"`. Raise `ai.max_tokens` for a higher provider ceiling.
+
 ### `POST /format`
 
 Formats text using a user-provided custom AI prompt. Designed to run on the *output* of translation (or any text).

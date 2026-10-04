@@ -70,6 +70,11 @@ FORMAT_MAX_DEPTH = 6  # safety bound on recursive splitting
 FORMAT_CONCURRENCY = 4  # parallel provider calls for independent chunks
 FORMAT_CONTENT_EDGE_CHARS = 24  # head/tail length that must survive formatting
 FORMAT_CONTENT_MAX_LOSS_FRACTION = 0.02  # tolerated content shrink
+TRANSLATE_CHUNK_CHARS = 1200  # target input size of one translation request
+TRANSLATE_MIN_CHUNK_CHARS = 160  # recursion floor: below this, keep the source chunk
+TRANSLATE_MAX_DEPTH = 6  # safety bound on recursive splitting
+TRANSLATE_CONCURRENCY = 4  # parallel provider calls for independent chunks
+TRANSLATE_MIN_OUTPUT_RATIO = 0.12  # shortest plausible output/content length ratio
 
 # Enforce the configurable pixel limit ourselves after Pillow parses the image
 # header, so max_image_pixels=0 can explicitly disable the check.
@@ -717,14 +722,41 @@ def _should_skip_translation(
 
 
 async def translate_text(config: AIConfig, text: str, language: str, prompt: str | None = None) -> OCRResponse:
+    """Translate text without silently dropping content to an output-token cap.
+
+    Translation cannot be content-verified across languages, so the text is split
+    into sentence-aligned chunks translated independently (with bounded
+    parallelism).  A chunk the provider truncates is split and retried, and once
+    it is too small to split its source text is emitted, so the returned
+    translation is never a silently truncated prefix.
+    """
     cfg = _resolve_ai_config(config, config.text)
     effective_prompt = prompt or await asyncio.to_thread(_render_prompt, "translate", language=language)
-    return await _post_openai_chat_completion(
-        cfg,
-        [
-            {"role": "system", "content": effective_prompt},
-            {"role": "user", "content": text},
-        ],
+
+    chunks = _segment_for_format(text, TRANSLATE_CHUNK_CHARS)
+    semaphore = asyncio.Semaphore(TRANSLATE_CONCURRENCY)
+    stats = _CompletionStats()
+    translated = await asyncio.gather(
+        *[
+            _translate_verified(cfg, effective_prompt, chunk, semaphore, stats, 0)
+            for chunk in chunks
+        ]
+    )
+    joined = "\n\n".join(part.strip() for part, _ in translated if part.strip())
+    if not joined and text.strip():
+        joined = text  # last-resort fallback, still lossless
+    floored = sum(1 for _, floor in translated if floor)
+    if floored:
+        logger.warning(
+            "translate kept source text for %d chunk(s) the provider could not finish; "
+            "consider raising ai.max_tokens",
+            floored,
+            extra={"event": "translate.truncated"},
+        )
+    return OCRResponse(
+        text=joined,
+        model=stats.model or cfg.model,
+        tokens_used=stats.tokens_used,
     )
 
 
@@ -825,8 +857,8 @@ def _split_in_half(text: str) -> list[str]:
 
 
 @dataclass
-class _FormatStats:
-    """Aggregate provider usage across the chunks of one formatting request."""
+class _CompletionStats:
+    """Aggregate provider usage across the chunks of one chunked request."""
 
     tokens_used: int = 0
     model: str = ""
@@ -840,18 +872,23 @@ class _FormatStats:
             self.hit_token_cap = True
 
 
-def _format_idempotency_key(chunk: str) -> str:
-    """Unique provider idempotency key for one formatting chunk.
+def _chunk_idempotency_key(chunk: str, operation: str) -> str:
+    """Unique provider idempotency key for one chunk of a chunked operation.
 
-    A request shares a single operation id, but a chunked format makes many
-    provider calls; keying each by its content keeps retries of the same chunk
-    idempotent without collapsing distinct chunks into one cached response.
+    A request shares a single operation id, but a chunked format or translation
+    makes many provider calls; keying each by its content keeps retries of the
+    same chunk idempotent without collapsing distinct chunks into one cached
+    response.
     """
     request_id = _operation_id.get()
     if not request_id:
         return ""
     digest = hashlib.sha256(chunk.encode("utf-8")).hexdigest()[:16]
-    return f"{request_id}:format:{digest}"
+    return f"{request_id}:{operation}:{digest}"
+
+
+def _format_idempotency_key(chunk: str) -> str:
+    return _chunk_idempotency_key(chunk, "format")
 
 
 async def _format_verified(
@@ -859,7 +896,7 @@ async def _format_verified(
     prompt: str,
     chunk: str,
     semaphore: asyncio.Semaphore,
-    stats: _FormatStats,
+    stats: _CompletionStats,
     depth: int,
 ) -> str:
     """Format one chunk, guaranteeing its word content survives.
@@ -912,7 +949,7 @@ async def format_text(config: AIConfig, text: str, prompt: str | None = None) ->
 
     chunks = _segment_for_format(text, FORMAT_CHUNK_CHARS)
     semaphore = asyncio.Semaphore(FORMAT_CONCURRENCY)
-    stats = _FormatStats()
+    stats = _CompletionStats()
     formatted = await asyncio.gather(
         *[
             _format_verified(cfg, effective_prompt, chunk, semaphore, stats, 0)
@@ -932,6 +969,70 @@ async def format_text(config: AIConfig, text: str, prompt: str | None = None) ->
         model=stats.model or cfg.model,
         tokens_used=stats.tokens_used,
     )
+
+
+def _translation_looks_complete(source: str, result: str) -> bool:
+    """Heuristic completeness check for a translation of *source*.
+
+    Meaning changes across languages, so a translation cannot be content-verified
+    like /format.  This only rejects clearly broken output: blank text, or output
+    whose word content is far too short for the source (what a silent drop
+    produces).  ``finish_reason == "length"`` remains the primary signal.
+    """
+    if not result.strip():
+        return False
+    source_content = _content_only(source)
+    if not source_content:
+        return True  # punctuation/symbols only; any non-blank output is fine
+    result_content = _content_only(result)
+    minimum = max(2, int(len(source_content) * TRANSLATE_MIN_OUTPUT_RATIO))
+    return len(result_content) >= minimum
+
+
+async def _translate_verified(
+    config: AIConfig,
+    prompt: str,
+    chunk: str,
+    semaphore: asyncio.Semaphore,
+    stats: _CompletionStats,
+    depth: int,
+) -> tuple[str, bool]:
+    """Translate one chunk, never silently returning a truncated translation.
+
+    Returns the translated text and whether the source-text floor was applied.
+    A chunk the provider cut off (``finish_reason == "length"``) or returned
+    implausibly short is split at a sentence boundary and retried; once it is too
+    small to split, its *source* text is returned instead of a truncated result.
+    """
+    if not chunk.strip():
+        return chunk, False
+    async with semaphore:
+        completion = await _request_chat_completion(
+            config,
+            [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": chunk},
+            ],
+            idempotency_key=_chunk_idempotency_key(chunk, "translate"),
+        )
+    stats.record(completion)
+
+    if completion.finish_reason != "length" and _translation_looks_complete(chunk, completion.text):
+        return completion.text, False
+    if len(chunk) <= TRANSLATE_MIN_CHUNK_CHARS or depth >= TRANSLATE_MAX_DEPTH:
+        return chunk, True  # floor: keep the source rather than drop meaning
+
+    parts = [part for part in _split_in_half(chunk) if part.strip()]
+    if len(parts) < 2:
+        return chunk, True
+    repaired = await asyncio.gather(
+        *[
+            _translate_verified(config, prompt, part, semaphore, stats, depth + 1)
+            for part in parts
+        ]
+    )
+    joined = "\n\n".join(part.strip() for part, _ in repaired if part.strip())
+    return joined, any(floor for _, floor in repaired)
 
 
 def _error_payload(error: str) -> dict[str, str | int | None]:
