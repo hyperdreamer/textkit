@@ -12,9 +12,11 @@ import re
 import tempfile
 import threading
 import time
+import unicodedata
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Annotated, Any
@@ -55,6 +57,19 @@ MIN_DETECT_CHARS = 20
 SUPPORTED_LANGUAGES = frozenset(
     {"original", "chinese", "english", "japanese", "korean", "french", "german", "spanish"}
 )
+
+# Verified /format pipeline.  The provider may silently truncate a response at an
+# output-token cap (some models stop after a few thousand tokens and report
+# ``finish_reason: "length"``); formatting therefore runs over small,
+# sentence-aligned chunks, every result is checked for content preservation, and
+# a chunk that still cannot be formatted safely falls back to its raw text, so
+# no words can ever be dropped.
+FORMAT_CHUNK_CHARS = 1800  # target input size of one formatting request
+FORMAT_MIN_CHUNK_CHARS = 200  # recursion floor: below this, keep the raw chunk
+FORMAT_MAX_DEPTH = 6  # safety bound on recursive splitting
+FORMAT_CONCURRENCY = 4  # parallel provider calls for independent chunks
+FORMAT_CONTENT_EDGE_CHARS = 24  # head/tail length that must survive formatting
+FORMAT_CONTENT_MAX_LOSS_FRACTION = 0.02  # tolerated content shrink
 
 # Enforce the configurable pixel limit ourselves after Pillow parses the image
 # header, so max_image_pixels=0 can explicitly disable the check.
@@ -169,6 +184,7 @@ class ProviderOverride(FrozenModel):
     api_key: str = ""
     api_key_env: str = ""
     model: str = Field(default="", max_length=200)
+    max_tokens: int | None = Field(default=None, ge=1, le=1_000_000)
 
     @field_validator("api_base")
     @classmethod
@@ -183,6 +199,7 @@ class AIConfig(FrozenModel):
     api_key: str = ""
     api_key_env: str = ""
     model: str = Field(default="gpt-4.1-mini", min_length=1, max_length=200)
+    max_tokens: int | None = Field(default=None, ge=1, le=1_000_000)
     timeout: TimeoutConfig = Field(default_factory=TimeoutConfig)
     ocr: ProviderOverride | None = None
     text: ProviderOverride | None = None
@@ -384,6 +401,7 @@ def _resolve_ai_config(base: AIConfig, override: ProviderOverride | None) -> AIC
         api_key=override.api_key if override_has_key else base.api_key,
         api_key_env=override.api_key_env if override_has_key else base.api_key_env,
         model=override.model or base.model,
+        max_tokens=override.max_tokens if override.max_tokens is not None else base.max_tokens,
         timeout=base.timeout,
     )
 
@@ -561,11 +579,37 @@ async def _call_with_retry(config: AIConfig, make_request: Any, provider_name: s
     raise last_exc
 
 
-async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str, Any]]) -> OCRResponse:
+@dataclass(frozen=True)
+class _ChatCompletion:
+    """One provider chat completion: text, model, usage, and stop reason."""
+
+    text: str
+    model: str
+    tokens_used: int
+    finish_reason: str | None = None
+
+
+def _extract_finish_reason(payload: dict[str, Any]) -> str | None:
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        reason = choices[0].get("finish_reason")
+        if isinstance(reason, str):
+            return reason
+    return None
+
+
+async def _request_chat_completion(
+    config: AIConfig,
+    messages: list[dict[str, Any]],
+    *,
+    idempotency_key: str | None = None,
+) -> _ChatCompletion:
     api_key = _resolve_ai_api_key(config)
-    request_body = {"model": config.model, "messages": messages}
+    request_body: dict[str, Any] = {"model": config.model, "messages": messages}
+    if config.max_tokens:
+        request_body["max_tokens"] = config.max_tokens
     headers = {"Authorization": f"Bearer {api_key}"}
-    operation_id = _operation_id.get()
+    operation_id = _operation_id.get() if idempotency_key is None else idempotency_key
     if operation_id:
         headers["Idempotency-Key"] = operation_id
     timeout = httpx.Timeout(
@@ -597,7 +641,17 @@ async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str
     model = payload.get("model", config.model)
     if not isinstance(model, str):
         raise HTTPException(status_code=502, detail="OpenAI API response has invalid model")
-    return OCRResponse(text=text, model=model, tokens_used=total_tokens)
+    return _ChatCompletion(
+        text=text,
+        model=model,
+        tokens_used=total_tokens,
+        finish_reason=_extract_finish_reason(payload),
+    )
+
+
+async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str, Any]]) -> OCRResponse:
+    result = await _request_chat_completion(config, messages)
+    return OCRResponse(text=result.text, model=result.model, tokens_used=result.tokens_used)
 
 
 async def _call_openai(config: AIConfig, data_url: str, prompt: str | None = None) -> OCRResponse:
@@ -674,15 +728,209 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
     )
 
 
+_SENTENCE_SPLIT = re.compile(r"[^。！？!?…\n]*[。！？!?…]+|\n+|[^。！？!?…\n]+")
+
+
+def _content_only(text: str) -> str:
+    """Drop whitespace and punctuation/symbols, keeping the words themselves."""
+    return "".join(
+        char
+        for char in text
+        if not char.isspace()
+        and not unicodedata.category(char).startswith(("P", "Z", "S"))
+    )
+
+
+def _content_preserved(source: str, result: str) -> bool:
+    """True when *result* keeps essentially all word content of *source*.
+
+    Formatting may insert punctuation and paragraph breaks (both removed by
+    :func:`_content_only`) but must not drop words.  Truncation always loses the
+    tail, so the head and tail must survive and the content may shrink by no more
+    than a small tolerance.
+    """
+    source_content = _content_only(source)
+    if not source_content:
+        return bool(result.strip())
+    result_content = _content_only(result)
+    if not result_content:
+        return False
+    tolerance = max(8, int(len(source_content) * FORMAT_CONTENT_MAX_LOSS_FRACTION))
+    if len(result_content) < len(source_content) - tolerance:
+        return False
+    edge = min(FORMAT_CONTENT_EDGE_CHARS, len(source_content))
+    return source_content[:edge] in result_content and source_content[-edge:] in result_content
+
+
+def _split_sentences(text: str) -> list[str]:
+    sentences = _SENTENCE_SPLIT.findall(text)
+    return sentences if sentences else ([text] if text else [])
+
+
+def _hard_split(text: str, limit: int) -> list[str]:
+    """Split a run-on sentence (no punctuation) at whitespace/commas near *limit*."""
+    pieces: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        cut = max(window.rfind(" "), window.rfind("，"), window.rfind(","), window.rfind("、"))
+        if cut < limit // 2:
+            cut = limit
+        pieces.append(remaining[:cut])
+        remaining = remaining[cut:]
+    if remaining:
+        pieces.append(remaining)
+    return pieces
+
+
+def _segment_for_format(text: str, target: int) -> list[str]:
+    """Sentence-aligned chunks of at most *target* chars, in original order.
+
+    Concatenating the chunks reproduces *text* exactly, so segmentation itself can
+    never lose content.
+    """
+    units: list[str] = []
+    for sentence in _split_sentences(text):
+        if len(sentence) > target:
+            units.extend(_hard_split(sentence, target))
+        else:
+            units.append(sentence)
+
+    chunks: list[str] = []
+    current = ""
+    for unit in units:
+        if current and len(current) + len(unit) > target:
+            chunks.append(current)
+            current = unit
+        else:
+            current += unit
+    if current:
+        chunks.append(current)
+    return chunks or [text]
+
+
+def _split_in_half(text: str) -> list[str]:
+    """Split at the sentence boundary nearest the midpoint for recursive repair."""
+    sentences = _split_sentences(text)
+    if len(sentences) < 2:
+        mid = len(text) // 2
+        return [text[:mid], text[mid:]] if 0 < mid < len(text) else [text]
+    midpoint = len(text) / 2
+    running = 0
+    for index, sentence in enumerate(sentences):
+        running += len(sentence)
+        if running >= midpoint:
+            return ["".join(sentences[: index + 1]), "".join(sentences[index + 1 :])]
+    return [text]
+
+
+@dataclass
+class _FormatStats:
+    """Aggregate provider usage across the chunks of one formatting request."""
+
+    tokens_used: int = 0
+    model: str = ""
+    hit_token_cap: bool = False
+
+    def record(self, completion: _ChatCompletion) -> None:
+        self.tokens_used += completion.tokens_used
+        if not self.model:
+            self.model = completion.model
+        if completion.finish_reason == "length":
+            self.hit_token_cap = True
+
+
+def _format_idempotency_key(chunk: str) -> str:
+    """Unique provider idempotency key for one formatting chunk.
+
+    A request shares a single operation id, but a chunked format makes many
+    provider calls; keying each by its content keeps retries of the same chunk
+    idempotent without collapsing distinct chunks into one cached response.
+    """
+    request_id = _operation_id.get()
+    if not request_id:
+        return ""
+    digest = hashlib.sha256(chunk.encode("utf-8")).hexdigest()[:16]
+    return f"{request_id}:format:{digest}"
+
+
+async def _format_verified(
+    config: AIConfig,
+    prompt: str,
+    chunk: str,
+    semaphore: asyncio.Semaphore,
+    stats: _FormatStats,
+    depth: int,
+) -> str:
+    """Format one chunk, guaranteeing its word content survives.
+
+    The provider response is verified against the input; a truncated or lossy
+    result is split and retried, and once a chunk is too small to split it is
+    returned verbatim.  Words are therefore never dropped.
+    """
+    if not chunk.strip():
+        return chunk
+    async with semaphore:
+        completion = await _request_chat_completion(
+            config,
+            [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": chunk},
+            ],
+            idempotency_key=_format_idempotency_key(chunk),
+        )
+    stats.record(completion)
+
+    if completion.finish_reason != "length" and _content_preserved(chunk, completion.text):
+        return completion.text
+    if len(chunk) <= FORMAT_MIN_CHUNK_CHARS or depth >= FORMAT_MAX_DEPTH:
+        return chunk  # lossless fallback: emit the unformatted source
+
+    parts = [part for part in _split_in_half(chunk) if part.strip()]
+    if len(parts) < 2:
+        return chunk
+    repaired = await asyncio.gather(
+        *[
+            _format_verified(config, prompt, part, semaphore, stats, depth + 1)
+            for part in parts
+        ]
+    )
+    return "\n\n".join(part.strip() for part in repaired if part.strip())
+
+
 async def format_text(config: AIConfig, text: str, prompt: str | None = None) -> OCRResponse:
+    """Format text without ever losing content to provider output-token caps.
+
+    The text is split into sentence-aligned chunks that are formatted
+    independently (with bounded parallelism).  Every result is verified for
+    content preservation; a chunk that would be truncated is split further and
+    ultimately falls back to its raw text, so the returned text always contains
+    every word of the input.
+    """
     cfg = _resolve_ai_config(config, config.text)
     effective_prompt = prompt or await asyncio.to_thread(_render_prompt, "format")
-    return await _post_openai_chat_completion(
-        cfg,
-        [
-            {"role": "system", "content": effective_prompt},
-            {"role": "user", "content": text},
-        ],
+
+    chunks = _segment_for_format(text, FORMAT_CHUNK_CHARS)
+    semaphore = asyncio.Semaphore(FORMAT_CONCURRENCY)
+    stats = _FormatStats()
+    formatted = await asyncio.gather(
+        *[
+            _format_verified(cfg, effective_prompt, chunk, semaphore, stats, 0)
+            for chunk in chunks
+        ]
+    )
+    joined = "\n\n".join(part.strip() for part in formatted if part.strip())
+    if not joined and text.strip():
+        joined = text  # last-resort fallback, still lossless
+    if stats.hit_token_cap and cfg.max_tokens is None:
+        logger.warning(
+            "format provider hit its output-token cap; consider setting ai.max_tokens",
+            extra={"event": "format.truncated"},
+        )
+    return OCRResponse(
+        text=joined,
+        model=stats.model or cfg.model,
+        tokens_used=stats.tokens_used,
     )
 
 

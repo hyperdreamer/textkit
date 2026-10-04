@@ -49,6 +49,11 @@ ai:
   # Vision-capable model name to use when no per-task override specifies one.
   model: "gpt-4.1-mini"
 
+  # Optional completion-token cap sent as ``max_tokens``.  Set it when a
+  # reasoning model exhausts a provider default and truncates long output; the
+  # /format pipeline also recovers from truncation by splitting the text.
+  # max_tokens: 32000
+
   # Per-task model/API overrides (optional).  Every field is optional — empty
   # fields inherit from the parent ``ai`` section.  You can override the model
   # or API endpoint for a specific task.
@@ -58,6 +63,7 @@ ai:
   #
   # text:                   # text-processing overrides (dedup + translate + format)
   #   api_base: "https://other-proxy.example.com"
+  #   max_tokens: 32000     # completion-token cap for text tasks
   #   api_key: "$OTHER_PROXY_API_KEY"
   #   model: "claude-sonnet-4-20250514"
 
