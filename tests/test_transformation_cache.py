@@ -160,6 +160,15 @@ class RecordingConnection:
         self._real.close()
 
 
+class CloseFailingConnection(RecordingConnection):
+    """Raises a SQLite failure after closing to exercise cleanup handling."""
+
+    def close(self) -> None:
+        self.closed = True
+        self._real.close()
+        raise sqlite3.OperationalError("close failed")
+
+
 class BlockingConnection(RecordingConnection):
     """Blocks inside a chosen statement until the test releases it."""
 
@@ -427,6 +436,26 @@ def test_initialize_creates_exact_version_one_schema(db_path: Path, executor) ->
             )
 
 
+def test_existing_schema_validation_runs_inside_maintenance_transaction(
+    db_path: Path, executor, monkeypatch
+) -> None:
+    cache = make_cache(db_path, executor)
+    assert asyncio.run(cache.initialize(FakePolicy())).status == "ready"
+
+    connections = install_connections(monkeypatch, RecordingConnection)
+    result = asyncio.run(cache.initialize(FakePolicy()))
+    assert (result.status, result.reason) == ("ready", None)
+
+    statements = connections[0].statements
+    begin = statements.index("BEGIN IMMEDIATE")
+    validation = [
+        index for index, statement in enumerate(statements)
+        if statement == "PRAGMA user_version"
+    ]
+    assert len(validation) >= 2
+    assert any(index > begin for index in validation)
+
+
 def test_empty_version_zero_database_is_initialized_transactionally(
     db_path: Path, executor, monkeypatch
 ) -> None:
@@ -471,6 +500,30 @@ def test_empty_version_zero_database_is_initialized_transactionally(
         assert conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] == 0
 
 
+@POSIX_ONLY
+def test_incompatible_permissive_file_is_rejected_without_metadata_mutation(
+    db_path: Path, executor, monkeypatch
+) -> None:
+    with contextlib.closing(raw_connect(db_path)) as conn:
+        conn.execute(
+            "CREATE TABLE transformation_cache (cache_key TEXT, output_text TEXT)"
+        )
+        conn.execute("PRAGMA user_version = 1")
+    os.chmod(db_path, 0o644)
+    before_bytes = db_path.read_bytes()
+    before_stat = db_path.stat()
+    connections = install_connections(monkeypatch, RecordingConnection)
+
+    result = asyncio.run(make_cache(db_path, executor).initialize(FakePolicy()))
+
+    assert (result.status, result.reason) == ("unavailable", "permission")
+    assert connections == []
+    after_stat = db_path.stat()
+    assert db_path.read_bytes() == before_bytes
+    assert stat.S_IMODE(after_stat.st_mode) == 0o644
+    assert after_stat.st_ino == before_stat.st_ino
+
+
 def test_incompatible_schema_returns_schema_without_recreating_file(
     db_path: Path, executor
 ) -> None:
@@ -496,6 +549,33 @@ def test_incompatible_schema_returns_schema_without_recreating_file(
             row[1] for row in conn.execute("PRAGMA table_info(transformation_cache)")
         ] == ["cache_key", "output_text"]
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
+def test_extra_schema_constraint_returns_schema_without_touching_file(
+    db_path: Path, executor
+) -> None:
+    with contextlib.closing(raw_connect(db_path)) as conn:
+        conn.execute(
+            "CREATE TABLE transformation_cache ("
+            "cache_key TEXT NOT NULL PRIMARY KEY,"
+            "operation TEXT NOT NULL CHECK (operation IN ('format', 'translate')),"
+            "output_text TEXT NOT NULL,"
+            "model TEXT NOT NULL,"
+            "generation_tokens INTEGER NOT NULL CHECK (generation_tokens >= 0),"
+            "generated_at REAL NOT NULL CHECK (generated_at >= 0),"
+            "CHECK (length(output_text) > 0)"
+            ")"
+        )
+        conn.execute(
+            "CREATE INDEX idx_transformation_cache_generation "
+            "ON transformation_cache (generated_at ASC, cache_key ASC)"
+        )
+        conn.execute("PRAGMA user_version = 1")
+    os.chmod(db_path, 0o600)
+
+    result = asyncio.run(make_cache(db_path, executor).initialize(FakePolicy()))
+
+    assert (result.status, result.reason) == ("unavailable", "schema")
 
 
 def test_unexpected_application_table_returns_schema_without_touching_file(
@@ -616,6 +696,28 @@ def test_capacity_evicts_oldest_with_key_tie_breaker(db_path: Path, executor) ->
     assert asyncio.run(cache.read(KEY_E, small, now=generation_now)).status == "hit"
     assert asyncio.run(cache.read(KEY_D, small, now=generation_now)).status == "miss"
     assert asyncio.run(cache.read(KEY_ZERO, small, now=generation_now)).status == "miss"
+
+
+def test_write_enforces_capacity_immediately(db_path: Path, executor) -> None:
+    cache = make_cache(db_path, executor)
+    policy = FakePolicy(max_entries=2)
+
+    for key, generated_at in (
+        (KEY_A, BASE_NOW - 300),
+        (KEY_B, BASE_NOW - 200),
+        (KEY_C, BASE_NOW - 100),
+    ):
+        assert asyncio.run(
+            cache.write(
+                key,
+                record(key, generated_at=generated_at),
+                policy,
+                now=BASE_NOW,
+            )
+        ).status == "stored"
+        assert row_count(db_path) <= policy.max_entries
+
+    assert row_count(db_path) == 2
 
 
 def test_capacity_is_shared_between_operations_on_read_and_write(
@@ -826,15 +928,26 @@ def test_disabled_policy_retains_rows_and_does_no_database_work(
 
 
 @POSIX_ONLY
-def test_wal_sidecars_are_private_after_a_real_write(db_path: Path, executor) -> None:
-    # a pre-existing permissive database is narrowed before SQLite opens it
+def test_wal_sidecars_are_private_after_a_real_write(
+    db_path: Path, executor, monkeypatch
+) -> None:
+    # An existing permissive database is rejected rather than narrowed.
     with contextlib.closing(raw_connect(db_path)):
         pass
     os.chmod(db_path, 0o644)
+    before_bytes = db_path.read_bytes()
+    before_stat = db_path.stat()
+    connections = install_connections(monkeypatch, RecordingConnection)
 
     cache = make_cache(db_path, executor)
+    rejected = asyncio.run(cache.initialize(FakePolicy()))
+    assert (rejected.status, rejected.reason) == ("unavailable", "permission")
+    assert connections == []
+    assert db_path.read_bytes() == before_bytes
+    assert stat.S_IMODE(db_path.stat().st_mode) == stat.S_IMODE(before_stat.st_mode) == 0o644
+
+    os.chmod(db_path, 0o600)
     assert asyncio.run(cache.initialize(FakePolicy())).status == "ready"
-    assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
 
     witness = raw_connect(db_path)
     try:
@@ -858,8 +971,11 @@ def test_wal_sidecars_are_private_after_a_real_write(db_path: Path, executor) ->
 
 
 @POSIX_ONLY
-def test_sidecars_are_narrowed_and_symlinks_are_rejected(db_path: Path, executor) -> None:
+def test_permissive_sidecars_and_symlinks_are_rejected(
+    db_path: Path, executor, monkeypatch
+) -> None:
     cache = make_cache(db_path, executor)
+    connections = install_connections(monkeypatch, RecordingConnection)
     assert asyncio.run(cache.initialize(FakePolicy())).status == "ready"
     # keep the WAL and SHM sidecars alive with a second connection
     witness = raw_connect(db_path)
@@ -870,22 +986,27 @@ def test_sidecars_are_narrowed_and_symlinks_are_rejected(db_path: Path, executor
         shm = db_path.with_name(db_path.name + "-shm")
         assert wal.exists() and shm.exists()
 
-        # a permissive sidecar is narrowed to 0600 rather than rejected
+        # a permissive sidecar is rejected without opening the database
         os.chmod(wal, 0o666)
         os.chmod(shm, 0o666)
-        narrowed = asyncio.run(cache.read(KEY_A, FakePolicy(), now=BASE_NOW))
-        assert narrowed.status == "hit"
-        assert stat.S_IMODE(os.lstat(wal).st_mode) == 0o600
-        assert stat.S_IMODE(os.lstat(shm).st_mode) == 0o600
+        connection_count = len(connections)
+        rejected = asyncio.run(cache.read(KEY_A, FakePolicy(), now=BASE_NOW))
+        assert (rejected.status, rejected.reason) == ("unavailable", "permission")
+        assert len(connections) == connection_count
+        assert stat.S_IMODE(os.lstat(wal).st_mode) == 0o666
+        assert stat.S_IMODE(os.lstat(shm).st_mode) == 0o666
 
         # a symlinked sidecar is refused rather than followed to another file
+        os.chmod(wal, 0o600)
         os.unlink(shm)
         target = db_path.with_name("attacker-controlled-shm")
         target.write_bytes(b"")
         os.chmod(target, 0o600)
         os.symlink(target, shm)
+        connection_count = len(connections)
         symlinked = asyncio.run(cache.read(KEY_A, FakePolicy(), now=BASE_NOW))
         assert (symlinked.status, symlinked.reason) == ("unavailable", "permission")
+        assert len(connections) == connection_count
     finally:
         witness.close()
 
@@ -1074,6 +1195,18 @@ def test_eligible_write_may_finish_after_caller_cancellation(
     assert (result.status, result.record.text) == ("hit", stored_text)
 
 
+def test_unexpected_worker_failure_is_allowlisted(
+    db_path: Path, executor, monkeypatch
+) -> None:
+    def exploding_opener(path):
+        raise RuntimeError("worker secret should not escape")
+
+    monkeypatch.setattr(transformation_cache, "_open_connection", exploding_opener)
+    result = asyncio.run(make_cache(db_path, executor).read(KEY_A, FakePolicy()))
+
+    assert (result.status, result.reason) == ("unavailable", "corrupt")
+
+
 def test_cache_work_does_not_block_the_event_loop(db_path: Path, executor, monkeypatch) -> None:
     def factory(real):
         return SlowConnection(real, delay=0.05)
@@ -1150,6 +1283,7 @@ def test_permission_schema_and_corrupt_failures_are_allowlisted(
     with contextlib.closing(raw_connect(versioned)) as conn:
         conn.execute("CREATE TABLE transformation_cache (cache_key TEXT)")
         conn.execute("PRAGMA user_version = 2")
+    os.chmod(versioned, 0o600)
     schema = asyncio.run(
         TransformationCache(versioned, clock=FakeClock(), executor=executor).initialize(FakePolicy())
     )
@@ -1175,6 +1309,24 @@ class CapturingHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         self.records.append(record)
+
+
+def test_cleanup_failure_is_mapped_once(
+    db_path: Path, executor, monkeypatch, caplog
+) -> None:
+    install_connections(monkeypatch, CloseFailingConnection)
+    caplog.set_level(logging.WARNING, logger=transformation_cache.logger.name)
+
+    result = asyncio.run(make_cache(db_path, executor).initialize(FakePolicy()))
+
+    assert (result.status, result.reason) == ("unavailable", "corrupt")
+    cache_records = [
+        item for item in caplog.records
+        if item.name == transformation_cache.logger.name
+    ]
+    assert len(cache_records) == 1
+    assert cache_records[0].getMessage() == transformation_cache.FAILURE_MESSAGE
+    assert cache_records[0].reason == "corrupt"
 
 
 @POSIX_ONLY

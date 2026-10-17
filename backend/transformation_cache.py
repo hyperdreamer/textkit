@@ -98,15 +98,6 @@ _EXPECTED_COLUMNS = [
     (5, "generated_at", "REAL", 1, None, 0),
 ]
 
-_EXPECTED_DDL_FRAGMENTS = (
-    "cache_key TEXT NOT NULL PRIMARY KEY",
-    "operation TEXT NOT NULL CHECK (operation IN ('format', 'translate'))",
-    "output_text TEXT NOT NULL",
-    "model TEXT NOT NULL",
-    "generation_tokens INTEGER NOT NULL CHECK (generation_tokens >= 0)",
-    "generated_at REAL NOT NULL CHECK (generated_at >= 0)",
-)
-
 _EXPECTED_INDEX_COLUMNS = [("generated_at", 0), ("cache_key", 0)]
 
 _DELETE_EXPIRED_SQL = f"DELETE FROM {TABLE_NAME} WHERE generated_at <= ?"
@@ -481,7 +472,7 @@ def _guarded(
 
     try:
         return operation(*args)
-    except (sqlite3.Error, OSError, _CacheFailure) as exc:
+    except Exception as exc:
         reason = _sanitize(exc, deadline)
         if reason != "timeout":
             _log_failure(reason)
@@ -559,6 +550,7 @@ def _write_sync(
                     stored.generated_at,
                 ),
             )
+            _enforce_capacity(connection, deadline, max_entries)
         return CacheWriteResult(status="stored")
     finally:
         _safe_close(connection)
@@ -668,14 +660,7 @@ def _ensure_private(path: Path, info: os.stat_result) -> None:
         return
     if info.st_uid != euid:
         raise _CacheFailure("permission")
-    if stat.S_IMODE(info.st_mode) == _PRIVATE_MODE:
-        return
-    try:
-        os.chmod(path, _PRIVATE_MODE)
-        narrowed = os.lstat(path)
-    except OSError as exc:
-        raise _CacheFailure("permission") from exc
-    if stat.S_IMODE(narrowed.st_mode) != _PRIVATE_MODE:
+    if stat.S_IMODE(info.st_mode) != _PRIVATE_MODE:
         raise _CacheFailure("permission")
 
 
@@ -725,7 +710,7 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
     owned = [row for row in index_rows if str(row[1]) == INDEX_NAME]
     if len(owned) != 1:
         raise _CacheFailure("schema")
-    if int(owned[0][2]) != 0 or str(owned[0][3]) != "c":
+    if int(owned[0][2]) != 0 or str(owned[0][3]) != "c" or int(owned[0][4]) != 0:
         raise _CacheFailure("schema")
     index_columns = [
         (str(row[2]), int(row[3]))
@@ -735,18 +720,21 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
     if index_columns != _EXPECTED_INDEX_COLUMNS:
         raise _CacheFailure("schema")
 
-    ddl_row = connection.execute(
+    table_sql = connection.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (TABLE_NAME,)
     ).fetchone()
-    if ddl_row is None or ddl_row[0] is None:
+    if table_sql is None or table_sql[0] is None:
         raise _CacheFailure("schema")
-    # Compare with all whitespace removed so a logically identical schema with
-    # different line breaks or spacing is still recognised; every declared
-    # type, NOT NULL flag, PRIMARY KEY, and CHECK expression must match exactly.
-    normalized = _squash(str(ddl_row[0]))
-    for fragment in _EXPECTED_DDL_FRAGMENTS:
-        if _squash(fragment) not in normalized:
-            raise _CacheFailure("schema")
+    if _squash(str(table_sql[0])) != _squash(_CREATE_TABLE_SQL):
+        raise _CacheFailure("schema")
+
+    index_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", (INDEX_NAME,)
+    ).fetchone()
+    if index_sql is None or index_sql[0] is None:
+        raise _CacheFailure("schema")
+    if _squash(str(index_sql[0])) != _squash(_CREATE_INDEX_SQL):
+        raise _CacheFailure("schema")
 
 
 def _squash(text: str) -> str:
@@ -789,34 +777,38 @@ def _rollback(connection: sqlite3.Connection) -> None:
 
 
 def _safe_close(connection: sqlite3.Connection) -> None:
-    try:
-        connection.close()
-    except sqlite3.Error:  # pragma: no cover - defensive
-        _log_failure("corrupt")
+    """Close the worker connection, letting cleanup failures reach the guard."""
+
+    connection.close()
 
 
 def _maintain(
     connection: sqlite3.Connection,
     deadline: float,
-    needs_creation: bool,
+    _needs_creation: bool,
     now: float,
     ttl_days: int,
     max_entries: int,
 ) -> None:
-    """Create the schema when needed, then prune expired rows and evict excess."""
+    """Validate or create the schema, then prune expired rows and evict excess."""
 
-    if needs_creation:
-        # Re-inspect under the immediate transaction: a concurrent first-time
-        # worker may already have created the schema while this one waited for
-        # the write lock.  Creating unconditionally would turn a benign race
-        # into a spurious failure.
-        _check_deadline(deadline)
-        if _inspect_schema(connection):
-            _create_schema(connection)
+    # Always re-inspect inside the operation transaction.  The preflight in
+    # _connect protects incompatible files from WAL changes; this validation
+    # protects the maintenance and lookup/upsert against a schema race.
+    _check_deadline(deadline)
+    if _inspect_schema(connection):
+        _create_schema(connection)
 
     cutoff = now - ttl_days * SECONDS_PER_DAY
     _check_deadline(deadline)
     connection.execute(_DELETE_EXPIRED_SQL, (cutoff,))
+    _enforce_capacity(connection, deadline, max_entries)
+
+
+def _enforce_capacity(
+    connection: sqlite3.Connection, deadline: float, max_entries: int
+) -> None:
+    """Delete the deterministic oldest rows until the configured bound holds."""
 
     _check_deadline(deadline)
     row_count = int(_scalar(connection.execute(_COUNT_ROWS_SQL)))
