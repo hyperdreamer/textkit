@@ -29,6 +29,11 @@ venv/
 ENV/
 env/
 
+# TextKit transformation cache: local output data, never commit
+backend/transformation_cache.db
+backend/transformation_cache.db-wal
+backend/transformation_cache.db-shm
+
 # Node and browser extension dependencies/build output
 node_modules/
 npm-debug.log*

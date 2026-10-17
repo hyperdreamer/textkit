@@ -120,6 +120,7 @@ Translates text to a target language.
 - `text` (string, required) — the text to translate.
 - `language` (string, required) — target language, e.g. `"Chinese"`, `"English"`.
 - `prompt` (string, optional) — custom system prompt that overrides the default translation prompt. The backend uses custom prompts verbatim; the extension replaces `{language}` with the selected language before sending one.
+- `force` (boolean, optional) — default `false`. `true` skips the completed-result cache lookup for this request. See [Format and translation result cache](#format-and-translation-result-cache).
 
 ```sh
 curl -X POST "http://localhost:8765/translate" \
@@ -142,6 +143,7 @@ Formats text using a user-provided custom AI prompt. Designed to run on the *out
 **Request:** JSON body with fields:
 - `text` (string, required) — the text to format.
 - `prompt` (string, optional) — custom system prompt that overrides the default format prompt. When omitted, the backend uses `backend/prompts/format.txt` when present, otherwise its nonempty built-in readability prompt. Examples: `"Convert to ALL CAPS"`, `"Reformat as clean Markdown with headings and bullet points"`, `"Summarise this text in 3 bullet points"`.
+- `force` (boolean, optional) — default `false`. `true` skips the completed-result cache lookup for this request. See [Format and translation result cache](#format-and-translation-result-cache).
 
 ```sh
 curl -X POST "http://localhost:8765/format" \
@@ -150,6 +152,35 @@ curl -X POST "http://localhost:8765/format" \
 ```
 
 Uses the same AI text provider as `/translate` and `/dedup` (`config.text` override if configured).
+
+### Format and translation result cache
+
+`POST /format` and `POST /translate` store completed results in a local SQLite cache owned entirely by the backend. A cache hit makes no provider call, and the extension needs no new controls to benefit from it.
+
+Only an identical request identity reuses an entry: the operation, the exact input text (no trimming or Unicode normalization), the effective prompt after the three-tier precedence below, the effective text-provider endpoint and model after `config.text` inheritance, the completion-token cap, the target language for translation, and internal cache-format and pipeline revisions. A hit returns the stored output and the provider-reported model with `tokens_used` exactly `0`, because that request performed no provider calls; the original generation token count stays inside the stored row. API keys stay lazy, so a hit never needs a credential.
+
+Both endpoints accept an optional JSON field `force` (default `false`, strict Boolean):
+
+- `force: false` — schema validation and maintenance, then a completed-result lookup.
+- `force: true` — schema validation and maintenance only; the completed-result lookup is skipped, so a fresh eligible generation is produced and stored.
+
+Force bypasses only TextKit's completed-result lookup. It does not bypass admission, body-size, rate/concurrency, or operation-ID checks, input and prompt validation, the translation skip gate, or provider-side idempotency. Retrying with the same `X-TextKit-Operation-Id` can still reuse a provider response; use a new operation ID for a genuinely fresh logical attempt.
+
+Successful `/format` and `/translate` responses carry exactly one `X-TextKit-Cache` header. The first matching row wins:
+
+| Header value | Meaning |
+| --- | --- |
+| `skipped` | `/translate` returned through the existing language skip gate; no cache access occurred. |
+| `disabled` | The request's cache policy has `enabled` set to `false`; no cache access occurred. |
+| `hit` | A non-expired completed row matched and was returned; no provider call occurred. |
+| `error` | A cache operation failed or exceeded its time budget. The provider result is still returned unchanged, and no further cache work happens for that request. This does not claim the provider failed. |
+| `uncacheable` | The provider succeeded but the result was empty or known degraded (for example a chunk that fell back to its source text), so nothing was stored. |
+| `refresh` | A forced request generated and successfully stored a fresh eligible result. |
+| `miss` | An ordinary eligible miss generated and successfully stored a result. |
+
+Non-success responses, including provider errors, carry no cache header, and no other endpoint adds one. Existing JSON shapes, including the translation skip fields, are unchanged.
+
+`force` is additive: ordinary clients may omit it and stay compatible with an older TextKit that does not know the field. Forced requests require the updated TextKit backend; an older backend rejects the unknown field with its normal validation error, which is surfaced rather than silently retried without Force. Because YT2TXT may send `force`, deploy the updated TextKit before YT2TXT.
 
 ### Three-tier prompt precedence
 
@@ -235,6 +266,11 @@ ai:
   #   model: "gpt-4.1"
   # text:
   #   model: "gpt-4.1-mini"
+
+cache:
+  enabled: true
+  ttl_days: 30
+  max_entries: 1000
 ```
 
 Supported `ai` fields:
@@ -244,6 +280,14 @@ Supported `ai` fields:
 - `model`: the model name to send to the provider. Fallback model used for all operations unless per-task overrides are set.
 - `ocr` (optional): nested section to override model/endpoint for vision (OCR) requests. Fields: `api_base`, `api_key`, `model`. Empty fields inherit from the parent `ai` section.
 - `text` (optional): nested section to override model/endpoint for text processing (dedup, translation, and format). Same fields as `ocr`.
+
+Supported `cache` fields:
+
+- `enabled` (default `true`): Boolean only. `false` skips cache initialization, maintenance, lookup, and writes for requests that observe it and reports `X-TextKit-Cache: disabled`. Existing rows are retained, not erased.
+- `ttl_days` (default `30`): non-Boolean integer from 1 through 3650. An entry expires when `now >= generated_at + ttl_days * 86400`; reads never extend the window.
+- `max_entries` (default `1000`): non-Boolean integer from 1 through 100000, shared by `/format` and `/translate`. Above the limit, the oldest generation timestamps are evicted first, with the identity digest as a deterministic tie-breaker.
+
+The whole `cache` mapping, or any individual field, may be omitted and the defaults apply. `cache: null` is a configuration error, as are Boolean values for the two integers, fractional numbers, numeric strings, `null`, zero, negative, and out-of-range values. When caching is enabled, startup performs a best-effort initialization and pruning pass. A policy edit applies to the next request that observes it; requests already in flight keep their snapshot until they finish.
 
 The backend falls back to these environment variable names:
 
@@ -262,6 +306,23 @@ python main.py
 `main.py` reads `config.yaml` and starts Uvicorn with the configured `host` and `port`.
 
 `GET /healthz` returns `{"status":"ok"}` for local health checks. Logs are emitted as structured JSON.
+
+## Cache retention, privacy, and rollback
+
+The transformation cache is local shared storage, not a per-account or per-credential partition. Its behavior and limits:
+
+- Rows in `backend/transformation_cache.db` (SQLite, WAL mode) contain only the request identity digest, the operation, the output text, the provider-reported model, the original generation token count, and the UTC generation timestamp. Prompts, input text, API keys, authorization headers, credential-derived values, URLs, tab IDs, operation IDs, and readable configuration are never stored; the digest is the only representation of a request.
+- Output text is therefore retained on local disk. A credential rotation alone does not invalidate rows, because credentials are excluded from the identity entirely.
+- Disabling caching retains existing rows. Re-enabling applies the then-current TTL and capacity at the next enabled access. Requests that already started keep their own policy snapshot through their eventual write.
+- Logical expiry and capacity eviction remove availability, not filesystem bytes. They do not promise physical erasure or file shrinkage, and backups or filesystem snapshots can retain earlier copies of the output.
+- An incompatible or unrecognized schema is bypassed for that request (`X-TextKit-Cache: error`), never silently migrated, deleted, or recreated. The existing file is left untouched, and a later request retries safely, so repairing permissions, releasing a lock, or replacing a corrupt file restores cache use without restarting the backend.
+- `backend/transformation_cache.db`, `backend/transformation_cache.db-wal`, and `backend/transformation_cache.db-shm` are Git-ignored. Never commit them.
+- To remove the cache manually, stop the backend first, then delete the database and both `-wal`/`-shm` sidecars together. Removing only the main file while the backend runs can leave inconsistent sidecars behind.
+
+Rollback:
+
+1. Remove the whole `cache` stanza from `backend/config.yaml` before running an older TextKit. Its configuration model rejects unknown fields, so leaving the stanza in place prevents the old backend from starting.
+2. Decide separately whether to retain or delete `backend/transformation_cache.db`. It is local data; an older TextKit neither reads, migrates, nor recreates it.
 
 ## Extension
 
