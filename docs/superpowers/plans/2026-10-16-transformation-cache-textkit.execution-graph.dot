@@ -1,0 +1,15 @@
+digraph execution {
+  rankdir=LR;
+  subgraph cluster_textkit_sequential {
+    label="textkit-sequential";
+    "T-001" [label="Task 1: Build the Deep SQLite Transformation Cache\nCapable"];
+    "T-002" [label="Task 2: Resolve Strict Policy, Prompt, Provider, and Cache Identity Snapshots\nCapable"];
+    "T-003" [label="Task 3: Carry Cache Eligibility Through Verified Format and Translation Repair\nCapable"];
+    "T-004" [label="Task 4: Integrate Force, Cache Transactions, Headers, and Endpoint Ordering\nCapable"];
+    "T-005" [label="Task 5: Document Local Retention, Headers, Configuration, and Verification\nStandard"];
+  }
+  "T-001" -> "T-002";
+  "T-002" -> "T-003";
+  "T-003" -> "T-004";
+  "T-004" -> "T-005";
+}

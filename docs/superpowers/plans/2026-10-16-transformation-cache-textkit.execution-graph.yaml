@@ -1,0 +1,184 @@
+source_plan:
+  path: docs/superpowers/plans/2026-10-16-transformation-cache-textkit.md
+  sha256: ecd11d3fa8f6ccb0384852820f1e9af90a13e987d98989438140d7782ef01d46
+  commit_oid: 8ca01183b5e8354b5c5c1d3f48bb897582b40d65
+schema_version: 1
+lanes:
+  - id: textkit-sequential
+    task_ids: [T-001, T-002, T-003, T-004, T-005]
+    owns: ["backend/transformation_cache.py", "backend/main.py", "backend/config.example.yaml", ".gitignore", "README.md", "tests/test_transformation_cache.py", "tests/test_prompt_snapshot.py", "tests/test_format_pipeline.py", "tests/test_translate_pipeline.py", "tests/test_transformation_endpoints.py"]
+    resources: []
+produces:
+  - id: I-001
+    name: TransformationCache
+    signature: "TransformationCache = async initialize(policy, now), read(key, policy, now), and write(key, record, policy, now) over a private SQLite database, returning typed maintenance, read, and write outcomes without exposing SQL state."
+    sha256: 3d4b66abbfcdfe71d8c472b1204926ae6cc3ce811a2148b9f5596b5c586fadf9
+    producer: T-001
+  - id: I-002
+    name: ResolvedTextSettings
+    signature: "ResolvedTextSettings = frozen { config: AIConfig, prompt: str, provider_endpoint: str }; cache_identity(operation, input_text, language, settings, pipeline_revision) returns the approved canonical UTF-8 JSON SHA-256 digest."
+    sha256: 34cd2fef79a3769114522d5c88e9c6676dffe5094e55577288df506e987ba5a6
+    producer: T-002
+  - id: I-003
+    name: PipelineOutcome
+    signature: "PipelineOutcome = frozen { response: OCRResponse, eligible: bool, degraded: bool }; execute_format(settings, text) and execute_translate(settings, text, language) preserve acceptance metadata through recursive repair."
+    sha256: dd0c04322b6e6b0bd6cdaaf283f26f0fb9f6cdeb200f4bd4d23bc2a309ffcfda
+    producer: T-003
+  - id: I-004
+    name: TextKitTransformationEndpoint
+    signature: "TextKit transformation endpoints accept optional Boolean force=false, preserve existing JSON fields, and add successful-response X-TextKit-Cache values skipped, disabled, hit, error, uncacheable, refresh, or miss; non-success responses omit the header."
+    sha256: e9f24cb7fdfdc2c805b0ff6ed0cf285aba29dc559179e6277e866a69dd0dff60
+    producer: T-004
+consumes:
+  - id: I-001
+    name: TransformationCache
+    signature: "TransformationCache = async initialize(policy, now), read(key, policy, now), and write(key, record, policy, now) over a private SQLite database, returning typed maintenance, read, and write outcomes without exposing SQL state."
+    sha256: 3d4b66abbfcdfe71d8c472b1204926ae6cc3ce811a2148b9f5596b5c586fadf9
+    producer: T-001
+  - id: I-002
+    name: ResolvedTextSettings
+    signature: "ResolvedTextSettings = frozen { config: AIConfig, prompt: str, provider_endpoint: str }; cache_identity(operation, input_text, language, settings, pipeline_revision) returns the approved canonical UTF-8 JSON SHA-256 digest."
+    sha256: 34cd2fef79a3769114522d5c88e9c6676dffe5094e55577288df506e987ba5a6
+    producer: T-002
+  - id: I-003
+    name: PipelineOutcome
+    signature: "PipelineOutcome = frozen { response: OCRResponse, eligible: bool, degraded: bool }; execute_format(settings, text) and execute_translate(settings, text, language) preserve acceptance metadata through recursive repair."
+    sha256: dd0c04322b6e6b0bd6cdaaf283f26f0fb9f6cdeb200f4bd4d23bc2a309ffcfda
+    producer: T-003
+  - id: I-004
+    name: TextKitTransformationEndpoint
+    signature: "TextKit transformation endpoints accept optional Boolean force=false, preserve existing JSON fields, and add successful-response X-TextKit-Cache values skipped, disabled, hit, error, uncacheable, refresh, or miss; non-success responses omit the header."
+    sha256: e9f24cb7fdfdc2c805b0ff6ed0cf285aba29dc559179e6277e866a69dd0dff60
+    producer: T-004
+interfaces:
+  produces:
+    - id: I-001
+      name: TransformationCache
+      signature: "TransformationCache = async initialize(policy, now), read(key, policy, now), and write(key, record, policy, now) over a private SQLite database, returning typed maintenance, read, and write outcomes without exposing SQL state."
+      sha256: 3d4b66abbfcdfe71d8c472b1204926ae6cc3ce811a2148b9f5596b5c586fadf9
+      producer: T-001
+    - id: I-002
+      name: ResolvedTextSettings
+      signature: "ResolvedTextSettings = frozen { config: AIConfig, prompt: str, provider_endpoint: str }; cache_identity(operation, input_text, language, settings, pipeline_revision) returns the approved canonical UTF-8 JSON SHA-256 digest."
+      sha256: 34cd2fef79a3769114522d5c88e9c6676dffe5094e55577288df506e987ba5a6
+      producer: T-002
+    - id: I-003
+      name: PipelineOutcome
+      signature: "PipelineOutcome = frozen { response: OCRResponse, eligible: bool, degraded: bool }; execute_format(settings, text) and execute_translate(settings, text, language) preserve acceptance metadata through recursive repair."
+      sha256: dd0c04322b6e6b0bd6cdaaf283f26f0fb9f6cdeb200f4bd4d23bc2a309ffcfda
+      producer: T-003
+    - id: I-004
+      name: TextKitTransformationEndpoint
+      signature: "TextKit transformation endpoints accept optional Boolean force=false, preserve existing JSON fields, and add successful-response X-TextKit-Cache values skipped, disabled, hit, error, uncacheable, refresh, or miss; non-success responses omit the header."
+      sha256: e9f24cb7fdfdc2c805b0ff6ed0cf285aba29dc559179e6277e866a69dd0dff60
+      producer: T-004
+  consumes:
+    - id: I-001
+      name: TransformationCache
+      signature: "TransformationCache = async initialize(policy, now), read(key, policy, now), and write(key, record, policy, now) over a private SQLite database, returning typed maintenance, read, and write outcomes without exposing SQL state."
+      sha256: 3d4b66abbfcdfe71d8c472b1204926ae6cc3ce811a2148b9f5596b5c586fadf9
+      producer: T-001
+    - id: I-002
+      name: ResolvedTextSettings
+      signature: "ResolvedTextSettings = frozen { config: AIConfig, prompt: str, provider_endpoint: str }; cache_identity(operation, input_text, language, settings, pipeline_revision) returns the approved canonical UTF-8 JSON SHA-256 digest."
+      sha256: 34cd2fef79a3769114522d5c88e9c6676dffe5094e55577288df506e987ba5a6
+      producer: T-002
+    - id: I-003
+      name: PipelineOutcome
+      signature: "PipelineOutcome = frozen { response: OCRResponse, eligible: bool, degraded: bool }; execute_format(settings, text) and execute_translate(settings, text, language) preserve acceptance metadata through recursive repair."
+      sha256: dd0c04322b6e6b0bd6cdaaf283f26f0fb9f6cdeb200f4bd4d23bc2a309ffcfda
+      producer: T-003
+    - id: I-004
+      name: TextKitTransformationEndpoint
+      signature: "TextKit transformation endpoints accept optional Boolean force=false, preserve existing JSON fields, and add successful-response X-TextKit-Cache values skipped, disabled, hit, error, uncacheable, refresh, or miss; non-success responses omit the header."
+      sha256: e9f24cb7fdfdc2c805b0ff6ed0cf285aba29dc559179e6277e866a69dd0dff60
+      producer: T-004
+tasks:
+  - id: T-001
+    plan_task: 1
+    title: "Build the Deep SQLite Transformation Cache"
+    lane: textkit-sequential
+    sequence: 1
+    tier: capable
+    category: cache-storage
+    owns: ["backend/transformation_cache.py", "tests/test_transformation_cache.py"]
+    resources: []
+    depends_on: []
+    interfaces:
+      produces: [I-001]
+      consumes: []
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_transformation_cache.py"]
+        cwd: "."
+        timeout_seconds: 300
+  - id: T-002
+    plan_task: 2
+    title: "Resolve Strict Policy, Prompt, Provider, and Cache Identity Snapshots"
+    lane: textkit-sequential
+    sequence: 2
+    tier: capable
+    category: settings-and-identity
+    owns: ["backend/main.py", "tests/test_prompt_snapshot.py"]
+    resources: []
+    depends_on: [T-001]
+    interfaces:
+      produces: [I-002]
+      consumes: [I-001]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_prompt_snapshot.py", "tests/test_backend.py", "tests/test_format_pipeline.py", "tests/test_translate_pipeline.py"]
+        cwd: "."
+        timeout_seconds: 600
+  - id: T-003
+    plan_task: 3
+    title: "Carry Cache Eligibility Through Verified Format and Translation Repair"
+    lane: textkit-sequential
+    sequence: 3
+    tier: capable
+    category: pipeline-eligibility
+    owns: ["backend/main.py", "tests/test_format_pipeline.py", "tests/test_translate_pipeline.py"]
+    resources: []
+    depends_on: [T-002]
+    interfaces:
+      produces: [I-003]
+      consumes: [I-002]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_format_pipeline.py", "tests/test_translate_pipeline.py"]
+        cwd: "."
+        timeout_seconds: 600
+  - id: T-004
+    plan_task: 4
+    title: "Integrate Force, Cache Transactions, Headers, and Endpoint Ordering"
+    lane: textkit-sequential
+    sequence: 4
+    tier: capable
+    category: endpoint-contract
+    owns: ["backend/main.py", "tests/test_transformation_endpoints.py"]
+    resources: []
+    depends_on: [T-003]
+    interfaces:
+      produces: [I-004]
+      consumes: [I-001, I-002, I-003]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_transformation_endpoints.py", "tests/test_prompt_snapshot.py", "tests/test_transformation_cache.py", "tests/test_format_pipeline.py", "tests/test_translate_pipeline.py", "tests/test_backend.py"]
+        cwd: "."
+        timeout_seconds: 900
+  - id: T-005
+    plan_task: 5
+    title: "Document Local Retention, Headers, Configuration, and Verification"
+    lane: textkit-sequential
+    sequence: 5
+    tier: standard
+    category: documentation-and-verification
+    owns: ["backend/config.example.yaml", ".gitignore", "README.md"]
+    resources: []
+    depends_on: [T-004]
+    interfaces:
+      produces: []
+      consumes: [I-004]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/test_transformation_cache.py", "tests/test_transformation_endpoints.py", "tests/test_prompt_snapshot.py", "tests/test_format_pipeline.py", "tests/test_translate_pipeline.py"]
+        cwd: "."
+        timeout_seconds: 900
+      - argv: ["python", "-m", "pytest", "-q", "tests/"]
+        cwd: "."
+        timeout_seconds: 1200
