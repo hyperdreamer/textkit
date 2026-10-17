@@ -19,7 +19,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -57,6 +57,9 @@ MIN_DETECT_CHARS = 20
 SUPPORTED_LANGUAGES = frozenset(
     {"original", "chinese", "english", "japanese", "korean", "french", "german", "spanish"}
 )
+
+CACHE_FORMAT_VERSION = 1
+PIPELINE_REVISIONS = {"format": 1, "translate": 1}
 
 # Verified /format pipeline.  The provider may silently truncate a response at an
 # output-token cap (some models stop after a few thousand tokens and report
@@ -215,6 +218,22 @@ class AIConfig(FrozenModel):
         return _validate_api_base_value(value)
 
 
+class CachePolicy(FrozenModel):
+    """Strict, immutable retention policy for completed transformations."""
+
+    enabled: bool = Field(default=True, strict=True)
+    ttl_days: int = Field(default=30, strict=True, ge=1, le=3650)
+    max_entries: int = Field(default=1000, strict=True, ge=1, le=100_000)
+
+
+class _ResolvedTextSettings(FrozenModel):
+    """One prompt and effective provider snapshot, without resolving secrets."""
+
+    config: AIConfig
+    prompt: str
+    provider_endpoint: str
+
+
 def _insecure_api_base_urls(ai: AIConfig | None) -> list[str]:
     """Return the deduplicated non-loopback http:// api_base values, base first."""
 
@@ -253,6 +272,7 @@ class AppConfig(FrozenModel):
     max_concurrent_requests: int = Field(default=4, ge=0, le=100)
     debug: bool = False
     ai: AIConfig | None = Field(default_factory=AIConfig)
+    cache: CachePolicy = Field(default_factory=CachePolicy)
 
     @field_validator("host")
     @classmethod
@@ -451,6 +471,62 @@ def _render_prompt(name: str, **kwargs: str) -> str:
     language = kwargs.get("language")
     template = _load_prompt(name, language)
     return template.replace("{language}", language or "")
+
+
+def _resolve_text_prompt(
+    operation: Literal["format", "translate"],
+    request_prompt: str | None,
+    language: str | None,
+) -> str:
+    """Resolve once; request overrides and existing empty files are explicit."""
+
+    if request_prompt is not None and request_prompt != "":
+        return request_prompt
+    if operation == "translate" and language is not None:
+        return _render_prompt(operation, language=language)
+    return _render_prompt(operation)
+
+
+async def _resolve_text_settings(
+    base: AIConfig,
+    operation: Literal["format", "translate"],
+    request_prompt: str | None,
+    language: str | None = None,
+) -> _ResolvedTextSettings:
+    """Freeze the inherited provider and off-thread prompt for key and execution."""
+
+    effective_ai = _resolve_ai_config(base, base.text)
+    prompt = await asyncio.to_thread(_resolve_text_prompt, operation, request_prompt, language)
+    return _ResolvedTextSettings(
+        config=effective_ai,
+        prompt=prompt,
+        provider_endpoint=f"{effective_ai.api_base}/v1/chat/completions",
+    )
+
+
+def _cache_identity(
+    operation: Literal["format", "translate"],
+    input_text: str,
+    language: str | None,
+    settings: _ResolvedTextSettings,
+    pipeline_revision: int = 1,
+) -> str:
+    """Hash exact request bytes and output-affecting settings, excluding secrets."""
+
+    canonical = {
+        "cache_format_version": CACHE_FORMAT_VERSION,
+        "input_text": input_text,
+        "max_tokens": settings.config.max_tokens,
+        "model": settings.config.model,
+        "operation": operation,
+        "pipeline_revision": pipeline_revision,
+        "prompt": settings.prompt,
+        "provider_endpoint": settings.provider_endpoint,
+    }
+    if operation == "translate":
+        canonical["language"] = language
+    serialized = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _read_prompt_direct(name: str, language: str | None = None) -> str | None:
