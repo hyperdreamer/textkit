@@ -293,6 +293,15 @@ class OCRResponse(BaseModel):
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class _PipelineOutcome:
+    """Public response and private cache eligibility for a verified pipeline."""
+
+    response: OCRResponse
+    eligible: bool
+    degraded: bool
+
+
 class DedupRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: BoundedText
@@ -806,22 +815,30 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
     it is too small to split its source text is emitted, so the returned
     translation is never a silently truncated prefix.
     """
-    cfg = _resolve_ai_config(config, config.text)
-    effective_prompt = prompt or await asyncio.to_thread(_render_prompt, "translate", language=language)
+    settings = await _resolve_text_settings(config, "translate", prompt, language)
+    return (await _execute_translate(settings, text, language)).response
 
+
+async def _execute_translate(
+    settings: _ResolvedTextSettings, text: str, language: str
+) -> _PipelineOutcome:
+    """Execute a translation using exactly the resolved provider and prompt."""
+    cfg = settings.config
     chunks = _segment_for_format(text, TRANSLATE_CHUNK_CHARS)
     semaphore = asyncio.Semaphore(TRANSLATE_CONCURRENCY)
     stats = _CompletionStats()
     translated = await asyncio.gather(
         *[
-            _translate_verified(cfg, effective_prompt, chunk, semaphore, stats, 0)
+            _translate_verified(cfg, settings.prompt, chunk, semaphore, stats, 0)
             for chunk in chunks
         ]
     )
-    joined = "\n\n".join(part.strip() for part, _ in translated if part.strip())
+    joined = "\n\n".join(part.text.strip() for part in translated if part.text.strip())
+    accepted = all(part.accepted for part in translated)
+    degraded = any(part.degraded for part in translated) or not joined
     if not joined and text.strip():
         joined = text  # last-resort fallback, still lossless
-    floored = sum(1 for _, floor in translated if floor)
+    floored = sum(1 for part in translated if part.degraded)
     if floored:
         logger.warning(
             "translate kept source text for %d chunk(s) the provider could not finish; "
@@ -829,10 +846,14 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
             floored,
             extra={"event": "translate.truncated"},
         )
-    return OCRResponse(
-        text=joined,
-        model=stats.model or cfg.model,
-        tokens_used=stats.tokens_used,
+    return _PipelineOutcome(
+        response=OCRResponse(
+            text=joined,
+            model=stats.model or cfg.model,
+            tokens_used=stats.tokens_used,
+        ),
+        eligible=accepted and not degraded,
+        degraded=degraded,
     )
 
 
@@ -932,6 +953,15 @@ def _split_in_half(text: str) -> list[str]:
     return [text]
 
 
+@dataclass(frozen=True)
+class _VerifiedChunk:
+    """Emitted text and verification state, retained through recursive repair."""
+
+    text: str
+    accepted: bool
+    degraded: bool
+
+
 @dataclass
 class _CompletionStats:
     """Aggregate provider usage across the chunks of one chunked request."""
@@ -974,7 +1004,7 @@ async def _format_verified(
     semaphore: asyncio.Semaphore,
     stats: _CompletionStats,
     depth: int,
-) -> str:
+) -> _VerifiedChunk:
     """Format one chunk, guaranteeing its word content survives.
 
     The provider response is verified against the input; a truncated or lossy
@@ -982,7 +1012,7 @@ async def _format_verified(
     returned verbatim.  Words are therefore never dropped.
     """
     if not chunk.strip():
-        return chunk
+        return _VerifiedChunk(chunk, accepted=False, degraded=False)
     async with semaphore:
         completion = await _request_chat_completion(
             config,
@@ -995,20 +1025,25 @@ async def _format_verified(
     stats.record(completion)
 
     if completion.finish_reason != "length" and _content_preserved(chunk, completion.text):
-        return completion.text
+        return _VerifiedChunk(completion.text, accepted=True, degraded=False)
     if len(chunk) <= FORMAT_MIN_CHUNK_CHARS or depth >= FORMAT_MAX_DEPTH:
-        return chunk  # lossless fallback: emit the unformatted source
+        return _VerifiedChunk(chunk, accepted=False, degraded=True)
 
     parts = [part for part in _split_in_half(chunk) if part.strip()]
     if len(parts) < 2:
-        return chunk
+        return _VerifiedChunk(chunk, accepted=False, degraded=True)
     repaired = await asyncio.gather(
         *[
             _format_verified(config, prompt, part, semaphore, stats, depth + 1)
             for part in parts
         ]
     )
-    return "\n\n".join(part.strip() for part in repaired if part.strip())
+    joined = "\n\n".join(part.text.strip() for part in repaired if part.text.strip())
+    return _VerifiedChunk(
+        text=joined,
+        accepted=bool(joined) and all(part.accepted for part in repaired),
+        degraded=not joined or any(part.degraded for part in repaired),
+    )
 
 
 async def format_text(config: AIConfig, text: str, prompt: str | None = None) -> OCRResponse:
@@ -1020,19 +1055,25 @@ async def format_text(config: AIConfig, text: str, prompt: str | None = None) ->
     ultimately falls back to its raw text, so the returned text always contains
     every word of the input.
     """
-    cfg = _resolve_ai_config(config, config.text)
-    effective_prompt = prompt or await asyncio.to_thread(_render_prompt, "format")
+    settings = await _resolve_text_settings(config, "format", prompt)
+    return (await _execute_format(settings, text)).response
 
+
+async def _execute_format(settings: _ResolvedTextSettings, text: str) -> _PipelineOutcome:
+    """Execute formatting using exactly the resolved provider and prompt."""
+    cfg = settings.config
     chunks = _segment_for_format(text, FORMAT_CHUNK_CHARS)
     semaphore = asyncio.Semaphore(FORMAT_CONCURRENCY)
     stats = _CompletionStats()
     formatted = await asyncio.gather(
         *[
-            _format_verified(cfg, effective_prompt, chunk, semaphore, stats, 0)
+            _format_verified(cfg, settings.prompt, chunk, semaphore, stats, 0)
             for chunk in chunks
         ]
     )
-    joined = "\n\n".join(part.strip() for part in formatted if part.strip())
+    joined = "\n\n".join(part.text.strip() for part in formatted if part.text.strip())
+    accepted = all(part.accepted for part in formatted)
+    degraded = any(part.degraded for part in formatted) or not joined
     if not joined and text.strip():
         joined = text  # last-resort fallback, still lossless
     if stats.hit_token_cap and cfg.max_tokens is None:
@@ -1040,10 +1081,14 @@ async def format_text(config: AIConfig, text: str, prompt: str | None = None) ->
             "format provider hit its output-token cap; consider setting ai.max_tokens",
             extra={"event": "format.truncated"},
         )
-    return OCRResponse(
-        text=joined,
-        model=stats.model or cfg.model,
-        tokens_used=stats.tokens_used,
+    return _PipelineOutcome(
+        response=OCRResponse(
+            text=joined,
+            model=stats.model or cfg.model,
+            tokens_used=stats.tokens_used,
+        ),
+        eligible=accepted and not degraded,
+        degraded=degraded,
     )
 
 
@@ -1072,16 +1117,16 @@ async def _translate_verified(
     semaphore: asyncio.Semaphore,
     stats: _CompletionStats,
     depth: int,
-) -> tuple[str, bool]:
+) -> _VerifiedChunk:
     """Translate one chunk, never silently returning a truncated translation.
 
-    Returns the translated text and whether the source-text floor was applied.
     A chunk the provider cut off (``finish_reason == "length"``) or returned
     implausibly short is split at a sentence boundary and retried; once it is too
     small to split, its *source* text is returned instead of a truncated result.
+    Verification and source-floor state survive every recursive repair.
     """
     if not chunk.strip():
-        return chunk, False
+        return _VerifiedChunk(chunk, accepted=False, degraded=False)
     async with semaphore:
         completion = await _request_chat_completion(
             config,
@@ -1094,21 +1139,25 @@ async def _translate_verified(
     stats.record(completion)
 
     if completion.finish_reason != "length" and _translation_looks_complete(chunk, completion.text):
-        return completion.text, False
+        return _VerifiedChunk(completion.text, accepted=True, degraded=False)
     if len(chunk) <= TRANSLATE_MIN_CHUNK_CHARS or depth >= TRANSLATE_MAX_DEPTH:
-        return chunk, True  # floor: keep the source rather than drop meaning
+        return _VerifiedChunk(chunk, accepted=False, degraded=True)
 
     parts = [part for part in _split_in_half(chunk) if part.strip()]
     if len(parts) < 2:
-        return chunk, True
+        return _VerifiedChunk(chunk, accepted=False, degraded=True)
     repaired = await asyncio.gather(
         *[
             _translate_verified(config, prompt, part, semaphore, stats, depth + 1)
             for part in parts
         ]
     )
-    joined = "\n\n".join(part.strip() for part, _ in repaired if part.strip())
-    return joined, any(floor for _, floor in repaired)
+    joined = "\n\n".join(part.text.strip() for part in repaired if part.text.strip())
+    return _VerifiedChunk(
+        text=joined,
+        accepted=bool(joined) and all(part.accepted for part in repaired),
+        degraded=not joined or any(part.degraded for part in repaired),
+    )
 
 
 def _error_payload(error: str) -> dict[str, str | int | None]:
