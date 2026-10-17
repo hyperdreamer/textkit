@@ -41,6 +41,7 @@ def _app_config(*, host: str = "localhost", debug: bool = False) -> main.AppConf
         host=host,
         debug=debug,
         ai=_ai_config(),
+        cache=main.CachePolicy(enabled=False),
     )
 
 
@@ -516,12 +517,14 @@ def test_zero_request_and_character_limits_disable_checks(
     )
     monkeypatch.setattr(main, "load_config", lambda: config)
 
-    async def fake_format(
-        _config: main.AIConfig, text: str, _prompt: str | None = None
-    ) -> main.OCRResponse:
-        return main.OCRResponse(text=text, model="test-model", tokens_used=1)
+    async def fake_format(_settings: main._ResolvedTextSettings, text: str) -> main._PipelineOutcome:
+        return main._PipelineOutcome(
+            response=main.OCRResponse(text=text, model="test-model", tokens_used=1),
+            eligible=True,
+            degraded=False,
+        )
 
-    monkeypatch.setattr(main, "format_text", fake_format)
+    monkeypatch.setattr(main, "_execute_format", fake_format)
     text = "x" * (main.DEFAULT_MAX_TEXT_CHARS + 1)
     prompt = "p" * (main.DEFAULT_MAX_PROMPT_CHARS + 1)
 

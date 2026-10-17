@@ -1248,24 +1248,11 @@ async def lifespan(_app: FastAPI):
     await _get_http_client()
     if config.cache.enabled:
         try:
-            cache_startup: CacheMaintenanceResult = await _transformation_cache.initialize(
-                config.cache
-            )
-            if cache_startup.status == "unavailable":
-                logger.warning(
-                    "transformation cache initialization unavailable",
-                    extra={
-                        "event": "cache.startup",
-                        "reason": cache_startup.reason,
-                    },
-                )
+            await _transformation_cache.initialize(config.cache)
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.warning(
-                "transformation cache initialization unavailable",
-                extra={"event": "cache.startup", "reason": "corrupt"},
-            )
+            pass
     if config.debug:
         await asyncio.to_thread(_private_debug_dir)
     logger.info("TextKit backend started on %s:%s", config.host, config.port, extra={"event": "server.start"})

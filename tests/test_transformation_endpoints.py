@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import logging
 from dataclasses import dataclass, field
 
 import pytest
@@ -125,6 +127,103 @@ def _install_config(monkeypatch, config):
 
 def _client() -> TestClient:
     return TestClient(main.app, raise_server_exceptions=False)
+
+
+def test_lifespan_initializes_enabled_cache(tmp_path, monkeypatch):
+    config = _app_config()
+    cache_path = tmp_path / "enabled-cache.db"
+    cache = main.TransformationCache(cache_path)
+    monkeypatch.setattr(main, "_transformation_cache", cache)
+    _install_config(monkeypatch, config)
+
+    class FakeHTTPClient:
+        async def aclose(self):
+            return None
+
+    client = FakeHTTPClient()
+
+    async def get_http_client():
+        return client
+
+    monkeypatch.setattr(main, "_get_http_client", get_http_client)
+    monkeypatch.setattr(main, "_http_client", client)
+
+    async def run_lifespan():
+        async with main.lifespan(main.app):
+            pass
+
+    asyncio.run(run_lifespan())
+    assert cache_path.exists()
+
+
+def test_lifespan_skips_disabled_cache_initialization(tmp_path, monkeypatch):
+    config = _app_config(enabled=False)
+    cache_path = tmp_path / "disabled-cache.db"
+    cache = main.TransformationCache(cache_path)
+    monkeypatch.setattr(main, "_transformation_cache", cache)
+    _install_config(monkeypatch, config)
+
+    class FakeHTTPClient:
+        async def aclose(self):
+            return None
+
+    client = FakeHTTPClient()
+
+    async def get_http_client():
+        return client
+
+    monkeypatch.setattr(main, "_get_http_client", get_http_client)
+    monkeypatch.setattr(main, "_http_client", client)
+
+    async def run_lifespan():
+        async with main.lifespan(main.app):
+            pass
+
+    asyncio.run(run_lifespan())
+    assert not cache_path.exists()
+
+
+def test_lifespan_cache_unavailability_is_nonfatal_and_logs_once(tmp_path, monkeypatch, caplog):
+    config = _app_config()
+    cache_path = tmp_path / "corrupt-cache.db"
+    cache_path.write_bytes(b"not a sqlite database")
+    cache_path.chmod(0o600)
+    cache = main.TransformationCache(cache_path)
+    monkeypatch.setattr(main, "_transformation_cache", cache)
+    _install_config(monkeypatch, config)
+
+    class FakeHTTPClient:
+        async def aclose(self):
+            return None
+
+    client = FakeHTTPClient()
+
+    async def get_http_client():
+        return client
+
+    monkeypatch.setattr(main, "_get_http_client", get_http_client)
+    monkeypatch.setattr(main, "_http_client", client)
+
+    async def run_lifespan():
+        async with main.lifespan(main.app):
+            pass
+
+    with caplog.at_level(logging.WARNING, logger="textkit.transformation_cache"):
+        asyncio.run(run_lifespan())
+
+    cache_warnings = [
+        record
+        for record in caplog.records
+        if record.name == "textkit.transformation_cache"
+        and getattr(record, "event", None) == "cache.unavailable"
+    ]
+    assert len(cache_warnings) == 1
+    assert cache_warnings[0].getMessage() == "transformation cache unavailable"
+    assert cache_warnings[0].reason == "corrupt"
+    assert not any(
+        record.getMessage() == "transformation cache initialization unavailable"
+        for record in caplog.records
+    )
 
 
 def test_force_defaults_false_and_extra_fields_remain_forbidden():
@@ -414,6 +513,10 @@ def test_translation_skip_returns_existing_fields_and_skipped_header(monkeypatch
     async def unexpected_provider(*_args, **_kwargs):
         raise AssertionError("skipped translation must not execute the provider")
 
+    async def unexpected_settings(*_args, **_kwargs):
+        raise AssertionError("skipped translation must not resolve text settings")
+
+    monkeypatch.setattr(main, "_resolve_text_settings", unexpected_settings)
     monkeypatch.setattr(main, "_execute_translate", unexpected_provider)
     response = _client().post(
         "/translate", json={"text": "hello", "language": "original", "force": True}
@@ -443,8 +546,11 @@ def test_force_does_not_bypass_original_or_same_language_skip(monkeypatch):
         calls.append(True)
         return _translate_outcome()
 
+    async def unexpected_settings(*_args, **_kwargs):
+        raise AssertionError("skipped translation must not resolve text settings")
+
+    monkeypatch.setattr(main, "_resolve_text_settings", unexpected_settings)
     monkeypatch.setattr(main, "_execute_translate", provider)
-    monkeypatch.setattr(main, "_detect_language", lambda _text: "en")
 
     original = _client().post(
         "/translate", json={"text": "hello", "language": "original", "force": True}
@@ -638,8 +744,11 @@ def test_force_does_not_change_provider_idempotency_key(monkeypatch):
     )
 
     assert ordinary.status_code == forced.status_code == 200
-    assert len(provider_keys) == 2
-    assert all("force" not in key for key in provider_keys)
+    expected_digest = hashlib.sha256(b"hello").hexdigest()[:16]
+    assert provider_keys == [
+        f"ordinary-attempt:format:{expected_digest}",
+        f"refresh-attempt:format:{expected_digest}",
+    ]
     assert len(written_keys) == 2
     assert written_keys[0] == written_keys[1]
 
