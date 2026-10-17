@@ -19,7 +19,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -29,6 +29,23 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+if __package__:
+    from .transformation_cache import (
+        CacheMaintenanceResult,
+        CacheReadResult,
+        CacheRecord,
+        CacheWriteResult,
+        TransformationCache,
+    )
+else:  # Support ``uvicorn main:app`` with backend/ as the working directory.
+    from transformation_cache import (
+        CacheMaintenanceResult,
+        CacheReadResult,
+        CacheRecord,
+        CacheWriteResult,
+        TransformationCache,
+    )
 
 try:
     from langdetect import DetectorFactory, detect
@@ -57,6 +74,9 @@ MIN_DETECT_CHARS = 20
 SUPPORTED_LANGUAGES = frozenset(
     {"original", "chinese", "english", "japanese", "korean", "french", "german", "spanish"}
 )
+
+CACHE_FORMAT_VERSION = 1
+PIPELINE_REVISIONS = {"format": 1, "translate": 1}
 
 # Verified /format pipeline.  The provider may silently truncate a response at an
 # output-token cap (some models stop after a few thousand tokens and report
@@ -215,6 +235,22 @@ class AIConfig(FrozenModel):
         return _validate_api_base_value(value)
 
 
+class CachePolicy(FrozenModel):
+    """Strict, immutable retention policy for completed transformations."""
+
+    enabled: bool = Field(default=True, strict=True)
+    ttl_days: int = Field(default=30, strict=True, ge=1, le=3650)
+    max_entries: int = Field(default=1000, strict=True, ge=1, le=100_000)
+
+
+class _ResolvedTextSettings(FrozenModel):
+    """One prompt and effective provider snapshot, without resolving secrets."""
+
+    config: AIConfig
+    prompt: str
+    provider_endpoint: str
+
+
 def _insecure_api_base_urls(ai: AIConfig | None) -> list[str]:
     """Return the deduplicated non-loopback http:// api_base values, base first."""
 
@@ -253,6 +289,7 @@ class AppConfig(FrozenModel):
     max_concurrent_requests: int = Field(default=4, ge=0, le=100)
     debug: bool = False
     ai: AIConfig | None = Field(default_factory=AIConfig)
+    cache: CachePolicy = Field(default_factory=CachePolicy)
 
     @field_validator("host")
     @classmethod
@@ -273,6 +310,15 @@ class OCRResponse(BaseModel):
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class _PipelineOutcome:
+    """Public response and private cache eligibility for a verified pipeline."""
+
+    response: OCRResponse
+    eligible: bool
+    degraded: bool
+
+
 class DedupRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: BoundedText
@@ -284,6 +330,7 @@ class TranslateRequest(BaseModel):
     text: BoundedText
     language: Annotated[str, Field(min_length=1, max_length=MAX_LANGUAGE_CHARS)]
     prompt: str | None = None
+    force: bool = Field(default=False, strict=True)
 
     @field_validator("language")
     @classmethod
@@ -298,6 +345,7 @@ class FormatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: BoundedText
     prompt: str | None = None
+    force: bool = Field(default=False, strict=True)
 
 
 class _PromptCacheEntry(FrozenModel):
@@ -316,6 +364,9 @@ _rate_events: defaultdict[str, deque[float]] = defaultdict(deque)
 _active_requests = 0
 _limit_lock = asyncio.Lock()
 _operation_id: ContextVar[str] = ContextVar("textkit_operation_id", default="")
+_transformation_cache = TransformationCache(
+    Path(__file__).with_name("transformation_cache.db")
+)
 
 
 def _load_yaml_config(path: Path | None = None) -> dict[str, Any]:
@@ -451,6 +502,62 @@ def _render_prompt(name: str, **kwargs: str) -> str:
     language = kwargs.get("language")
     template = _load_prompt(name, language)
     return template.replace("{language}", language or "")
+
+
+def _resolve_text_prompt(
+    operation: Literal["format", "translate"],
+    request_prompt: str | None,
+    language: str | None,
+) -> str:
+    """Resolve once; request overrides and existing empty files are explicit."""
+
+    if request_prompt is not None and request_prompt != "":
+        return request_prompt
+    if operation == "translate" and language is not None:
+        return _render_prompt(operation, language=language)
+    return _render_prompt(operation)
+
+
+async def _resolve_text_settings(
+    base: AIConfig,
+    operation: Literal["format", "translate"],
+    request_prompt: str | None,
+    language: str | None = None,
+) -> _ResolvedTextSettings:
+    """Freeze the inherited provider and off-thread prompt for key and execution."""
+
+    effective_ai = _resolve_ai_config(base, base.text)
+    prompt = await asyncio.to_thread(_resolve_text_prompt, operation, request_prompt, language)
+    return _ResolvedTextSettings(
+        config=effective_ai,
+        prompt=prompt,
+        provider_endpoint=f"{effective_ai.api_base}/v1/chat/completions",
+    )
+
+
+def _cache_identity(
+    operation: Literal["format", "translate"],
+    input_text: str,
+    language: str | None,
+    settings: _ResolvedTextSettings,
+    pipeline_revision: int = 1,
+) -> str:
+    """Hash exact request bytes and output-affecting settings, excluding secrets."""
+
+    canonical = {
+        "cache_format_version": CACHE_FORMAT_VERSION,
+        "input_text": input_text,
+        "max_tokens": settings.config.max_tokens,
+        "model": settings.config.model,
+        "operation": operation,
+        "pipeline_revision": pipeline_revision,
+        "prompt": settings.prompt,
+        "provider_endpoint": settings.provider_endpoint,
+    }
+    if operation == "translate":
+        canonical["language"] = language
+    serialized = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _read_prompt_direct(name: str, language: str | None = None) -> str | None:
@@ -730,22 +837,30 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
     it is too small to split its source text is emitted, so the returned
     translation is never a silently truncated prefix.
     """
-    cfg = _resolve_ai_config(config, config.text)
-    effective_prompt = prompt or await asyncio.to_thread(_render_prompt, "translate", language=language)
+    settings = await _resolve_text_settings(config, "translate", prompt, language)
+    return (await _execute_translate(settings, text, language)).response
 
+
+async def _execute_translate(
+    settings: _ResolvedTextSettings, text: str, language: str
+) -> _PipelineOutcome:
+    """Execute a translation using exactly the resolved provider and prompt."""
+    cfg = settings.config
     chunks = _segment_for_format(text, TRANSLATE_CHUNK_CHARS)
     semaphore = asyncio.Semaphore(TRANSLATE_CONCURRENCY)
     stats = _CompletionStats()
     translated = await asyncio.gather(
         *[
-            _translate_verified(cfg, effective_prompt, chunk, semaphore, stats, 0)
+            _translate_verified(cfg, settings.prompt, chunk, semaphore, stats, 0)
             for chunk in chunks
         ]
     )
-    joined = "\n\n".join(part.strip() for part, _ in translated if part.strip())
+    joined = "\n\n".join(part.text.strip() for part in translated if part.text.strip())
+    accepted = all(part.accepted for part in translated)
+    degraded = any(part.degraded for part in translated) or not joined
     if not joined and text.strip():
         joined = text  # last-resort fallback, still lossless
-    floored = sum(1 for _, floor in translated if floor)
+    floored = sum(1 for part in translated if part.degraded)
     if floored:
         logger.warning(
             "translate kept source text for %d chunk(s) the provider could not finish; "
@@ -753,10 +868,14 @@ async def translate_text(config: AIConfig, text: str, language: str, prompt: str
             floored,
             extra={"event": "translate.truncated"},
         )
-    return OCRResponse(
-        text=joined,
-        model=stats.model or cfg.model,
-        tokens_used=stats.tokens_used,
+    return _PipelineOutcome(
+        response=OCRResponse(
+            text=joined,
+            model=stats.model or cfg.model,
+            tokens_used=stats.tokens_used,
+        ),
+        eligible=accepted and not degraded,
+        degraded=degraded,
     )
 
 
@@ -856,6 +975,15 @@ def _split_in_half(text: str) -> list[str]:
     return [text]
 
 
+@dataclass(frozen=True)
+class _VerifiedChunk:
+    """Emitted text and verification state, retained through recursive repair."""
+
+    text: str
+    accepted: bool
+    degraded: bool
+
+
 @dataclass
 class _CompletionStats:
     """Aggregate provider usage across the chunks of one chunked request."""
@@ -898,7 +1026,7 @@ async def _format_verified(
     semaphore: asyncio.Semaphore,
     stats: _CompletionStats,
     depth: int,
-) -> str:
+) -> _VerifiedChunk:
     """Format one chunk, guaranteeing its word content survives.
 
     The provider response is verified against the input; a truncated or lossy
@@ -906,7 +1034,7 @@ async def _format_verified(
     returned verbatim.  Words are therefore never dropped.
     """
     if not chunk.strip():
-        return chunk
+        return _VerifiedChunk(chunk, accepted=False, degraded=False)
     async with semaphore:
         completion = await _request_chat_completion(
             config,
@@ -919,20 +1047,25 @@ async def _format_verified(
     stats.record(completion)
 
     if completion.finish_reason != "length" and _content_preserved(chunk, completion.text):
-        return completion.text
+        return _VerifiedChunk(completion.text, accepted=True, degraded=False)
     if len(chunk) <= FORMAT_MIN_CHUNK_CHARS or depth >= FORMAT_MAX_DEPTH:
-        return chunk  # lossless fallback: emit the unformatted source
+        return _VerifiedChunk(chunk, accepted=False, degraded=True)
 
     parts = [part for part in _split_in_half(chunk) if part.strip()]
     if len(parts) < 2:
-        return chunk
+        return _VerifiedChunk(chunk, accepted=False, degraded=True)
     repaired = await asyncio.gather(
         *[
             _format_verified(config, prompt, part, semaphore, stats, depth + 1)
             for part in parts
         ]
     )
-    return "\n\n".join(part.strip() for part in repaired if part.strip())
+    joined = "\n\n".join(part.text.strip() for part in repaired if part.text.strip())
+    return _VerifiedChunk(
+        text=joined,
+        accepted=bool(joined) and all(part.accepted for part in repaired),
+        degraded=not joined or any(part.degraded for part in repaired),
+    )
 
 
 async def format_text(config: AIConfig, text: str, prompt: str | None = None) -> OCRResponse:
@@ -944,19 +1077,25 @@ async def format_text(config: AIConfig, text: str, prompt: str | None = None) ->
     ultimately falls back to its raw text, so the returned text always contains
     every word of the input.
     """
-    cfg = _resolve_ai_config(config, config.text)
-    effective_prompt = prompt or await asyncio.to_thread(_render_prompt, "format")
+    settings = await _resolve_text_settings(config, "format", prompt)
+    return (await _execute_format(settings, text)).response
 
+
+async def _execute_format(settings: _ResolvedTextSettings, text: str) -> _PipelineOutcome:
+    """Execute formatting using exactly the resolved provider and prompt."""
+    cfg = settings.config
     chunks = _segment_for_format(text, FORMAT_CHUNK_CHARS)
     semaphore = asyncio.Semaphore(FORMAT_CONCURRENCY)
     stats = _CompletionStats()
     formatted = await asyncio.gather(
         *[
-            _format_verified(cfg, effective_prompt, chunk, semaphore, stats, 0)
+            _format_verified(cfg, settings.prompt, chunk, semaphore, stats, 0)
             for chunk in chunks
         ]
     )
-    joined = "\n\n".join(part.strip() for part in formatted if part.strip())
+    joined = "\n\n".join(part.text.strip() for part in formatted if part.text.strip())
+    accepted = all(part.accepted for part in formatted)
+    degraded = any(part.degraded for part in formatted) or not joined
     if not joined and text.strip():
         joined = text  # last-resort fallback, still lossless
     if stats.hit_token_cap and cfg.max_tokens is None:
@@ -964,10 +1103,14 @@ async def format_text(config: AIConfig, text: str, prompt: str | None = None) ->
             "format provider hit its output-token cap; consider setting ai.max_tokens",
             extra={"event": "format.truncated"},
         )
-    return OCRResponse(
-        text=joined,
-        model=stats.model or cfg.model,
-        tokens_used=stats.tokens_used,
+    return _PipelineOutcome(
+        response=OCRResponse(
+            text=joined,
+            model=stats.model or cfg.model,
+            tokens_used=stats.tokens_used,
+        ),
+        eligible=accepted and not degraded,
+        degraded=degraded,
     )
 
 
@@ -996,16 +1139,16 @@ async def _translate_verified(
     semaphore: asyncio.Semaphore,
     stats: _CompletionStats,
     depth: int,
-) -> tuple[str, bool]:
+) -> _VerifiedChunk:
     """Translate one chunk, never silently returning a truncated translation.
 
-    Returns the translated text and whether the source-text floor was applied.
     A chunk the provider cut off (``finish_reason == "length"``) or returned
     implausibly short is split at a sentence boundary and retried; once it is too
     small to split, its *source* text is returned instead of a truncated result.
+    Verification and source-floor state survive every recursive repair.
     """
     if not chunk.strip():
-        return chunk, False
+        return _VerifiedChunk(chunk, accepted=False, degraded=False)
     async with semaphore:
         completion = await _request_chat_completion(
             config,
@@ -1018,21 +1161,25 @@ async def _translate_verified(
     stats.record(completion)
 
     if completion.finish_reason != "length" and _translation_looks_complete(chunk, completion.text):
-        return completion.text, False
+        return _VerifiedChunk(completion.text, accepted=True, degraded=False)
     if len(chunk) <= TRANSLATE_MIN_CHUNK_CHARS or depth >= TRANSLATE_MAX_DEPTH:
-        return chunk, True  # floor: keep the source rather than drop meaning
+        return _VerifiedChunk(chunk, accepted=False, degraded=True)
 
     parts = [part for part in _split_in_half(chunk) if part.strip()]
     if len(parts) < 2:
-        return chunk, True
+        return _VerifiedChunk(chunk, accepted=False, degraded=True)
     repaired = await asyncio.gather(
         *[
             _translate_verified(config, prompt, part, semaphore, stats, depth + 1)
             for part in parts
         ]
     )
-    joined = "\n\n".join(part.strip() for part, _ in repaired if part.strip())
-    return joined, any(floor for _, floor in repaired)
+    joined = "\n\n".join(part.text.strip() for part in repaired if part.text.strip())
+    return _VerifiedChunk(
+        text=joined,
+        accepted=bool(joined) and all(part.accepted for part in repaired),
+        degraded=not joined or any(part.degraded for part in repaired),
+    )
 
 
 def _error_payload(error: str) -> dict[str, str | int | None]:
@@ -1099,6 +1246,13 @@ async def lifespan(_app: FastAPI):
     config = await _get_config()
     await asyncio.to_thread(lambda: [_load_prompt(name) for name in _DEFAULT_PROMPTS])
     await _get_http_client()
+    if config.cache.enabled:
+        try:
+            await _transformation_cache.initialize(config.cache)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
     if config.debug:
         await asyncio.to_thread(_private_debug_dir)
     logger.info("TextKit backend started on %s:%s", config.host, config.port, extra={"event": "server.start"})
@@ -1274,8 +1428,87 @@ async def dedup(request: DedupRequest) -> dict[str, str | int]:
     return {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
 
 
+async def _run_cached_transformation(
+    operation: Literal["format", "translate"],
+    text: str,
+    request_prompt: str | None,
+    language: str | None,
+    force: bool,
+    config: AppConfig,
+) -> JSONResponse:
+    if config.ai is None:
+        raise HTTPException(status_code=500, detail="AI provider configuration is missing")
+
+    settings = await _resolve_text_settings(config.ai, operation, request_prompt, language)
+    key = _cache_identity(
+        operation,
+        text,
+        language,
+        settings,
+        PIPELINE_REVISIONS[operation],
+    )
+    policy = config.cache
+    cache_error = False
+
+    if policy.enabled:
+        if force:
+            maintenance: CacheMaintenanceResult = await _transformation_cache.initialize(
+                policy
+            )
+            cache_error = maintenance.status == "unavailable"
+        else:
+            cached: CacheReadResult = await _transformation_cache.read(key, policy)
+            if cached.status == "hit":
+                assert cached.record is not None
+                return JSONResponse(
+                    content={
+                        "text": cached.record.text,
+                        "model": cached.record.model,
+                        "tokens_used": 0,
+                    },
+                    headers={"X-TextKit-Cache": "hit"},
+                )
+            cache_error = cached.status == "unavailable"
+
+    if operation == "format":
+        outcome = await _execute_format(settings, text)
+    else:
+        assert language is not None
+        outcome = await _execute_translate(settings, text, language)
+
+    response = outcome.response
+    eligible = outcome.eligible and not outcome.degraded and bool(response.text.strip())
+    if not policy.enabled:
+        cache_status = "disabled"
+    elif cache_error:
+        cache_status = "error"
+    elif not eligible:
+        cache_status = "uncacheable"
+    else:
+        record = CacheRecord(
+            key=key,
+            operation=operation,
+            text=response.text,
+            model=response.model,
+            generation_tokens=response.tokens_used,
+            generated_at=time.time(),
+        )
+        stored: CacheWriteResult = await _transformation_cache.write(key, record, policy)
+        if stored.status == "unavailable":
+            cache_status = "error"
+        else:
+            cache_status = "refresh" if force else "miss"
+
+    content: dict[str, Any] = {
+        "text": response.text,
+        "model": response.model,
+        "tokens_used": response.tokens_used,
+    }
+    return JSONResponse(content=content, headers={"X-TextKit-Cache": cache_status})
+
+
 @app.post("/translate")
-async def translate(request: TranslateRequest) -> dict[str, Any]:
+async def translate(request: TranslateRequest) -> Response:
     config = await _get_config()
     if config.ai is None:
         raise HTTPException(status_code=500, detail="AI provider configuration is missing")
@@ -1289,27 +1522,42 @@ async def translate(request: TranslateRequest) -> dict[str, Any]:
         debug=config.debug,
     )
     if skip:
-        return {
-            "text": request.text,
-            "model": "",
-            "tokens_used": 0,
-            "skipped": True,
-            "detected_language": detected_iso,
-            "skip_reason": reason,
-        }
-    result = await translate_text(config.ai, request.text, request.language, request.prompt)
-    return {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
+        return JSONResponse(
+            content={
+                "text": request.text,
+                "model": "",
+                "tokens_used": 0,
+                "skipped": True,
+                "detected_language": detected_iso,
+                "skip_reason": reason,
+            },
+            headers={"X-TextKit-Cache": "skipped"},
+        )
+    return await _run_cached_transformation(
+        "translate",
+        request.text,
+        request.prompt,
+        request.language,
+        request.force,
+        config,
+    )
 
 
 @app.post("/format")
-async def format_text_endpoint(request: FormatRequest) -> dict[str, str | int]:
+async def format_text_endpoint(request: FormatRequest) -> Response:
     config = await _get_config()
     if config.ai is None:
         raise HTTPException(status_code=500, detail="AI provider configuration is missing")
     _validate_text_size(request.text, config)
     _validate_optional_prompt(request.prompt, config)
-    result = await format_text(config.ai, request.text, request.prompt)
-    return {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
+    return await _run_cached_transformation(
+        "format",
+        request.text,
+        request.prompt,
+        None,
+        request.force,
+        config,
+    )
 
 
 def _validate_prompt_request(name: str, language: str | None) -> str | None:

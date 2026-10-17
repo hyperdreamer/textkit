@@ -78,3 +78,32 @@ ai:
   #   read: 600      # waiting for response body (default: 600 = 10 min)
   #   write: 60      # sending the request body (default: 60)
   #   pool: 10       # acquiring a connection from the pool (default: 10)
+
+# Cache of completed /format and /translate results, stored locally in
+# backend/transformation_cache.db (SQLite, WAL mode).  Only an identical request
+# identity reuses an entry: operation, exact input text, effective prompt,
+# effective text-provider endpoint and model, completion-token cap, target
+# language for translation, and internal cache/pipeline revisions.  Prompts,
+# input text, API keys, authorization headers, credential-derived values, URLs,
+# tab IDs, operation IDs, and readable configuration are never stored; the
+# identity digest is the only representation of a request.
+#
+# Omit this whole mapping, or any individual field, to use the defaults below.
+# An explicit ``cache: null`` is a configuration error.  Each value is validated
+# strictly: ``enabled`` accepts only a Boolean, and the integers reject Boolean
+# values, fractional numbers, numeric strings, and null.
+cache:
+  # false skips cache initialization, maintenance, lookup, and writes for
+  # requests that observe it, and reports ``X-TextKit-Cache: disabled``.
+  # Existing rows are retained, not erased, and become reachable again when
+  # caching is re-enabled under the then-current TTL and capacity.
+  enabled: true
+
+  # Retention window in days, measured from verified generation completion;
+  # reads never extend it.  Valid range: 1-3650.  Expiry affects logical
+  # availability only, not physical erasure or file shrinkage.
+  ttl_days: 30
+
+  # Maximum stored rows shared by /format and /translate.  When exceeded, the
+  # oldest generation timestamps are evicted first.  Valid range: 1-100000.
+  max_entries: 1000

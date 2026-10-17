@@ -10,12 +10,30 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from backend import main
+
+
+@pytest.fixture(autouse=True)
+def isolate_pipeline_settings(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "CONFIG_PATH", tmp_path / "config.yaml")
+    monkeypatch.setattr(main, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(main, "_config_cache", None)
+    monkeypatch.setattr(main, "_prompt_cache", {})
+
+
+@pytest.fixture
+def format_settings():
+    return main._ResolvedTextSettings(
+        config=_ai_config(),
+        prompt="fmt",
+        provider_endpoint="https://example.invalid/v1/chat/completions",
+    )
 
 
 def _ai_config(**overrides) -> main.AIConfig:
@@ -178,11 +196,134 @@ class TestFormatTextPipeline:
         assert result.text.strip() == ""
 
 
+def test_fully_repaired_format_result_is_eligible(monkeypatch, format_settings):
+    provider = FakeProvider(safe_chars=400)
+    monkeypatch.setattr(main, "_request_chat_completion", provider)
+    text = "".join(f"这是第{i}句测试内容。" for i in range(200))
+
+    outcome = asyncio.run(main._execute_format(format_settings, text))
+
+    assert main._content_only(outcome.response.text) == main._content_only(text)
+    assert outcome.eligible is True
+    assert outcome.degraded is False
+    assert outcome.response.tokens_used == 7 * len(provider.calls)
+    assert outcome.response.model == "test-model"
+    assert any(len(chunk) > 400 for chunk in provider.calls)
+    assert any(len(chunk) <= 400 for chunk in provider.calls)
+
+
+def test_source_floor_format_result_is_degraded_and_ineligible(monkeypatch, format_settings):
+    provider = FakeProvider(safe_chars=120)
+    monkeypatch.setattr(main, "_request_chat_completion", provider)
+    text = "".join(f"这是第{i}句测试内容。" for i in range(200))
+
+    outcome = asyncio.run(main._execute_format(format_settings, text))
+
+    assert main._content_only(outcome.response.text) == main._content_only(text)
+    assert outcome.eligible is False
+    assert outcome.degraded is True
+    # Accepted siblings must not hide a child that fell back to its source.
+    assert any(len(chunk) <= 120 for chunk in provider.calls)
+    assert any(120 < len(chunk) <= 200 for chunk in provider.calls)
+
+
+def test_format_repair_with_source_floor_is_not_accepted(monkeypatch, format_settings):
+    monkeypatch.setattr(main, "_request_chat_completion", FakeProvider(safe_chars=120))
+    first = "甲" * 149 + "。"
+    second = "乙" * 99 + "。"
+
+    result = asyncio.run(main._format_verified(
+        format_settings.config, format_settings.prompt, first + second,
+        asyncio.Semaphore(1), main._CompletionStats(), 0,
+    ))
+
+    assert result.text == first + "\n\n" + second
+    assert result.accepted is False
+    assert result.degraded is True
+
+
+def test_accepted_unchanged_format_result_is_eligible(monkeypatch, format_settings):
+    monkeypatch.setattr(main, "_request_chat_completion", FakeProvider())
+    text = "你好。世界。"
+
+    outcome = asyncio.run(main._execute_format(format_settings, text))
+
+    assert outcome.response.text == text
+    assert outcome.eligible is True
+    assert outcome.degraded is False
+
+
+@pytest.mark.parametrize("text", ["", "source content to preserve"])
+def test_format_final_empty_join_is_ineligible(monkeypatch, format_settings, text):
+    async def empty_verified(*args):
+        return SimpleNamespace(text=" \n", accepted=True, degraded=False)
+
+    monkeypatch.setattr(main, "_format_verified", empty_verified)
+
+    outcome = asyncio.run(main._execute_format(format_settings, text))
+
+    assert outcome.response.text == text
+    assert outcome.eligible is False
+    assert outcome.degraded is True
+
+
+@pytest.mark.parametrize("text", ["", " \n"])
+def test_empty_format_result_is_degraded_and_ineligible(monkeypatch, format_settings, text):
+    monkeypatch.setattr(main, "_request_chat_completion", FakeProvider())
+
+    outcome = asyncio.run(main._execute_format(format_settings, text))
+
+    assert outcome.response.text == ""
+    assert outcome.eligible is False
+    assert outcome.degraded is True
+
+
+def test_public_format_text_still_returns_only_ocr_response(monkeypatch):
+    monkeypatch.setattr(main, "_request_chat_completion", FakeProvider())
+
+    result = asyncio.run(main.format_text(_ai_config(), "你好。世界。", prompt="fmt"))
+
+    assert type(result) is main.OCRResponse
+    assert result.model_dump() == {
+        "text": "你好。世界。",
+        "model": "test-model",
+        "tokens_used": 7,
+        "error": None,
+    }
+
+
+def test_format_uses_resolved_empty_prompt_once(monkeypatch, tmp_path):
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    (prompts / "format.txt").write_text("", encoding="utf-8")
+    render_prompt = main._render_prompt
+    renders = []
+
+    def render_once(*args, **kwargs):
+        renders.append(args)
+        assert len(renders) == 1
+        return render_prompt(*args, **kwargs)
+
+    async def provider(config, messages, *, idempotency_key=None):
+        assert messages[0] == {"role": "system", "content": ""}
+        return main._ChatCompletion("你好。", config.model, 7, "stop")
+
+    monkeypatch.setattr(main, "_render_prompt", render_once)
+    monkeypatch.setattr(main, "_request_chat_completion", provider)
+
+    result = asyncio.run(main.format_text(_ai_config(), "你好。"))
+
+    assert result.text == "你好。"
+    assert len(renders) == 1
+
+
 def test_format_endpoint_uses_verified_pipeline(monkeypatch):
     provider = FakeProvider(safe_chars=80)
     monkeypatch.setattr(main, "_request_chat_completion", provider)
     monkeypatch.setattr(
-        main, "load_config", lambda: main.AppConfig(host="localhost", ai=_ai_config())
+        main, "load_config", lambda: main.AppConfig(
+            host="localhost", ai=_ai_config(), cache=main.CachePolicy(enabled=False)
+        )
     )
     client = TestClient(main.app)
     text = "".join(f"句子{i}。" for i in range(100))
@@ -190,6 +331,7 @@ def test_format_endpoint_uses_verified_pipeline(monkeypatch):
     response = client.post("/format", json={"text": text})
 
     assert response.status_code == 200
+    assert set(response.json()) == {"text", "model", "tokens_used"}
     assert main._content_only(response.json()["text"]) == main._content_only(text)
 
 

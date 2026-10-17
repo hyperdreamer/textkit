@@ -10,11 +10,29 @@ rather than a silently truncated translation.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from backend import main
+
+
+@pytest.fixture(autouse=True)
+def isolate_pipeline_settings(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "CONFIG_PATH", tmp_path / "config.yaml")
+    monkeypatch.setattr(main, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(main, "_config_cache", None)
+    monkeypatch.setattr(main, "_prompt_cache", {})
+
+
+@pytest.fixture
+def translate_settings():
+    return main._ResolvedTextSettings(
+        config=_ai_config(),
+        prompt="tr",
+        provider_endpoint="https://example.invalid/v1/chat/completions",
+    )
 
 
 def _ai_config(**overrides) -> main.AIConfig:
@@ -187,11 +205,125 @@ class TestTranslateTextPipeline:
         assert result.text.strip() == ""
 
 
+def test_fully_repaired_translation_is_eligible(monkeypatch, translate_settings):
+    provider = FakeTranslator(safe_chars=400)
+    monkeypatch.setattr(main, "_request_chat_completion", provider)
+    text = "".join(f"这是第{i}句测试内容。" for i in range(200))
+
+    outcome = asyncio.run(main._execute_translate(translate_settings, text, "English"))
+
+    assert main._content_only(outcome.response.text) == main._content_only(text)
+    assert outcome.eligible is True
+    assert outcome.degraded is False
+    assert outcome.response.tokens_used == 7 * len(provider.calls)
+    assert outcome.response.model == "test-model"
+    assert "length" in provider.finish_reasons
+    assert "stop" in provider.finish_reasons
+
+
+def test_translation_source_floor_is_ineligible(monkeypatch, translate_settings):
+    provider = FakeTranslator(safe_chars=120)
+    monkeypatch.setattr(main, "_request_chat_completion", provider)
+    text = "甲" * 149 + "。" + "乙" * 99 + "。"
+
+    outcome = asyncio.run(main._execute_translate(translate_settings, text, "English"))
+
+    assert main._content_only(outcome.response.text) == main._content_only(text)
+    assert outcome.eligible is False
+    assert outcome.degraded is True
+    assert "length" in provider.finish_reasons
+    assert "stop" in provider.finish_reasons
+    assert "«" in outcome.response.text
+
+
+def test_translation_repair_with_source_floor_is_not_accepted(monkeypatch, translate_settings):
+    monkeypatch.setattr(main, "_request_chat_completion", FakeTranslator(safe_chars=120))
+    first = "甲" * 149 + "。"
+    second = "乙" * 99 + "。"
+
+    result = asyncio.run(main._translate_verified(
+        translate_settings.config, translate_settings.prompt, first + second,
+        asyncio.Semaphore(1), main._CompletionStats(), 0,
+    ))
+
+    assert result.text == first + "\n\n«" + second + "»"
+    assert result.accepted is False
+    assert result.degraded is True
+
+
+@pytest.mark.parametrize("text", ["", " \n"])
+def test_translation_empty_result_is_ineligible(monkeypatch, translate_settings, text):
+    monkeypatch.setattr(main, "_request_chat_completion", FakeTranslator())
+
+    outcome = asyncio.run(main._execute_translate(translate_settings, text, "English"))
+
+    assert outcome.response.text == ""
+    assert outcome.eligible is False
+    assert outcome.degraded is True
+
+
+@pytest.mark.parametrize("text", ["", "source content to preserve"])
+def test_translation_final_join_fallback_is_ineligible(monkeypatch, translate_settings, text):
+    async def empty_verified(*args):
+        return SimpleNamespace(text=" \n", accepted=True, degraded=False)
+
+    monkeypatch.setattr(main, "_translate_verified", empty_verified)
+
+    outcome = asyncio.run(main._execute_translate(translate_settings, text, "English"))
+
+    assert outcome.response.text == text
+    assert outcome.eligible is False
+    assert outcome.degraded is True
+
+
+def test_public_translate_text_still_returns_only_ocr_response(monkeypatch):
+    monkeypatch.setattr(main, "_request_chat_completion", FakeTranslator())
+
+    result = asyncio.run(
+        main.translate_text(_ai_config(), "你好。世界。", "English", prompt="tr")
+    )
+
+    assert type(result) is main.OCRResponse
+    assert result.model_dump() == {
+        "text": "«你好。世界。»",
+        "model": "test-model",
+        "tokens_used": 7,
+        "error": None,
+    }
+
+
+def test_translate_uses_resolved_empty_prompt_once(monkeypatch, tmp_path):
+    prompts = tmp_path / "prompts"
+    prompts.mkdir()
+    (prompts / "translate.English.txt").write_text("", encoding="utf-8")
+    render_prompt = main._render_prompt
+    renders = []
+
+    def render_once(*args, **kwargs):
+        renders.append(args)
+        assert len(renders) == 1
+        return render_prompt(*args, **kwargs)
+
+    async def provider(config, messages, *, idempotency_key=None):
+        assert messages[0] == {"role": "system", "content": ""}
+        return main._ChatCompletion("Hello world", config.model, 7, "stop")
+
+    monkeypatch.setattr(main, "_render_prompt", render_once)
+    monkeypatch.setattr(main, "_request_chat_completion", provider)
+
+    result = asyncio.run(main.translate_text(_ai_config(), "你好。", "English"))
+
+    assert result.text == "Hello world"
+    assert len(renders) == 1
+
+
 def test_translate_endpoint_uses_chunked_pipeline(monkeypatch):
     provider = FakeTranslator(safe_chars=80)
     monkeypatch.setattr(main, "_request_chat_completion", provider)
     monkeypatch.setattr(
-        main, "load_config", lambda: main.AppConfig(host="localhost", ai=_ai_config())
+        main, "load_config", lambda: main.AppConfig(
+            host="localhost", ai=_ai_config(), cache=main.CachePolicy(enabled=False)
+        )
     )
     client = TestClient(main.app)
     text = "".join(f"句子{i}。" for i in range(100))
@@ -208,7 +340,9 @@ def test_translate_endpoint_response_shape(monkeypatch):
     provider = FakeTranslator()
     monkeypatch.setattr(main, "_request_chat_completion", provider)
     monkeypatch.setattr(
-        main, "load_config", lambda: main.AppConfig(host="localhost", ai=_ai_config())
+        main, "load_config", lambda: main.AppConfig(
+            host="localhost", ai=_ai_config(), cache=main.CachePolicy(enabled=False)
+        )
     )
     client = TestClient(main.app)
 
