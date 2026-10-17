@@ -30,6 +30,23 @@ from fastapi.responses import JSONResponse, Response
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+if __package__:
+    from .transformation_cache import (
+        CacheMaintenanceResult,
+        CacheReadResult,
+        CacheRecord,
+        CacheWriteResult,
+        TransformationCache,
+    )
+else:  # Support ``uvicorn main:app`` with backend/ as the working directory.
+    from transformation_cache import (
+        CacheMaintenanceResult,
+        CacheReadResult,
+        CacheRecord,
+        CacheWriteResult,
+        TransformationCache,
+    )
+
 try:
     from langdetect import DetectorFactory, detect
     from langdetect.lang_detect_exception import LangDetectException
@@ -313,6 +330,7 @@ class TranslateRequest(BaseModel):
     text: BoundedText
     language: Annotated[str, Field(min_length=1, max_length=MAX_LANGUAGE_CHARS)]
     prompt: str | None = None
+    force: bool = Field(default=False, strict=True)
 
     @field_validator("language")
     @classmethod
@@ -327,6 +345,7 @@ class FormatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     text: BoundedText
     prompt: str | None = None
+    force: bool = Field(default=False, strict=True)
 
 
 class _PromptCacheEntry(FrozenModel):
@@ -345,6 +364,9 @@ _rate_events: defaultdict[str, deque[float]] = defaultdict(deque)
 _active_requests = 0
 _limit_lock = asyncio.Lock()
 _operation_id: ContextVar[str] = ContextVar("textkit_operation_id", default="")
+_transformation_cache = TransformationCache(
+    Path(__file__).with_name("transformation_cache.db")
+)
 
 
 def _load_yaml_config(path: Path | None = None) -> dict[str, Any]:
@@ -1224,6 +1246,26 @@ async def lifespan(_app: FastAPI):
     config = await _get_config()
     await asyncio.to_thread(lambda: [_load_prompt(name) for name in _DEFAULT_PROMPTS])
     await _get_http_client()
+    if config.cache.enabled:
+        try:
+            cache_startup: CacheMaintenanceResult = await _transformation_cache.initialize(
+                config.cache
+            )
+            if cache_startup.status == "unavailable":
+                logger.warning(
+                    "transformation cache initialization unavailable",
+                    extra={
+                        "event": "cache.startup",
+                        "reason": cache_startup.reason,
+                    },
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "transformation cache initialization unavailable",
+                extra={"event": "cache.startup", "reason": "corrupt"},
+            )
     if config.debug:
         await asyncio.to_thread(_private_debug_dir)
     logger.info("TextKit backend started on %s:%s", config.host, config.port, extra={"event": "server.start"})
@@ -1399,8 +1441,87 @@ async def dedup(request: DedupRequest) -> dict[str, str | int]:
     return {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
 
 
+async def _run_cached_transformation(
+    operation: Literal["format", "translate"],
+    text: str,
+    request_prompt: str | None,
+    language: str | None,
+    force: bool,
+    config: AppConfig,
+) -> JSONResponse:
+    if config.ai is None:
+        raise HTTPException(status_code=500, detail="AI provider configuration is missing")
+
+    settings = await _resolve_text_settings(config.ai, operation, request_prompt, language)
+    key = _cache_identity(
+        operation,
+        text,
+        language,
+        settings,
+        PIPELINE_REVISIONS[operation],
+    )
+    policy = config.cache
+    cache_error = False
+
+    if policy.enabled:
+        if force:
+            maintenance: CacheMaintenanceResult = await _transformation_cache.initialize(
+                policy
+            )
+            cache_error = maintenance.status == "unavailable"
+        else:
+            cached: CacheReadResult = await _transformation_cache.read(key, policy)
+            if cached.status == "hit":
+                assert cached.record is not None
+                return JSONResponse(
+                    content={
+                        "text": cached.record.text,
+                        "model": cached.record.model,
+                        "tokens_used": 0,
+                    },
+                    headers={"X-TextKit-Cache": "hit"},
+                )
+            cache_error = cached.status == "unavailable"
+
+    if operation == "format":
+        outcome = await _execute_format(settings, text)
+    else:
+        assert language is not None
+        outcome = await _execute_translate(settings, text, language)
+
+    response = outcome.response
+    eligible = outcome.eligible and not outcome.degraded and bool(response.text.strip())
+    if not policy.enabled:
+        cache_status = "disabled"
+    elif cache_error:
+        cache_status = "error"
+    elif not eligible:
+        cache_status = "uncacheable"
+    else:
+        record = CacheRecord(
+            key=key,
+            operation=operation,
+            text=response.text,
+            model=response.model,
+            generation_tokens=response.tokens_used,
+            generated_at=time.time(),
+        )
+        stored: CacheWriteResult = await _transformation_cache.write(key, record, policy)
+        if stored.status == "unavailable":
+            cache_status = "error"
+        else:
+            cache_status = "refresh" if force else "miss"
+
+    content: dict[str, Any] = {
+        "text": response.text,
+        "model": response.model,
+        "tokens_used": response.tokens_used,
+    }
+    return JSONResponse(content=content, headers={"X-TextKit-Cache": cache_status})
+
+
 @app.post("/translate")
-async def translate(request: TranslateRequest) -> dict[str, Any]:
+async def translate(request: TranslateRequest) -> Response:
     config = await _get_config()
     if config.ai is None:
         raise HTTPException(status_code=500, detail="AI provider configuration is missing")
@@ -1414,27 +1535,42 @@ async def translate(request: TranslateRequest) -> dict[str, Any]:
         debug=config.debug,
     )
     if skip:
-        return {
-            "text": request.text,
-            "model": "",
-            "tokens_used": 0,
-            "skipped": True,
-            "detected_language": detected_iso,
-            "skip_reason": reason,
-        }
-    result = await translate_text(config.ai, request.text, request.language, request.prompt)
-    return {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
+        return JSONResponse(
+            content={
+                "text": request.text,
+                "model": "",
+                "tokens_used": 0,
+                "skipped": True,
+                "detected_language": detected_iso,
+                "skip_reason": reason,
+            },
+            headers={"X-TextKit-Cache": "skipped"},
+        )
+    return await _run_cached_transformation(
+        "translate",
+        request.text,
+        request.prompt,
+        request.language,
+        request.force,
+        config,
+    )
 
 
 @app.post("/format")
-async def format_text_endpoint(request: FormatRequest) -> dict[str, str | int]:
+async def format_text_endpoint(request: FormatRequest) -> Response:
     config = await _get_config()
     if config.ai is None:
         raise HTTPException(status_code=500, detail="AI provider configuration is missing")
     _validate_text_size(request.text, config)
     _validate_optional_prompt(request.prompt, config)
-    result = await format_text(config.ai, request.text, request.prompt)
-    return {"text": result.text, "model": result.model, "tokens_used": result.tokens_used}
+    return await _run_cached_transformation(
+        "format",
+        request.text,
+        request.prompt,
+        None,
+        request.force,
+        config,
+    )
 
 
 def _validate_prompt_request(name: str, language: str | None) -> str | None:
