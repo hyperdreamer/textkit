@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import hashlib
 import logging
 import os
 import sqlite3
@@ -576,6 +577,58 @@ def test_extra_schema_constraint_returns_schema_without_touching_file(
     result = asyncio.run(make_cache(db_path, executor).initialize(FakePolicy()))
 
     assert (result.status, result.reason) == ("unavailable", "schema")
+
+
+@pytest.mark.parametrize(
+    ("literal", "changed_literal", "surviving_operation"),
+    [("'format'", "'for mat'", "translate"), ("'translate'", "'trans late'", "format")],
+    ids=["format", "translate"],
+)
+def test_check_literal_whitespace_difference_is_rejected(
+    db_path: Path, executor, monkeypatch, literal, changed_literal, surviving_operation
+) -> None:
+    # Honest spacing between SQL tokens remains compatible for both definitions.
+    formatted_path = db_path.with_name("formatted.db")
+    with contextlib.closing(raw_connect(formatted_path)) as conn:
+        conn.execute(transformation_cache._CREATE_TABLE_SQL.replace(" ", " \n  "))
+        conn.execute(transformation_cache._CREATE_INDEX_SQL.replace(" ", " \n  "))
+        conn.execute("PRAGMA user_version = 1")
+    os.chmod(formatted_path, 0o600)
+    compatible = asyncio.run(make_cache(formatted_path, executor).initialize(FakePolicy()))
+    assert (compatible.status, compatible.reason) == ("ready", None)
+
+    # This row would be pruned if the incompatible CHECK were adopted.
+    saved_row = (KEY_A, surviving_operation, "keep this output", "model", 7, 1.0)
+    with contextlib.closing(raw_connect(db_path)) as conn:
+        conn.execute(transformation_cache._CREATE_TABLE_SQL.replace(literal, changed_literal))
+        conn.execute(transformation_cache._CREATE_INDEX_SQL)
+        conn.execute("PRAGMA user_version = 1")
+        conn.execute("INSERT INTO transformation_cache VALUES (?, ?, ?, ?, ?, ?)", saved_row)
+        before_schema = conn.execute("SELECT type, name, sql FROM sqlite_master").fetchall()
+    os.chmod(db_path, 0o600)
+    before_hash = hashlib.sha256(db_path.read_bytes()).digest()
+    before_stat = db_path.stat()
+    connections = install_connections(monkeypatch, RecordingConnection)
+
+    result = asyncio.run(
+        make_cache(db_path, executor).initialize(FakePolicy(ttl_days=1), now=BASE_NOW)
+    )
+
+    assert (result.status, result.reason) == ("unavailable", "schema")
+    assert hashlib.sha256(db_path.read_bytes()).digest() == before_hash
+    after_stat = db_path.stat()
+    assert stat.S_IMODE(after_stat.st_mode) == stat.S_IMODE(before_stat.st_mode) == 0o600
+    assert after_stat.st_ino == before_stat.st_ino
+    assert connections[0].closed is True
+    assert "PRAGMA journal_mode=WAL" not in connections[0].statements
+    assert "BEGIN IMMEDIATE" not in connections[0].statements
+    for suffix in ("-wal", "-shm"):
+        assert not db_path.with_name(db_path.name + suffix).exists()
+    with contextlib.closing(raw_connect(db_path)) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert conn.execute("SELECT * FROM transformation_cache").fetchall() == [saved_row]
+        assert conn.execute("SELECT type, name, sql FROM sqlite_master").fetchall() == before_schema
 
 
 def test_unexpected_application_table_returns_schema_without_touching_file(
@@ -1196,7 +1249,7 @@ def test_eligible_write_may_finish_after_caller_cancellation(
 
 
 def test_unexpected_worker_failure_is_allowlisted(
-    db_path: Path, executor, monkeypatch
+    db_path: Path, executor, monkeypatch, cache_log_records
 ) -> None:
     def exploding_opener(path):
         raise RuntimeError("worker secret should not escape")
@@ -1205,6 +1258,12 @@ def test_unexpected_worker_failure_is_allowlisted(
     result = asyncio.run(make_cache(db_path, executor).read(KEY_A, FakePolicy()))
 
     assert (result.status, result.reason) == ("unavailable", "corrupt")
+    assert len(cache_log_records) == 1
+    entry = cache_log_records[0]
+    assert (entry.getMessage(), entry.event, entry.reason, entry.exc_info) == (
+        "transformation cache unavailable", "cache.unavailable", "corrupt", None
+    )
+    assert "worker secret" not in repr(entry.__dict__)
 
 
 def test_cache_work_does_not_block_the_event_loop(db_path: Path, executor, monkeypatch) -> None:
@@ -1309,6 +1368,113 @@ class CapturingHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         self.records.append(record)
+
+
+@pytest.fixture
+def cache_log_records():
+    """Capture directly on the cache logger through worker completion."""
+
+    logger = transformation_cache.logger
+    handler = CapturingHandler()
+    previous_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    try:
+        yield handler.records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+
+async def await_blocked_cache_operation(cache, operation, entered):
+    policy = FakePolicy()
+    if operation == "initialize":
+        request = cache.initialize(policy)
+    elif operation == "read":
+        request = cache.read(KEY_A, policy)
+    else:
+        assert operation == "write"
+        request = cache.write(KEY_A, record(), policy)
+    task = asyncio.create_task(request)
+    assert await asyncio.to_thread(entered.wait, 5.0)
+    return await task
+
+
+@pytest.mark.parametrize("operation", ["initialize", "read", "write"])
+def test_timeout_then_late_close_failure_logs_one_event(
+    db_path: Path, monkeypatch, cache_log_records, operation
+) -> None:
+    pool = ThreadPoolExecutor(max_workers=1)
+    entered = threading.Event()
+    release = threading.Event()
+
+    class LateCloseFailure(RecordingConnection):
+        def close(self):
+            super().close()
+            entered.set()
+            assert release.wait(5.0), "test did not release close"
+            raise RuntimeError(f"SECRET-PROMPT late close: {db_path} {KEY_A}")
+
+    connections = install_connections(monkeypatch, LateCloseFailure)
+    try:
+        cache = make_cache(db_path, pool)
+        result = asyncio.run(await_blocked_cache_operation(cache, operation, entered))
+        assert (result.status, result.reason) == ("unavailable", "timeout")
+        assert len(cache_log_records) == 1
+        assert cache_log_records[0].reason == "timeout"
+    finally:
+        release.set()
+        # Draining the pool keeps the logger attached until the guard finishes.
+        pool.shutdown(wait=True)
+
+    assert connections[0].closed is True
+    assert len(cache_log_records) == 1
+    entry = cache_log_records[0]
+    assert (entry.getMessage(), entry.event, entry.reason, entry.exc_info) == (
+        "transformation cache unavailable", "cache.unavailable", "timeout", None
+    )
+    rendered = repr(entry.__dict__)
+    for secret in (str(db_path), KEY_A, "SECRET-PROMPT", "late close"):
+        assert secret not in rendered
+
+
+@pytest.mark.parametrize("operation", ["initialize", "read", "write"])
+def test_timeout_then_late_worker_failure_logs_one_event(
+    db_path: Path, monkeypatch, cache_log_records, operation
+) -> None:
+    pool = ThreadPoolExecutor(max_workers=1)
+    entered = threading.Event()
+    release = threading.Event()
+
+    class LateWorkerFailure(RecordingConnection):
+        def execute(self, sql, params=()):
+            if "DELETE FROM transformation_cache" in sql:
+                entered.set()
+                assert release.wait(5.0), "test did not release worker"
+                raise RuntimeError(f"SECRET-PROMPT late worker: {db_path} {KEY_A}")
+            return super().execute(sql, params)
+
+    connections = install_connections(monkeypatch, LateWorkerFailure)
+    try:
+        cache = make_cache(db_path, pool)
+        result = asyncio.run(await_blocked_cache_operation(cache, operation, entered))
+        assert (result.status, result.reason) == ("unavailable", "timeout")
+        assert len(cache_log_records) == 1
+        assert cache_log_records[0].reason == "timeout"
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
+
+    assert connections[0].closed is True
+    assert "ROLLBACK" in connections[0].statements
+    assert len(cache_log_records) == 1
+    entry = cache_log_records[0]
+    assert (entry.getMessage(), entry.event, entry.reason, entry.exc_info) == (
+        "transformation cache unavailable", "cache.unavailable", "timeout", None
+    )
+    rendered = repr(entry.__dict__)
+    for secret in (str(db_path), KEY_A, "SECRET-PROMPT", "late worker"):
+        assert secret not in rendered
 
 
 def test_cleanup_failure_is_mapped_once(

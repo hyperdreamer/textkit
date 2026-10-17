@@ -324,26 +324,27 @@ class TransformationCache:
         now: Optional[float],
         *payload: Any,
     ) -> Any:
+        failure = _FailureReporter()
         try:
             resolved_now = _finite_timestamp(self._clock() if now is None else now)
         except (_CacheFailure, TypeError, ValueError):
-            _log_failure("corrupt")
+            failure.report("corrupt")
             return _unavailable(result_type, "corrupt")
         # The budget starts before queue submission so worker queue delay counts.
         deadline = _monotonic() + BUDGET_SECONDS
         executor = self._executor if self._executor is not None else _default_executor()
         try:
             future = executor.submit(
-                worker, self._path, deadline, resolved_now, policy, *payload
+                worker, self._path, deadline, resolved_now, policy, failure, *payload
             )
         except Exception:
-            _log_failure("corrupt")
+            failure.report("corrupt")
             return _unavailable(result_type, "corrupt")
 
         remaining = deadline - _monotonic()
         if remaining <= 0:
             _discard(future)
-            _log_failure("timeout")
+            failure.report("timeout")
             return _unavailable(result_type, "timeout")
 
         try:
@@ -352,13 +353,9 @@ class TransformationCache:
             # Cancelling the caller-side future cannot stop an operating-system
             # call already running in the worker; it still closes its connection.
             _discard(future)
-            _log_failure("timeout")
+            failure.report("timeout")
             return _unavailable(result_type, "timeout")
 
-        # Workers report every failure except their own deadline expiry; the
-        # caller owns timeout logging so one attempt logs exactly one event.
-        if getattr(result, "reason", None) == "timeout":
-            _log_failure("timeout")
         return result
 
 
@@ -373,6 +370,21 @@ def _log_failure(reason: str) -> None:
     """Log one fixed event with only an allowlisted reason."""
 
     logger.warning(FAILURE_MESSAGE, extra={"event": "cache.unavailable", "reason": reason})
+
+
+class _FailureReporter:
+    """Let the caller and worker share one failure-reporting claim per operation."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._reported = False
+
+    def report(self, reason: str) -> None:
+        with self._lock:
+            if self._reported:
+                return
+            self._reported = True
+        _log_failure(reason)
 
 
 def _classify_sqlite_error(exc: sqlite3.Error, deadline: float) -> str:
@@ -431,9 +443,10 @@ def _worker_initialize(
     deadline: float,
     now: float,
     policy: CachePolicyView,
+    failure: _FailureReporter,
 ) -> CacheMaintenanceResult:
     return _guarded(
-        deadline, CacheMaintenanceResult, _initialize_sync, path, deadline, now, policy
+        deadline, failure, CacheMaintenanceResult, _initialize_sync, path, deadline, now, policy
     )
 
 
@@ -442,10 +455,11 @@ def _worker_read(
     deadline: float,
     now: float,
     policy: CachePolicyView,
+    failure: _FailureReporter,
     key: Any,
 ) -> CacheReadResult:
     return _guarded(
-        deadline, CacheReadResult, _read_sync, path, deadline, now, policy, key
+        deadline, failure, CacheReadResult, _read_sync, path, deadline, now, policy, key
     )
 
 
@@ -454,16 +468,18 @@ def _worker_write(
     deadline: float,
     now: float,
     policy: CachePolicyView,
+    failure: _FailureReporter,
     key: Any,
     record: Any,
 ) -> CacheWriteResult:
     return _guarded(
-        deadline, CacheWriteResult, _write_sync, path, deadline, now, policy, key, record
+        deadline, failure, CacheWriteResult, _write_sync, path, deadline, now, policy, key, record
     )
 
 
 def _guarded(
     deadline: float,
+    failure: _FailureReporter,
     result_type: Callable[..., Any],
     operation: Callable[..., Any],
     *args: Any,
@@ -474,8 +490,7 @@ def _guarded(
         return operation(*args)
     except Exception as exc:
         reason = _sanitize(exc, deadline)
-        if reason != "timeout":
-            _log_failure(reason)
+        failure.report(reason)
         return _unavailable(result_type, reason)
 
 
@@ -725,7 +740,7 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
     ).fetchone()
     if table_sql is None or table_sql[0] is None:
         raise _CacheFailure("schema")
-    if _squash(str(table_sql[0])) != _squash(_CREATE_TABLE_SQL):
+    if _schema_tokens(str(table_sql[0])) != _schema_tokens(_CREATE_TABLE_SQL):
         raise _CacheFailure("schema")
 
     index_sql = connection.execute(
@@ -733,14 +748,18 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
     ).fetchone()
     if index_sql is None or index_sql[0] is None:
         raise _CacheFailure("schema")
-    if _squash(str(index_sql[0])) != _squash(_CREATE_INDEX_SQL):
+    if _schema_tokens(str(index_sql[0])) != _schema_tokens(_CREATE_INDEX_SQL):
         raise _CacheFailure("schema")
 
 
-def _squash(text: str) -> str:
-    """Drop every whitespace character, keeping case and literals intact."""
+def _schema_tokens(text: str) -> list[str]:
+    """Ignore inter-token spacing; preserve quoted tokens and comments verbatim."""
 
-    return "".join(text.split())
+    return re.findall(
+        r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|`(?:[^`]|``)*`|\[[^\]]*\]"
+        r"|--[^\r\n]*(?:\r\n|\r|\n|$)|/\*[\s\S]*?\*/|[\w$]+|[^ \t\n\r\f]",
+        text,
+    )
 
 
 def _create_schema(connection: sqlite3.Connection) -> None:
