@@ -74,6 +74,7 @@ MIN_DETECT_CHARS = 20
 SUPPORTED_LANGUAGES = frozenset(
     {"original", "chinese", "english", "japanese", "korean", "french", "german", "spanish"}
 )
+SUPPORTED_ENDPOINTS = ("/v1/chat/completions", "/v1/responses", "/v1/messages")
 
 CACHE_FORMAT_VERSION = 1
 PIPELINE_REVISIONS = {"format": 1, "translate": 1}
@@ -401,6 +402,15 @@ def load_config() -> AppConfig:
     raw = _load_yaml_config()
     if "save_root" in raw:
         raise RuntimeError("save_root was removed; file saving belongs to the authenticated file bridge")
+    raw_ai = raw.get("ai")
+    if isinstance(raw_ai, dict) and "endpoint" in raw_ai:
+        raw_endpoint = raw_ai["endpoint"]
+        if not isinstance(raw_endpoint, str) or raw_endpoint not in SUPPORTED_ENDPOINTS:
+            ordered = ", ".join(sorted(SUPPORTED_ENDPOINTS))
+            raise RuntimeError(
+                f"Unsupported ai.endpoint value: {raw_endpoint!r}. "
+                f"Use one of: {ordered}"
+            )
     try:
         config = AppConfig.model_validate(raw)
     except ValidationError as exc:
@@ -460,6 +470,8 @@ def _resolve_ai_config(base: AIConfig, override: ProviderOverride | None) -> AIC
         api_key_env=override.api_key_env if override_has_key else base.api_key_env,
         model=override.model or base.model,
         max_tokens=override.max_tokens if override.max_tokens is not None else base.max_tokens,
+        endpoint=base.endpoint,
+        messages_default_max_tokens=base.messages_default_max_tokens,
         timeout=base.timeout,
     )
 

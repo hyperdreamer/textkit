@@ -703,6 +703,82 @@ def test_load_config_does_not_rewarn_for_unchanged_config(
     assert len(warnings) == 2
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    ["/v1/chat/completions", "/v1/responses", "/v1/messages"],
+)
+def test_load_config_accepts_each_supported_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, endpoint: str
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "ai:\n"
+        '  api_base: "https://example.invalid"\n'
+        '  api_key: "test-key"\n'
+        f'  endpoint: "{endpoint}"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "_config_cache", None)
+    assert main.load_config().ai.endpoint == endpoint
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("null", "Unsupported ai.endpoint value: None."),
+        ("/chat/completions", "Unsupported ai.endpoint value: '/chat/completions'."),
+        ("https://api.openai.com/v1/messages", "Unsupported ai.endpoint value:"),
+        ("123", "Unsupported ai.endpoint value: 123."),
+    ],
+)
+def test_load_config_rejects_present_invalid_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str, expected: str
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "ai:\n"
+        '  api_base: "https://example.invalid"\n'
+        '  api_key: "test-key"\n'
+        f"  endpoint: {raw}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "_config_cache", None)
+    with pytest.raises(RuntimeError, match=expected):
+        main.load_config()
+
+
+def test_resolve_ai_config_carries_endpoint_and_messages_default() -> None:
+    base = main.AIConfig(
+        api_base="https://example.invalid",
+        api_key="k",
+        model="m",
+        endpoint="/v1/messages",
+        messages_default_max_tokens=2048,
+        text=main.ProviderOverride(model="other"),
+    )
+    effective = main._resolve_ai_config(base, base.text)
+    assert effective.endpoint == "/v1/messages"
+    assert effective.messages_default_max_tokens == 2048
+
+
+def test_provider_override_rejects_endpoint() -> None:
+    with pytest.raises(Exception):
+        main.ProviderOverride(endpoint="/v1/messages")
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "5", 1.0])
+def test_messages_default_max_tokens_rejects_invalid(value: object) -> None:
+    with pytest.raises(Exception):
+        main.AIConfig(messages_default_max_tokens=value)
+
+
+def test_messages_default_max_tokens_defaults_and_accepts_positive() -> None:
+    assert main.AIConfig().messages_default_max_tokens == 4096
+    assert main.AIConfig(messages_default_max_tokens=1).messages_default_max_tokens == 1
+
+
 def test_credentials_are_resolved_lazily_per_operation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
