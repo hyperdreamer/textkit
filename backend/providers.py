@@ -105,6 +105,68 @@ def _require_mapping(payload: object, label: str) -> Mapping[str, Any]:
     return payload
 
 
+def _require_model(payload: Mapping[str, Any], configured_model: str) -> str:
+    raw = payload.get("model", _ABSENT)
+    if raw is _ABSENT:
+        return configured_model
+    if not isinstance(raw, str):
+        raise ProviderProtocolError(
+            f"provider response field model must be a string, got {raw!r}"
+        )
+    return raw
+
+
+def _require_non_negative_int(value: object, field: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ProviderProtocolError(
+            f"provider response field {field} must be a non-negative integer, got {value!r}"
+        )
+    return value
+
+
+def _extract_chat_text(payload: Mapping[str, Any]) -> str:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise ProviderProtocolError("OpenAI API response is missing choices")
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        raise ProviderProtocolError("OpenAI API response is missing choices[0].message")
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    if isinstance(content, list):
+        parts = [
+            part["text"].strip()
+            for part in content
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+            and part["text"].strip()
+        ]
+        if parts:
+            return "\n".join(parts)
+    raise ProviderProtocolError("OpenAI API response contains no text content")
+
+
+def _chat_usage_tokens(payload: Mapping[str, Any]) -> int:
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return 0
+    total = usage.get("total_tokens", 0)
+    if not isinstance(total, int) or total < 0:
+        raise ProviderProtocolError("OpenAI API response has invalid token usage")
+    return total
+
+
+def _chat_finish_reason(payload: Mapping[str, Any]) -> str | None:
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        reason = choices[0].get("finish_reason")
+        if isinstance(reason, str):
+            return reason
+    return None
+
+
 def _render_chat_content(
     content: str | Sequence[TextPart | ImagePart],
 ) -> str | list[dict[str, Any]]:
@@ -149,7 +211,13 @@ class ChatCompletionsAdapter:
         }
 
     def parse_response(self, payload: object, *, configured_model: str) -> ChatCompletion:
-        raise NotImplementedError
+        mapping = _require_mapping(payload, "response")
+        return ChatCompletion(
+            text=_extract_chat_text(mapping),
+            model=_require_model(mapping, configured_model),
+            tokens_used=_chat_usage_tokens(mapping),
+            finish_reason=_chat_finish_reason(mapping),
+        )
 
 
 class ResponsesAdapter:

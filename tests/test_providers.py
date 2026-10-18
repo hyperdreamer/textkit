@@ -190,3 +190,98 @@ def test_chat_completion_field_order_and_default_finish_reason():
 
 def test_messages_default_max_tokens_defaults_to_4096():
     assert _config().messages_default_max_tokens == 4096
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("  hello  ", "hello"),
+        ([{"type": "text", "text": " a "}, {"type": "text", "text": " b "}], "a\nb"),
+    ],
+)
+def test_chat_text_is_stripped_and_list_parts_join_with_newline(content, expected):
+    payload = {"choices": [{"message": {"content": content}}]}
+    result = providers.ChatCompletionsAdapter().parse_response(
+        payload, configured_model="cfg"
+    )
+    assert result.text == expected
+
+
+@pytest.mark.parametrize("content", ["", "   ", None])
+def test_chat_blank_content_is_rejected(content):
+    payload = {"choices": [{"message": {"content": content}}]}
+    with pytest.raises(providers.ProviderProtocolError):
+        providers.ChatCompletionsAdapter().parse_response(payload, configured_model="cfg")
+
+
+def test_chat_missing_choices_message_mentions_missing_choices():
+    with pytest.raises(providers.ProviderProtocolError, match="missing choices"):
+        providers.ChatCompletionsAdapter().parse_response(
+            {"model": "m"}, configured_model="cfg"
+        )
+
+
+_CHAT_PAYLOAD = {
+    "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+}
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        (None, 0),
+        ({}, 0),
+        ({"total_tokens": 3}, 3),
+        ({"total_tokens": True}, 1),
+        ({"total_tokens": 0}, 0),
+        ({"prompt_tokens": "bad"}, 0),
+        ({"total_tokens": 3, "prompt_tokens": "bad"}, 3),
+    ],
+)
+def test_chat_usage_compatibility_table(usage, expected):
+    payload = dict(_CHAT_PAYLOAD)
+    if usage is not None:
+        payload["usage"] = usage
+    result = providers.ChatCompletionsAdapter().parse_response(
+        payload, configured_model="cfg"
+    )
+    assert result.tokens_used == expected
+
+
+def test_chat_usage_absent_normalizes_to_zero():
+    result = providers.ChatCompletionsAdapter().parse_response(
+        _CHAT_PAYLOAD, configured_model="cfg"
+    )
+    assert result.tokens_used == 0
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"total_tokens": -1},
+        {"total_tokens": 1.0},
+        {"total_tokens": "3"},
+        {"total_tokens": None},
+    ],
+)
+def test_chat_rejects_invalid_total_tokens(usage):
+    payload = dict(_CHAT_PAYLOAD)
+    payload["usage"] = usage
+    with pytest.raises(providers.ProviderProtocolError):
+        providers.ChatCompletionsAdapter().parse_response(
+            payload, configured_model="cfg"
+        )
+
+
+def test_chat_ignores_populated_error_field():
+    payload = {
+        "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"total_tokens": 3},
+        "model": "upstream",
+        "error": {"code": "server_error"},
+    }
+    result = providers.ChatCompletionsAdapter().parse_response(
+        payload, configured_model="cfg"
+    )
+    assert result.text == "ok"
+    assert result.tokens_used == 3
