@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "TextKit",
+  "version": "2.1.2",
+  "minimum_chrome_version": "116",
+  "description": "Select a page region, OCR repeated viewport captures, and download merged text.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "downloads",
+    "storage",
+    "offscreen",
+    "clipboardWrite",
+    "notifications"
+  ],
+  "optional_host_permissions": [
+    "http://localhost/*",
+    "http://127.0.0.1/*",
+    "http://[::1]/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "TextKit"
+  },
+  "commands": {
+    "start-region-capture": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+S",
+        "mac": "Command+Shift+S"
+      },
+      "description": "Select a region and start OCR capture"
+    }
+  }
+}
