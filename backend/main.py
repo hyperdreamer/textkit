@@ -225,6 +225,8 @@ class AIConfig(FrozenModel):
     api_key_env: str = ""
     model: str = Field(default="gpt-4.1-mini", min_length=1, max_length=200)
     max_tokens: int | None = Field(default=None, ge=1, le=1_000_000)
+    endpoint: Literal["/v1/chat/completions", "/v1/responses", "/v1/messages"] | None = None
+    messages_default_max_tokens: int = Field(default=4096, strict=True, gt=0)
     timeout: TimeoutConfig = Field(default_factory=TimeoutConfig)
     ocr: ProviderOverride | None = None
     text: ProviderOverride | None = None
