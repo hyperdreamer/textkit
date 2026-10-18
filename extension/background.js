@@ -472,6 +472,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch((e) => sendResponse({ ok: false, error: e.message }));
     return true;
   }
+  if (message?.type === 'commands:binding') {
+    let replied = false;
+    const reply = (payload) => {
+      if (!replied) {
+        replied = true;
+        sendResponse(payload);
+      }
+    };
+    try {
+      chrome.commands.getAll()
+        .then((rows) => {
+          const row = rows.find(
+            (candidate) => candidate.name === 'confirm-region-capture'
+          );
+          if (!row) return reply({ state: 'unavailable' });
+          return reply(row.shortcut
+            ? { state: 'assigned', label: row.shortcut }
+            : { state: 'unassigned' });
+        })
+        .catch(() => reply({ state: 'unavailable' }));
+    } catch {
+      reply({ state: 'unavailable' });
+    }
+    return true;
+  }
   return false;
 });
 

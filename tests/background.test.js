@@ -2322,3 +2322,101 @@ test('W08 launch retains readiness permission injection and token flow', async (
     message: { type: 'selection:start', selectionToken: state.selectionToken }
   }]);
 });
+
+async function bindingProbe(getAll) {
+  const h = await shortcutWorker();
+  h.context.chrome.commands.getAll = getAll;
+  const responses = [];
+  const returns = h.events.runtimeMessage.emit(
+    { type: 'commands:binding' }, {}, (value) => responses.push(plain(value))
+  );
+  return { h, returns, responses };
+}
+
+test('W09 assigned binding uses exact-name row and asynchronous channel', async () => {
+  const gate = deferred();
+  const { h, returns, responses } = await bindingProbe(() => gate.promise);
+  assert.deepEqual(returns, [true], 'W09 listener must return true');
+  assert.deepEqual(responses, []);
+  gate.resolve([
+    { name: 'start-region-capture', shortcut: 'Ctrl+Shift+S' },
+    { name: 'confirm-region-capture-extra', shortcut: 'WRONG' },
+    { name: 'confirm-region-capture', shortcut: 'Alt+Shift+O' }
+  ]);
+  await delay();
+  assert.deepEqual(responses, [{ state: 'assigned', label: 'Alt+Shift+O' }]);
+  assert.deepEqual(h.queries, []);
+  assert.deepEqual(h.sends, []);
+  h.assertQuiet();
+});
+
+test('W10 empty shortcut is unassigned with no label', async () => {
+  const p = await bindingProbe(() => Promise.resolve([
+    { name: 'confirm-region-capture', shortcut: '' }
+  ]));
+  await delay();
+  assert.deepEqual(p.returns, [true]);
+  assert.deepEqual(p.responses, [{ state: 'unassigned' }]);
+  p.h.assertQuiet();
+});
+
+test('W11 missing exact command row is unavailable', async () => {
+  const p = await bindingProbe(() => Promise.resolve([
+    { name: 'start-region-capture', shortcut: 'Ctrl+Shift+S' },
+    { name: 'confirm-region-capture-extra', shortcut: 'Alt+Shift+O' }
+  ]));
+  await delay();
+  assert.deepEqual(p.returns, [true]);
+  assert.deepEqual(p.responses, [{ state: 'unavailable' }]);
+  p.h.assertQuiet();
+});
+
+test('W12 rejected lookup replies unavailable without escaped rejection', async () => {
+  const p = await bindingProbe(() => Promise.reject(new Error('getAll rejected')));
+  await delay();
+  assert.deepEqual(p.returns, [true]);
+  assert.deepEqual(p.responses, [{ state: 'unavailable' }]);
+  p.h.assertQuiet();
+});
+
+test('W13 synchronous getAll throw replies before listener returns true', async () => {
+  const h = await shortcutWorker();
+  h.context.chrome.commands.getAll = () => { throw new Error('getAll threw'); };
+  let returned = false;
+  const responses = [];
+  const returns = h.events.runtimeMessage.emit({ type: 'commands:binding' }, {}, (value) => {
+    assert.equal(returned, false);
+    responses.push(plain(value));
+  });
+  returned = true;
+  assert.deepEqual(returns, [true]);
+  assert.deepEqual(responses, [{ state: 'unavailable' }]);
+  await delay();
+  assert.equal(responses.length, 1);
+  h.assertQuiet();
+});
+
+test('W14 replied latch defeats a second failure path', async () => {
+  const p = await bindingProbe(() => ({
+    then(fulfilled) {
+      fulfilled([{ name: 'confirm-region-capture', shortcut: 'Alt+Shift+O' }]);
+      return { catch(rejected) { rejected(new Error('late failure')); } };
+    }
+  }));
+  assert.deepEqual(p.returns, [true]);
+  assert.deepEqual(p.responses, [{ state: 'assigned', label: 'Alt+Shift+O' }]);
+  p.h.assertQuiet();
+  const h = await shortcutWorker();
+  h.context.chrome.commands.getAll = () => Promise.resolve([
+    { name: 'confirm-region-capture', shortcut: 'Alt+Shift+O' }
+  ]);
+  let calls = 0;
+  const returns = h.events.runtimeMessage.emit({ type: 'commands:binding' }, {}, () => {
+    calls += 1;
+    throw new Error('response delivery threw');
+  });
+  await delay();
+  assert.deepEqual(returns, [true]);
+  assert.equal(calls, 1, 'latch is set before sendResponse can throw');
+  h.assertQuiet();
+});
