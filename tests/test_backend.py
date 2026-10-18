@@ -1260,15 +1260,6 @@ def _settings(
     )
 
 
-def test_provider_endpoint_uses_the_resolver_per_protocol() -> None:
-    for endpoint, suffix in [
-        (None, "/v1/chat/completions"),
-        ("/v1/responses", "/v1/responses"),
-        ("/v1/messages", "/v1/messages"),
-    ]:
-        assert _settings(endpoint=endpoint).provider_endpoint.endswith(suffix)
-
-
 def test_cache_identity_is_isolated_between_protocols() -> None:
     chat = main._cache_identity("format", "hello", None, _settings())
     responses = main._cache_identity(
@@ -1279,21 +1270,43 @@ def test_cache_identity_is_isolated_between_protocols() -> None:
 
 
 def test_messages_default_max_tokens_changes_messages_identity_only() -> None:
-    first = main._cache_identity("format", "hello", None, _settings("/v1/messages", 4096))
-    second = main._cache_identity("format", "hello", None, _settings("/v1/messages", 2048))
+    first = main._cache_identity(
+        "format", "hello", None, _settings("/v1/messages", 4096)
+    )
+    second = main._cache_identity(
+        "format", "hello", None, _settings("/v1/messages", 2048)
+    )
     assert first != second
     legacy_a = main._cache_identity("format", "hello", None, _settings(fallback=4096))
     legacy_b = main._cache_identity("format", "hello", None, _settings(fallback=2048))
     assert legacy_a == legacy_b
+    responses_a = main._cache_identity(
+        "format", "hello", None, _settings("/v1/responses", 4096)
+    )
+    responses_b = main._cache_identity(
+        "format", "hello", None, _settings("/v1/responses", 2048)
+    )
+    assert responses_a == responses_b
 
 
-def test_resolved_text_settings_endpoint_follows_the_protocol() -> None:
+@pytest.mark.parametrize(
+    ("endpoint", "expected"),
+    [
+        (None, "https://example.invalid/v1/chat/completions"),
+        ("/v1/chat/completions", "https://example.invalid/v1/chat/completions"),
+        ("/v1/responses", "https://example.invalid/v1/responses"),
+        ("/v1/messages", "https://example.invalid/v1/messages"),
+    ],
+)
+def test_resolved_text_settings_endpoint_follows_the_protocol(
+    endpoint: str | None, expected: str
+) -> None:
     base = main.AIConfig(
         api_base="https://example.invalid",
         api_key="k",
         model="test-model",
-        endpoint="/v1/responses",
+        endpoint=endpoint,
     )
     settings = asyncio.run(main._resolve_text_settings(base, "format", "p"))
-    assert settings.config.endpoint == "/v1/responses"
-    assert settings.provider_endpoint == "https://example.invalid/v1/responses"
+    assert settings.config.endpoint == endpoint
+    assert settings.provider_endpoint == expected
