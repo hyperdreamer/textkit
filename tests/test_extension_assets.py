@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -55,3 +56,14 @@ def test_popup_has_one_main_landmark_and_complete_tab_semantics() -> None:
     assert {tab["aria-controls"] for tab in parser.tabs} == {panel["id"] for panel in parser.panels}
     assert all(panel.get("aria-labelledby") for panel in parser.panels)
     assert parser.live_regions >= 3
+
+
+def test_popup_version_element_is_manifest_driven() -> None:
+    html = (ROOT / "extension" / "popup.html").read_text(encoding="utf-8")
+    popup_js = (ROOT / "extension" / "popup.js").read_text(encoding="utf-8")
+
+    # A hardcoded version literal drifts from manifest.json on every release bump.
+    assert re.search(r'<span class="version" id="app-version"></span>', html)
+    assert not re.search(r'class="version"[^>]*>\s*v\d', html)
+    assert "getManifest" in popup_js
+    assert "appVersionEl.textContent" in popup_js
