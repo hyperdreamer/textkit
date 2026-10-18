@@ -32,10 +32,14 @@ max_concurrent_requests: 4
 # directory persists after backend exit until manually removed or temp cleanup.
 # debug: false
 
-# AI API settings — uses an OpenAI-compatible chat completions API.
+# AI API settings — OpenAI Chat Completions by default, with optional
+# OpenAI Responses or Anthropic Messages.
 ai:
-  # Base URL for the provider API, without a trailing slash.
-  # OpenAI-compatible providers must expose /v1/chat/completions.
+  # Base URL for the provider API, without a trailing slash.  Trailing slashes
+  # are stripped before the endpoint is appended, so gateway prefixes such as
+  # https://gateway.example.com/openai survive in both modes.
+  # A base that already ends in /v1 is not normalized: legacy mode appends
+  # /v1/chat/completions verbatim, producing a doubled /v1/v1 segment.
   api_base: "https://api.openai.com"
 
   # API key for the provider. Plaintext values are used directly.
@@ -46,18 +50,48 @@ ai:
   # Examples: $OCR_API_KEY, $OPENAI_API_KEY.
   api_key: "$OCR_API_KEY"
 
+  # Upstream protocol.  Omit this key to keep the legacy behaviour: the backend
+  # appends /v1/chat/completions verbatim to the validated api_base (there is no
+  # standalone /v1 auto-append and no path normalization).  An explicit value
+  # selects one of exactly three protocols:
+  #
+  #   /v1/chat/completions  OpenAI Chat Completions
+  #   /v1/responses         OpenAI Responses
+  #   /v1/messages          Anthropic Messages
+  #
+  # The explicit endpoint is appended to api_base after trailing slashes are
+  # removed, so gateway path prefixes are preserved.  Any other value — null, a
+  # non-string, an alias, or a full URL — is a configuration error: startup
+  # refuses to run, and a later edit fails the next request with a structured
+  # 500 instead of calling the provider.
+  #
+  # Auth differs by protocol: both OpenAI protocols send
+  # Authorization: Bearer <key>; Messages sends x-api-key: <key> together with
+  # anthropic-version: 2023-06-01.
+  #
+  # This field belongs to the base ai section only; ai.ocr and ai.text cannot
+  # override it.
+  # endpoint: "/v1/chat/completions"
+
+  # Token cap used only by Anthropic Messages, and only when no positive
+  # effective max_tokens exists.  OpenAI protocols ignore it.  Must be a strict
+  # positive integer (Booleans, strings, fractions, and null are rejected).
+  # messages_default_max_tokens: 4096
+
   # Vision-capable model name to use when no per-task override specifies one.
   model: "gpt-4.1-mini"
 
-  # Optional completion-token cap sent as ``max_tokens``.  Set it when a
-  # reasoning model exhausts a provider default and truncates long output; the
-  # /format and /translate pipelines also recover from truncation by splitting
-  # the text.
+  # Optional completion-token cap.  Chat sends it as ``max_tokens``, Responses
+  # as ``max_output_tokens``, and Messages as ``max_tokens`` (falling back to
+  # messages_default_max_tokens).  Set it when a reasoning model exhausts a
+  # provider default and truncates long output; the /format and /translate
+  # pipelines also recover from truncation by splitting the text.
   # max_tokens: 32000
 
   # Per-task model/API overrides (optional).  Every field is optional — empty
   # fields inherit from the parent ``ai`` section.  You can override the model
-  # or API endpoint for a specific task.
+  # or provider base URL for a specific task, but not the protocol endpoint:
+  # ai.endpoint is a base ``ai`` field and the override model rejects it.
   #
   # ocr:                    # OCR-specific overrides
   #   model: "gpt-4.1"      # vision-capable model for OCR

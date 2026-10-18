@@ -691,6 +691,16 @@ async def _get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
+def _transport_label(config: AIConfig) -> str:
+    """The provider name used in transport and decode error details.
+
+    Messages is Anthropic's wire protocol; every OpenAI-shaped protocol keeps
+    the legacy ``OpenAI`` label so Chat details stay byte-compatible.
+    """
+
+    return "Anthropic" if config.endpoint == "/v1/messages" else "OpenAI"
+
+
 async def _call_with_retry(config: AIConfig, make_request: Any, provider_name: str) -> httpx.Response:
     deadline = config.timeout.read + 60
     last_exc: Exception | None = None
@@ -760,8 +770,9 @@ async def _request_chat_completion(
             raise HTTPException(status_code=502, detail=f"OpenAI API failed: {detail}")
         return response
 
+    provider_label = _transport_label(resolved)
     payload = _decode_provider_json(
-        await _call_with_retry(config, _do_request, "OpenAI"), "OpenAI"
+        await _call_with_retry(config, _do_request, provider_label), provider_label
     )
     try:
         return adapter.parse_response(payload, configured_model=config.model)

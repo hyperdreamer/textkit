@@ -868,6 +868,98 @@ def test_messages_default_max_tokens_defaults_and_accepts_positive() -> None:
     assert main.AIConfig(messages_default_max_tokens=1).messages_default_max_tokens == 1
 
 
+# ── configuration error paths: startup refusal and request-time reload ──
+
+
+def _write_config(path: Path, *, endpoint_line: str) -> None:
+    path.write_text(
+        "ai:\n"
+        '  api_base: "https://example.invalid"\n'
+        '  api_key: "test-key"\n' + endpoint_line,
+        encoding="utf-8",
+    )
+
+
+def test_lifespan_invalid_endpoint_refuses_startup_without_http_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, endpoint_line='  endpoint: "/bad/path"\n')
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "_config_cache", None)
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("startup refusal must not reach the provider")
+
+    with _mocked_provider(handler) as requests:
+        # The bare ``client`` fixture skips lifespan startup; only the
+        # context-managed form runs it, so the refusal surfaces as RuntimeError.
+        with pytest.raises(RuntimeError, match="Unsupported ai.endpoint value"):
+            with TestClient(main.app):
+                pass
+
+    assert requests == []
+
+
+def test_request_time_reload_invalid_endpoint_returns_exact_500_envelope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, endpoint_line='  endpoint: "/v1/responses"\n')
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "_config_cache", None)
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_protocol_envelope("/v1/responses", "deduped"))
+
+    with _mocked_provider(handler) as requests:
+        client = TestClient(main.app)
+        ok = client.post("/dedup", json={"text": "hello"})
+        assert ok.status_code == 200
+        assert ok.json()["text"] == "deduped"
+        assert len(requests) == 1
+
+        _write_config(config_path, endpoint_line='  endpoint: "/v1/bogus"\n')
+        # Clear the cache explicitly so the reload does not depend on the
+        # filesystem timestamp granularity of the edited file.
+        monkeypatch.setattr(main, "_config_cache", None)
+        response = client.post("/dedup", json={"text": "hello"})
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["text"] == ""
+    assert body["model"] == ""
+    assert body["tokens_used"] == 0
+    assert "Unsupported ai.endpoint value" in body["error"]
+    # The structured 500 comes from security_and_limits before any AI work.
+    assert body["error"] != "Internal server error"
+    assert len(requests) == 1, "an invalid reload must not make a second upstream call"
+
+
+def test_invalid_endpoint_paths_make_zero_upstream_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client_calls: list[str] = []
+
+    async def spy_client() -> httpx.AsyncClient:
+        client_calls.append("client")
+        raise AssertionError("rejecting a config needs no provider client")
+
+    monkeypatch.setattr(main, "_get_http_client", spy_client)
+    config_path = tmp_path / "config.yaml"
+    _write_config(config_path, endpoint_line="  endpoint: null\n")
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "_config_cache", None)
+
+    with pytest.raises(RuntimeError, match="Unsupported ai.endpoint value: None"):
+        main.load_config()
+    with pytest.raises(RuntimeError, match="Unsupported ai.endpoint value: None"):
+        with TestClient(main.app):
+            pass
+
+    assert client_calls == []
+
+
 def test_credentials_are_resolved_lazily_per_operation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2190,6 +2282,72 @@ def test_malformed_envelope_does_not_retry(monkeypatch: pytest.MonkeyPatch) -> N
     assert "missing choices" in error.detail
     assert len(calls) == 1
     assert delays == []
+
+
+def test_transport_failure_label_follows_the_resolved_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec decision 5: Messages details say Anthropic, OpenAI details stay OpenAI."""
+
+    delays = _spy_sleep(monkeypatch)
+
+    async def failing(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    messages_result, messages_error = _call_facade(
+        _provider_config(endpoint="/v1/messages"), failing
+    )
+    chat_result, chat_error = _call_facade(_provider_config(), failing)
+
+    assert messages_result is None
+    assert isinstance(messages_error, main.HTTPException)
+    assert messages_error.status_code == 502
+    assert messages_error.detail.startswith("Anthropic API connection failed: ")
+
+    assert chat_result is None
+    assert isinstance(chat_error, main.HTTPException)
+    assert chat_error.status_code == 502
+    assert chat_error.detail.startswith("OpenAI API connection failed: ")
+
+    assert delays == [1, 1]
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected_label"),
+    [
+        (None, "OpenAI"),
+        ("/v1/chat/completions", "OpenAI"),
+        ("/v1/responses", "OpenAI"),
+        ("/v1/messages", "Anthropic"),
+    ],
+    ids=["legacy", "chat", "responses", "messages"],
+)
+def test_decode_failure_label_follows_the_resolved_protocol(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str | None, expected_label: str
+) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="not json")
+
+    _result, error = _call_facade(_provider_config(endpoint=endpoint), handler)
+
+    assert isinstance(error, main.HTTPException)
+    assert error.status_code == 502
+    assert error.detail == f"{expected_label} API returned invalid JSON"
+
+
+def test_legacy_chat_http_error_detail_keeps_its_wording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The is_error branch keeps the byte-identical legacy ``OpenAI`` prefix."""
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="bad request")
+
+    _result, error = _call_facade(_provider_config(), handler)
+
+    assert isinstance(error, main.HTTPException)
+    assert error.status_code == 502
+    assert error.detail == "OpenAI API failed: bad request"
 
 
 def test_shared_pooled_client_is_reused() -> None:
