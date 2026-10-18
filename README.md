@@ -279,7 +279,7 @@ cache:
 
 Supported `ai` fields:
 
-- `api_base`: base provider URL without a trailing slash; trailing slashes are removed before the endpoint is appended. The protocol path is appended to this base in both modes, so gateway path prefixes such as `https://gateway.example.com/openai` survive. HTTP is accepted for any host, but non-loopback HTTP is unencrypted and the backend logs a startup warning; prefer HTTPS.
+- `api_base`: base provider URL without a trailing slash; trailing slashes are removed before the endpoint is appended. Omitting `api_base` defaults to `https://api.openai.com` in both legacy and explicit modes. The protocol path is appended to this base in both modes, so gateway path prefixes such as `https://gateway.example.com/openai` survive. HTTP is accepted for any host, but non-loopback HTTP is unencrypted and the backend logs a startup warning; prefer HTTPS.
 - `endpoint` (optional): upstream protocol. Omitting it keeps the legacy behaviour — the backend appends `/v1/chat/completions` verbatim to the validated `api_base`, with no standalone `/v1` auto-append and no path normalization, so a base that already ends in `/v1` produces a doubled `/v1/v1` segment exactly as before. An explicit value selects one of exactly three protocols:
   - `/v1/chat/completions` — OpenAI Chat Completions
   - `/v1/responses` — OpenAI Responses

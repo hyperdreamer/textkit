@@ -756,6 +756,7 @@ async def _request_chat_completion(
         write=config.timeout.write,
         pool=config.timeout.pool,
     )
+    provider_label = _transport_label(resolved)
 
     async def _do_request() -> httpx.Response:
         client = await _get_http_client()
@@ -767,10 +768,11 @@ async def _request_chat_completion(
         )
         if response.is_error:
             detail = response.text[:500] + ("..." if len(response.text) > 500 else "")
-            raise HTTPException(status_code=502, detail=f"OpenAI API failed: {detail}")
+            raise HTTPException(
+                status_code=502, detail=f"{provider_label} API failed: {detail}"
+            )
         return response
 
-    provider_label = _transport_label(resolved)
     payload = _decode_provider_json(
         await _call_with_retry(config, _do_request, provider_label), provider_label
     )

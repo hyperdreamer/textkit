@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from typing import Awaitable, Callable, Iterator
@@ -1236,26 +1237,34 @@ def test_legacy_chat_wire_goldens_match_pre_change_bytes(operation: str) -> None
     assert b"temperature" not in request.content
 
 
-def test_legacy_chat_wire_golden_includes_idempotency_without_reordering_json_headers() -> (
-    None
-):
-    messages, expected_body = LEGACY_CASES["ocr"]
-    request = _capture_legacy_chat_request(messages, idempotency_key="ocr-op-1")
+@pytest.mark.parametrize("operation", sorted(LEGACY_CASES))
+def test_legacy_chat_wire_goldens_include_idempotency_without_reordering_headers(
+    operation: str,
+) -> None:
+    messages, expected_body = LEGACY_CASES[operation]
+    idempotency_key = f"{operation}-op-1"
+    unkeyed = _capture_legacy_chat_request(messages)
+    request = _capture_legacy_chat_request(messages, idempotency_key=idempotency_key)
 
+    assert str(request.url) == "https://example.invalid/v1/chat/completions"
+    assert request.url == unkeyed.url
+    assert request.content == unkeyed.content == expected_body
     raw = list(request.headers.raw)
     names = [name for name, _ in raw]
-    assert (b"Idempotency-Key", b"ocr-op-1") in raw
+    assert (b"Idempotency-Key", idempotency_key.encode("ascii")) in raw
     assert names.index(b"Authorization") < names.index(b"Idempotency-Key")
     assert names.index(b"Idempotency-Key") < names.index(b"Content-Length")
     assert names.index(b"Content-Length") < names.index(b"Content-Type")
-    assert request.content == expected_body
     expected_raw = _expected_legacy_raw_headers(
-        expected_body, idempotency_key="ocr-op-1"
+        expected_body, idempotency_key=idempotency_key
     )
     assert dict(raw) == dict(expected_raw)
     assert [pair for pair in raw if pair[0] != b"Accept-Encoding"] == [
         pair for pair in expected_raw if pair[0] != b"Accept-Encoding"
     ]
+    assert [pair for pair in raw if pair[0] != b"Idempotency-Key"] == list(
+        unkeyed.headers.raw
+    )
 
 
 def test_facade_routes_to_the_configured_messages_protocol(
@@ -1303,6 +1312,35 @@ def test_facade_routes_to_the_configured_messages_protocol(
     assert seen[0]["headers"]["x-api-key"] == "test-key"
     assert seen[0]["headers"]["anthropic-version"] == "2023-06-01"
     assert "authorization" not in seen[0]["headers"]
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected_detail"),
+    [
+        ({"total_tokens": 3}, "OpenAI API response has invalid model"),
+        ({"total_tokens": -1}, "OpenAI API response has invalid token usage"),
+    ],
+    ids=["invalid-model", "usage-before-model"],
+)
+def test_legacy_chat_facade_preserves_model_error_detail_and_usage_precedence(
+    usage: dict[str, object], expected_detail: str
+) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "model": None,
+                "usage": usage,
+            },
+        )
+
+    result, error = _call_facade(_provider_config(), handler)
+
+    assert result is None
+    assert isinstance(error, main.HTTPException)
+    assert error.status_code == 502
+    assert error.detail == expected_detail
 
 
 def test_facade_reports_malformed_protocol_response_as_bad_gateway(
@@ -1515,6 +1553,91 @@ def _settings(
     return main._ResolvedTextSettings(
         config=config, prompt="p", provider_endpoint=main.resolve_endpoint(config)
     )
+
+
+def test_legacy_chat_cache_entry_is_reused_by_resolved_format_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Freeze the identity written before protocol selection added endpoint and
+    # messages_default_max_tokens; neither new field belongs in this legacy key.
+    legacy_identity = {
+        "cache_format_version": 1,
+        "input_text": "Hello\nworld",
+        "max_tokens": None,
+        "model": "test-model",
+        "operation": "format",
+        "pipeline_revision": 1,
+        "prompt": "Format {verbatim}",
+        "provider_endpoint": "https://example.invalid/v1/chat/completions",
+    }
+    legacy_digest = hashlib.sha256(
+        json.dumps(
+            legacy_identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    assert legacy_digest == (
+        "c80b950b5bce10ffac6026037fe4649111381531b1f932892844fc43cab0e1ff"
+    )
+    policy = main.CachePolicy()
+    generated_at = 1_000_000.0
+    cache_path = tmp_path / "legacy-chat-cache.db"
+    record = main.CacheRecord(
+        key=legacy_digest,
+        operation="format",
+        text="Legacy Chat output persisted before protocol adapters",
+        model="legacy-saved-model",
+        generation_tokens=42,
+        generated_at=generated_at,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        writer = main.TransformationCache(
+            cache_path, clock=lambda: generated_at, executor=executor
+        )
+        assert asyncio.run(writer.write(legacy_digest, record, policy)).status == "stored"
+        assert cache_path.exists()
+
+        base = _ai_config()
+        settings = asyncio.run(
+            main._resolve_text_settings(base, "format", legacy_identity["prompt"])
+        )
+        resolved_digest = main._cache_identity(
+            "format", legacy_identity["input_text"], None, settings
+        )
+        assert resolved_digest == legacy_digest
+
+        # A separate handle must recover the committed SQLite row from disk.
+        reader = main.TransformationCache(
+            cache_path, clock=lambda: generated_at, executor=executor
+        )
+        cached = asyncio.run(reader.read(resolved_digest, policy))
+        assert cached.status == "hit"
+        assert cached.record == record
+
+        config = main.AppConfig(host="localhost", ai=base, cache=policy)
+        monkeypatch.setattr(main, "load_config", lambda: config)
+        monkeypatch.setattr(main, "_transformation_cache", reader)
+
+        async def unexpected_provider(_request: httpx.Request) -> httpx.Response:
+            raise AssertionError("a persisted legacy Chat hit must not call the provider")
+
+        with _mocked_provider(unexpected_provider) as requests:
+            response = TestClient(main.app, raise_server_exceptions=False).post(
+                "/format",
+                json={
+                    "text": legacy_identity["input_text"],
+                    "prompt": legacy_identity["prompt"],
+                },
+            )
+
+        assert requests == []
+        assert response.status_code == 200
+        assert response.headers["x-textkit-cache"] == "hit"
+        assert response.json() == {
+            "text": record.text,
+            "model": record.model,
+            "tokens_used": 0,
+        }
 
 
 def test_cache_identity_is_isolated_between_protocols() -> None:
@@ -2348,6 +2471,42 @@ def test_legacy_chat_http_error_detail_keeps_its_wording(
     assert isinstance(error, main.HTTPException)
     assert error.status_code == 502
     assert error.detail == "OpenAI API failed: bad request"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected_label"),
+    [
+        (None, "OpenAI"),
+        ("/v1/chat/completions", "OpenAI"),
+        ("/v1/responses", "OpenAI"),
+        ("/v1/messages", "Anthropic"),
+    ],
+    ids=["legacy", "chat", "responses", "messages"],
+)
+@pytest.mark.parametrize(
+    ("upstream_detail", "expected_detail"),
+    [
+        ("anthropic says no", "anthropic says no"),
+        ("x" * 500, "x" * 500),
+        ("x" * 501, "x" * 500 + "..."),
+    ],
+    ids=["short", "at-limit", "truncated"],
+)
+def test_http_error_detail_uses_protocol_label_and_preserves_truncation(
+    endpoint: str | None,
+    expected_label: str,
+    upstream_detail: str,
+    expected_detail: str,
+) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text=upstream_detail)
+
+    result, error = _call_facade(_provider_config(endpoint=endpoint), handler)
+
+    assert result is None
+    assert isinstance(error, main.HTTPException)
+    assert error.status_code == 502
+    assert error.detail == f"{expected_label} API failed: {expected_detail}"
 
 
 def test_shared_pooled_client_is_reused() -> None:

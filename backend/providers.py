@@ -432,10 +432,15 @@ class ChatCompletionsAdapter:
 
     def parse_response(self, payload: object, *, configured_model: str) -> ChatCompletion:
         mapping = _require_mapping(payload, "response")
+        text = _extract_chat_text(mapping)
+        tokens_used = _chat_usage_tokens(mapping)
+        model = mapping.get("model", configured_model)
+        if not isinstance(model, str):
+            raise ProviderProtocolError("OpenAI API response has invalid model")
         return ChatCompletion(
-            text=_extract_chat_text(mapping),
-            model=_require_model(mapping, configured_model),
-            tokens_used=_chat_usage_tokens(mapping),
+            text=text,
+            model=model,
+            tokens_used=tokens_used,
             finish_reason=_chat_finish_reason(mapping),
         )
 
