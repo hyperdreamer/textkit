@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 from io import BytesIO
 from pathlib import Path
@@ -911,3 +912,265 @@ def test_operation_id_is_forwarded_as_provider_idempotency_key() -> None:
     assert result.text == "done"
     assert seen_headers is not None
     assert seen_headers["idempotency-key"] == "translate:1:stable-id"
+
+
+# ── provider protocol facade ─────────────────────────────────────
+
+def _provider_config(**overrides: object) -> main.AIConfig:
+    values: dict[str, object] = {
+        "api_base": "https://example.invalid",
+        "api_key": "test-key",
+        "model": "test-model",
+    }
+    values.update(overrides)
+    return main.AIConfig(**values)
+
+
+def test_chat_completion_is_the_provider_class() -> None:
+    from backend import providers
+
+    assert main._ChatCompletion is providers.ChatCompletion
+
+
+def test_extract_finish_reason_wrapper_stays_tolerant() -> None:
+    assert main._extract_finish_reason(
+        {"choices": [{"message": {}, "finish_reason": "length"}]}
+    ) == "length"
+    assert main._extract_finish_reason({"choices": [{"message": {}}]}) is None
+    assert main._extract_finish_reason({}) is None
+
+
+def test_legacy_chat_request_body_and_headers_are_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            {
+                "url": str(request.url),
+                "headers": dict(request.headers),
+                "body": json.loads(request.content),
+            }
+        )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "done"}, "finish_reason": "stop"}],
+                "model": "reported-model",
+                "usage": {"total_tokens": 3},
+            },
+        )
+
+    async def run() -> main._ChatCompletion:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        previous = main._http_client
+        main._http_client = client
+        try:
+            return await main._request_chat_completion(
+                _provider_config(),
+                [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hello"},
+                ],
+            )
+        finally:
+            main._http_client = previous
+            await client.aclose()
+
+    result = asyncio.run(run())
+
+    assert (result.text, result.model, result.tokens_used, result.finish_reason) == (
+        "done",
+        "reported-model",
+        3,
+        "stop",
+    )
+    assert len(seen) == 1
+    request = seen[0]
+    assert request["url"] == "https://example.invalid/v1/chat/completions"
+    assert request["headers"]["authorization"] == "Bearer test-key"
+    assert "idempotency-key" not in request["headers"]
+    assert request["body"] == {
+        "model": "test-model",
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello"},
+        ],
+    }
+    assert "temperature" not in request["body"]
+
+
+def test_facade_routes_to_the_configured_messages_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append({"url": str(request.url), "headers": dict(request.headers)})
+        return httpx.Response(
+            200,
+            json={
+                "content": [{"type": "text", "text": "bonjour"}],
+                "stop_reason": "end_turn",
+                "model": "claude-test",
+                "usage": {"input_tokens": 5, "output_tokens": 7},
+            },
+        )
+
+    async def run() -> main._ChatCompletion:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        previous = main._http_client
+        main._http_client = client
+        try:
+            return await main._request_chat_completion(
+                _provider_config(endpoint="/v1/messages"),
+                [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "hello"},
+                ],
+            )
+        finally:
+            main._http_client = previous
+            await client.aclose()
+
+    result = asyncio.run(run())
+
+    assert (result.text, result.model, result.tokens_used, result.finish_reason) == (
+        "bonjour",
+        "claude-test",
+        12,
+        "end_turn",
+    )
+    assert seen[0]["url"] == "https://example.invalid/v1/messages"
+    assert seen[0]["headers"]["x-api-key"] == "test-key"
+    assert seen[0]["headers"]["anthropic-version"] == "2023-06-01"
+    assert "authorization" not in seen[0]["headers"]
+
+
+def test_facade_reports_malformed_protocol_response_as_bad_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"content": [], "stop_reason": "end_turn"})
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        previous = main._http_client
+        main._http_client = client
+        try:
+            await main._request_chat_completion(
+                _provider_config(endpoint="/v1/messages"),
+                [{"role": "user", "content": "hello"}],
+            )
+        finally:
+            main._http_client = previous
+            await client.aclose()
+
+    with pytest.raises(main.HTTPException) as exc_info:
+        asyncio.run(run())
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail == (
+        "Anthropic Messages response contains no text content"
+    )
+
+
+def test_ocr_sends_provider_neutral_parts_for_each_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bodies: list[dict] = []
+    responses = {
+        "/v1/chat/completions": {
+            "choices": [{"message": {"content": "ocr text"}, "finish_reason": "stop"}],
+            "model": "chat-model",
+            "usage": {"total_tokens": 2},
+        },
+        "/v1/messages": {
+            "content": [{"type": "text", "text": "ocr text"}],
+            "stop_reason": "end_turn",
+            "model": "messages-model",
+        },
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        endpoint = str(request.url).removeprefix("https://example.invalid")
+        return httpx.Response(200, json=responses[endpoint])
+
+    async def run(endpoint: str | None) -> main.OCRResponse:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        previous = main._http_client
+        main._http_client = client
+        try:
+            return await main._call_openai(
+                _provider_config(endpoint=endpoint),
+                "data:image/png;base64,AAAA",
+                "ocr prompt",
+            )
+        finally:
+            main._http_client = previous
+            await client.aclose()
+
+    chat_result = asyncio.run(run(None))
+    messages_result = asyncio.run(run("/v1/messages"))
+
+    assert chat_result.model_dump() == {
+        "text": "ocr text",
+        "model": "chat-model",
+        "tokens_used": 2,
+        "error": None,
+    }
+    assert messages_result.model_dump() == {
+        "text": "ocr text",
+        "model": "messages-model",
+        "tokens_used": 0,
+        "error": None,
+    }
+    assert bodies[0]["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "ocr prompt"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ],
+        }
+    ]
+    assert bodies[1]["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "ocr prompt"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "AAAA",
+                    },
+                },
+            ],
+        }
+    ]
+    assert bodies[1]["max_tokens"] == 4096
+    assert "system" not in bodies[1]
+
+
+def test_blank_route_result_is_rejected_with_the_existing_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def blank(_config, _messages, *, idempotency_key=None):
+        return main._ChatCompletion("   ", "test-model", 4, "length")
+
+    monkeypatch.setattr(main, "_request_chat_completion", blank)
+
+    with pytest.raises(main.HTTPException) as exc_info:
+        asyncio.run(
+            main._post_openai_chat_completion(
+                _provider_config(), [{"role": "user", "content": "hello"}]
+            )
+        )
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail == "OpenAI API response contains no text content"

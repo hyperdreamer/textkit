@@ -31,6 +31,15 @@ from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 if __package__:
+    from . import providers as _providers
+    from .providers import (
+        ChatCompletion as _ChatCompletion,
+        ImagePart,
+        ProviderProtocolError,
+        TextPart,
+        resolve_endpoint,
+        select_adapter,
+    )
     from .transformation_cache import (
         CacheMaintenanceResult,
         CacheReadResult,
@@ -39,6 +48,15 @@ if __package__:
         TransformationCache,
     )
 else:  # Support ``uvicorn main:app`` with backend/ as the working directory.
+    import providers as _providers
+    from providers import (  # type: ignore[no-redef]
+        ChatCompletion as _ChatCompletion,
+        ImagePart,
+        ProviderProtocolError,
+        TextPart,
+        resolve_endpoint,
+        select_adapter,
+    )
     from transformation_cache import (
         CacheMaintenanceResult,
         CacheReadResult,
@@ -652,27 +670,12 @@ def _decode_provider_json(response: httpx.Response, provider_name: str) -> dict[
 
 
 def _extract_openai_text(payload: dict[str, Any]) -> str:
-    choices = payload.get("choices")
-    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        raise HTTPException(status_code=502, detail="OpenAI API response is missing choices")
-    message = choices[0].get("message")
-    if not isinstance(message, dict):
-        raise HTTPException(status_code=502, detail="OpenAI API response is missing choices[0].message")
-    content = message.get("content")
-    if isinstance(content, str) and content.strip():
-        return content.strip()
-    if isinstance(content, list):
-        parts = [
-            part["text"].strip()
-            for part in content
-            if isinstance(part, dict)
-            and part.get("type") == "text"
-            and isinstance(part.get("text"), str)
-            and part["text"].strip()
-        ]
-        if parts:
-            return "\n".join(parts)
-    raise HTTPException(status_code=502, detail="OpenAI API response contains no text content")
+    """Backward-compatible wrapper over the provider Chat text helper."""
+
+    try:
+        return _providers._extract_chat_text(payload)
+    except _providers.ProviderProtocolError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 async def _get_http_client() -> httpx.AsyncClient:
@@ -705,23 +708,10 @@ async def _call_with_retry(config: AIConfig, make_request: Any, provider_name: s
     raise last_exc
 
 
-@dataclass(frozen=True)
-class _ChatCompletion:
-    """One provider chat completion: text, model, usage, and stop reason."""
-
-    text: str
-    model: str
-    tokens_used: int
-    finish_reason: str | None = None
-
-
 def _extract_finish_reason(payload: dict[str, Any]) -> str | None:
-    choices = payload.get("choices")
-    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-        reason = choices[0].get("finish_reason")
-        if isinstance(reason, str):
-            return reason
-    return None
+    """Backward-compatible wrapper over the provider finish-reason helper."""
+
+    return _providers._chat_finish_reason(payload)
 
 
 async def _request_chat_completion(
@@ -731,13 +721,18 @@ async def _request_chat_completion(
     idempotency_key: str | None = None,
 ) -> _ChatCompletion:
     api_key = _resolve_ai_api_key(config)
-    request_body: dict[str, Any] = {"model": config.model, "messages": messages}
-    if config.max_tokens:
-        request_body["max_tokens"] = config.max_tokens
-    headers = {"Authorization": f"Bearer {api_key}"}
+    system_prompt: str | None = None
+    content: Any = messages[-1]["content"]
+    if len(messages) > 1 and messages[0].get("role") == "system":
+        system_prompt = messages[0].get("content")
+    resolved = config.model_copy(update={"api_key": api_key})
+    adapter = select_adapter(resolved)
+    request = adapter.build_request(
+        config=resolved, system_prompt=system_prompt, content=content
+    )
     operation_id = _operation_id.get() if idempotency_key is None else idempotency_key
     if operation_id:
-        headers["Idempotency-Key"] = operation_id
+        request["headers"]["Idempotency-Key"] = operation_id
     timeout = httpx.Timeout(
         connect=config.timeout.connect,
         read=config.timeout.read,
@@ -748,9 +743,9 @@ async def _request_chat_completion(
     async def _do_request() -> httpx.Response:
         client = await _get_http_client()
         response = await client.post(
-            f"{config.api_base}/v1/chat/completions",
-            headers=headers,
-            json=request_body,
+            request["url"],
+            headers=request["headers"],
+            json=request["body"],
             timeout=timeout,
         )
         if response.is_error:
@@ -758,39 +753,38 @@ async def _request_chat_completion(
             raise HTTPException(status_code=502, detail=f"OpenAI API failed: {detail}")
         return response
 
-    payload = _decode_provider_json(await _call_with_retry(config, _do_request, "OpenAI"), "OpenAI")
-    text = _extract_openai_text(payload)
-    usage = payload.get("usage")
-    total_tokens = usage.get("total_tokens", 0) if isinstance(usage, dict) else 0
-    if not isinstance(total_tokens, int) or total_tokens < 0:
-        raise HTTPException(status_code=502, detail="OpenAI API response has invalid token usage")
-    model = payload.get("model", config.model)
-    if not isinstance(model, str):
-        raise HTTPException(status_code=502, detail="OpenAI API response has invalid model")
-    return _ChatCompletion(
-        text=text,
-        model=model,
-        tokens_used=total_tokens,
-        finish_reason=_extract_finish_reason(payload),
+    payload = _decode_provider_json(
+        await _call_with_retry(config, _do_request, "OpenAI"), "OpenAI"
     )
+    try:
+        return adapter.parse_response(payload, configured_model=config.model)
+    except ProviderProtocolError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-async def _post_openai_chat_completion(config: AIConfig, messages: list[dict[str, Any]]) -> OCRResponse:
+async def _post_openai_chat_completion(
+    config: AIConfig, messages: list[dict[str, Any]]
+) -> OCRResponse:
     result = await _request_chat_completion(config, messages)
-    return OCRResponse(text=result.text, model=result.model, tokens_used=result.tokens_used)
+    if not result.text.strip():
+        raise HTTPException(
+            status_code=502, detail="OpenAI API response contains no text content"
+        )
+    return OCRResponse(
+        text=result.text, model=result.model, tokens_used=result.tokens_used
+    )
 
 
 async def _call_openai(config: AIConfig, data_url: str, prompt: str | None = None) -> OCRResponse:
     effective_prompt = prompt or await asyncio.to_thread(_render_prompt, "ocr")
     return await _post_openai_chat_completion(
         config,
-        [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": effective_prompt},
-                {"type": "image_url", "image_url": {"url": data_url}},
-            ],
-        }],
+        [
+            {
+                "role": "user",
+                "content": [TextPart(effective_prompt), ImagePart(data_url)],
+            }
+        ],
     )
 
 
