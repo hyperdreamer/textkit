@@ -54,3 +54,6 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Isolated git worktrees for feature work
+.worktrees/
