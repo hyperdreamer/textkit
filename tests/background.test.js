@@ -2114,3 +2114,30 @@ test('format has no fixed timeout — Stop still aborts via AbortController', as
   assert.equal(result.error, 'Formatting superseded.');
   assert.equal(vm.runInContext('formatControllers.has(1)', harness.context), false);
 });
+
+// W15: full command declaration and unchanged non-command manifest.
+test('W15 manifest declares two commands without changing other metadata', () => {
+  const { execFileSync } = require('node:child_process');
+  const manifestPath = path.join(ROOT, 'extension', 'manifest.json');
+  const currentText = fs.readFileSync(manifestPath, 'utf8');
+  const pinnedText = execFileSync('git', [
+    'show', 'c47dec6a24b42bcdb25f2c4fbe731deca8ce4431:extension/manifest.json'
+  ], { cwd: ROOT, encoding: 'utf8' });
+  const current = JSON.parse(currentText);
+  const pinned = JSON.parse(pinnedText);
+  assert.deepEqual(current.commands, {
+    'start-region-capture': {
+      suggested_key: { default: 'Ctrl+Shift+S', mac: 'Command+Shift+S' },
+      description: 'Select a region and start OCR capture'
+    },
+    'confirm-region-capture': {
+      suggested_key: { default: 'Ctrl+Shift+Space', mac: 'Command+Shift+Space' },
+      description: 'Confirm selected OCR region'
+    }
+  }, 'W15 requires both exact commands');
+  delete current.commands;
+  delete pinned.commands;
+  assert.deepEqual(current, pinned);
+  assert.equal(currentText.slice(0, currentText.indexOf('  "commands":')),
+    pinnedText.slice(0, pinnedText.indexOf('  "commands":')));
+});

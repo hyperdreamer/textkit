@@ -40,6 +40,13 @@
         "mac": "Command+Shift+S"
       },
       "description": "Select a region and start OCR capture"
+    },
+    "confirm-region-capture": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Space",
+        "mac": "Command+Shift+Space"
+      },
+      "description": "Confirm selected OCR region"
     }
   }
 }
