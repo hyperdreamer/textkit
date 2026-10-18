@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
 import hashlib
 import json
 import os
 from io import BytesIO
 from pathlib import Path
+from typing import Awaitable, Callable, Iterator
 
 import pytest
 import httpx
@@ -445,11 +448,14 @@ def test_insecure_api_base_urls_emits_no_warnings(
 
 
 def test_provider_response_requires_choices() -> None:
-    with pytest.raises(main.HTTPException) as exc_info:
-        main._extract_openai_text({"model": "test"})
+    from backend import providers
 
-    assert exc_info.value.status_code == 502
-    assert "missing choices" in exc_info.value.detail
+    with pytest.raises(providers.ProviderProtocolError) as exc_info:
+        providers.ChatCompletionsAdapter().parse_response(
+            {"model": "test"}, configured_model="test"
+        )
+
+    assert "missing choices" in str(exc_info.value)
 
 
 def test_prompt_render_preserves_unrelated_braces(
@@ -1469,3 +1475,724 @@ def test_resolved_text_settings_endpoint_follows_the_protocol(
     settings = asyncio.run(main._resolve_text_settings(base, "format", "p"))
     assert settings.config.endpoint == endpoint
     assert settings.provider_endpoint == expected
+
+
+# ── per-protocol OCR wire shapes, malformed envelopes, and real transport ──
+
+_PROTOCOL_ENDPOINTS: list[str | None] = [None, "/v1/responses", "/v1/messages"]
+_PROTOCOL_IDS = ["chat", "responses", "messages"]
+
+# Long enough to be split by both repair pipelines, so a truncation signal can
+# be proven to reach them: above FORMAT_MIN_CHUNK_CHARS and
+# TRANSLATE_MIN_CHUNK_CHARS, splitting into two halves that stay non-empty.
+_REPAIR_SOURCE = (
+    "The formatting pipeline verifies that every single word of the source text "
+    "survives a provider call. It splits a truncated chunk at the nearest sentence "
+    "boundary and repairs each half independently. Only accepted halves are joined, "
+    "and the route then returns the joined result to the caller."
+)
+
+
+def _protocol(endpoint: str | None) -> str:
+    return {
+        None: "chat",
+        "/v1/chat/completions": "chat",
+        "/v1/responses": "responses",
+        "/v1/messages": "messages",
+    }[endpoint]
+
+
+def _route_config(endpoint: str | None) -> main.AppConfig:
+    return main.AppConfig(
+        host="localhost",
+        ai=_provider_config(endpoint=endpoint),
+        cache=main.CachePolicy(enabled=False),
+    )
+
+
+def _protocol_envelope(
+    endpoint: str | None, text: str, *, truncated: bool = False
+) -> dict:
+    """One deterministic valid envelope shaped for the configured protocol."""
+
+    protocol = _protocol(endpoint)
+    if protocol == "responses":
+        output = (
+            []
+            if text == ""
+            else [{"type": "message", "content": [{"type": "output_text", "text": text}]}]
+        )
+        if truncated:
+            return {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": output,
+                "model": "reported-model",
+                "usage": {"input_tokens": 2, "output_tokens": 3},
+            }
+        return {
+            "status": "completed",
+            "output": output,
+            "model": "reported-model",
+            "usage": {"input_tokens": 2, "output_tokens": 3},
+        }
+    if protocol == "messages":
+        return {
+            "content": [] if text == "" else [{"type": "text", "text": text}],
+            "stop_reason": "max_tokens" if truncated else "end_turn",
+            "model": "reported-model",
+            "usage": {"input_tokens": 2, "output_tokens": 3},
+        }
+    return {
+        "choices": [
+            {
+                "message": {"content": text},
+                "finish_reason": "length" if truncated else "stop",
+            }
+        ],
+        "model": "reported-model",
+        "usage": {"total_tokens": 5},
+    }
+
+
+def _user_text(endpoint: str | None, body: dict) -> str:
+    """The protocol-neutral user text carried by one captured request body."""
+
+    if _protocol(endpoint) == "responses":
+        value = body["input"]
+    else:
+        value = body["messages"][-1]["content"]
+    if isinstance(value, list):
+        return "".join(
+            part.get("text", "") for part in value if isinstance(part, dict)
+        )
+    assert isinstance(value, str)
+    return value
+
+
+@contextlib.contextmanager
+def _mocked_provider(
+    handler: Callable[[httpx.Request], Awaitable[httpx.Response]],
+) -> Iterator[list[httpx.Request]]:
+    """Swap the shared pooled client for a recording ``MockTransport`` client."""
+
+    requests: list[httpx.Request] = []
+
+    async def recording(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return await handler(request)
+
+    async def close() -> None:
+        await client.aclose()
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(recording))
+    previous = main._http_client
+    main._http_client = client
+    try:
+        yield requests
+    finally:
+        main._http_client = previous
+        asyncio.run(close())
+
+
+def _run_ocr(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str | None
+) -> tuple[httpx.Request, str, dict]:
+    monkeypatch.setattr(main, "load_config", lambda: _route_config(endpoint))
+    png = _png_bytes()
+    data_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_protocol_envelope(endpoint, "ocr text"))
+
+    with _mocked_provider(handler) as requests:
+        response = TestClient(main.app, raise_server_exceptions=False).post(
+            "/ocr",
+            files={"image": ("page.png", png, "image/png")},
+            data={"prompt": "OCR prompt"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "text": "ocr text",
+        "model": "reported-model",
+        "tokens_used": 5,
+        "error": None,
+    }
+    assert len(requests) == 1
+    return requests[0], data_url, json.loads(requests[0].content)
+
+
+def test_chat_ocr_uses_image_url_object(monkeypatch: pytest.MonkeyPatch) -> None:
+    request, data_url, body = _run_ocr(monkeypatch, None)
+
+    assert str(request.url) == "https://example.invalid/v1/chat/completions"
+    assert body["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "OCR prompt"},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }
+    ]
+    assert list(body) == ["model", "messages"]
+    assert "system" not in {message["role"] for message in body["messages"]}
+    assert request.headers["authorization"] == "Bearer test-key"
+    assert request.headers["content-type"] == "application/json"
+
+
+def test_responses_ocr_uses_wrapped_input_parts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, data_url, body = _run_ocr(monkeypatch, "/v1/responses")
+
+    assert str(request.url) == "https://example.invalid/v1/responses"
+    assert body["input"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "OCR prompt"},
+                {"type": "input_image", "image_url": data_url},
+            ],
+        }
+    ]
+    assert list(body) == ["model", "input", "store"]
+    assert body["store"] is False
+    assert "instructions" not in body
+    assert request.headers["authorization"] == "Bearer test-key"
+    assert request.headers["content-type"] == "application/json"
+
+
+def test_messages_ocr_uses_base64_source_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, data_url, body = _run_ocr(monkeypatch, "/v1/messages")
+
+    _media_type, _marker, payload = data_url.partition(";base64,")
+    assert str(request.url) == "https://example.invalid/v1/messages"
+    assert body["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "OCR prompt"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": payload,
+                    },
+                },
+            ],
+        }
+    ]
+    assert list(body) == ["model", "messages", "max_tokens"]
+    assert body["max_tokens"] == 4096
+    assert "system" not in body
+    assert request.headers["x-api-key"] == "test-key"
+    assert request.headers["anthropic-version"] == "2023-06-01"
+    assert "authorization" not in request.headers
+    assert request.headers["content-type"] == "application/json"
+
+
+@pytest.mark.parametrize("endpoint", _PROTOCOL_ENDPOINTS, ids=_PROTOCOL_IDS)
+def test_idempotency_key_is_sent_for_chat_responses_and_messages(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str | None
+) -> None:
+    monkeypatch.setattr(main, "load_config", lambda: _route_config(endpoint))
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_protocol_envelope(endpoint, "deduped"))
+
+    with _mocked_provider(handler) as requests:
+        response = TestClient(main.app, raise_server_exceptions=False).post(
+            "/dedup",
+            json={"text": "raw text", "prompt": "dedup prompt"},
+            headers={"X-TextKit-Operation-Id": "dedup:1:stable-id"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["text"] == "deduped"
+    assert len(requests) == 1
+    assert requests[0].headers["idempotency-key"] == "dedup:1:stable-id"
+
+
+_UNUSABLE_ENVELOPES: list[tuple[str | None, dict]] = [
+    ("/v1/responses", {"status": "failed", "output": []}),
+    ("/v1/responses", {"status": "cancelled", "output": []}),
+    (
+        "/v1/responses",
+        {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "visible"}],
+                }
+            ],
+        },
+    ),
+    ("/v1/responses", {"status": "in_progress", "output": []}),
+    ("/v1/responses", {"status": "queued", "output": []}),
+    ("/v1/responses", {"status": "unknown", "output": []}),
+    ("/v1/responses", {"model": "reported-model"}),
+    ("/v1/responses", {"status": None, "output": []}),
+    ("/v1/responses", {"status": 7, "output": []}),
+    (
+        "/v1/responses",
+        {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [],
+            "error": {"code": "boom"},
+        },
+    ),
+    (
+        "/v1/responses",
+        {
+            "status": "completed",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "visible"}],
+                }
+            ],
+        },
+    ),
+    (
+        "/v1/responses",
+        {
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": 5}]}],
+        },
+    ),
+    ("/v1/responses", {"status": "completed", "output": ["not-an-object"]}),
+    (
+        "/v1/messages",
+        {
+            "content": [{"type": "thinking", "thinking": "no"}],
+            "stop_reason": "end_turn",
+        },
+    ),
+    ("/v1/messages", {"content": [{"type": "text", "text": "   "}], "stop_reason": "end_turn"}),
+    ("/v1/messages", {"content": [], "stop_reason": "end_turn"}),
+    ("/v1/messages", {"content": "not-a-list", "stop_reason": "end_turn"}),
+    (
+        "/v1/messages",
+        {"content": [{"type": "text", "text": "ok"}], "stop_reason": "pause_turn"},
+    ),
+    (
+        "/v1/messages",
+        {
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "error": {"type": "overloaded_error"},
+        },
+    ),
+    (
+        "/v1/messages",
+        {
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": True},
+        },
+    ),
+    (
+        "/v1/messages",
+        {
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": [],
+        },
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "payload"),
+    _UNUSABLE_ENVELOPES,
+    ids=[
+        f"{_protocol(endpoint)}-{index}"
+        for index, (endpoint, _payload) in enumerate(_UNUSABLE_ENVELOPES)
+    ],
+)
+def test_malformed_provider_envelopes_return_502_not_500(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str | None, payload: dict
+) -> None:
+    monkeypatch.setattr(main, "load_config", lambda: _route_config(endpoint))
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with _mocked_provider(handler) as requests:
+        response = TestClient(main.app, raise_server_exceptions=False).post(
+            "/dedup", json={"text": "raw text"}
+        )
+
+    assert len(requests) == 1
+    assert response.status_code == 502
+    body = response.json()
+    assert body["text"] == ""
+    assert body["tokens_used"] == 0
+    assert body["error"]
+    assert body["error"] != "Internal server error"
+
+
+@pytest.mark.parametrize("endpoint", _PROTOCOL_ENDPOINTS, ids=_PROTOCOL_IDS)
+def test_malformed_json_and_unexpected_shape_are_502(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str | None
+) -> None:
+    monkeypatch.setattr(main, "load_config", lambda: _route_config(endpoint))
+    replies = [httpx.Response(200, text="not json"), httpx.Response(200, json=[1, 2])]
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return replies.pop(0)
+
+    with _mocked_provider(handler) as requests:
+        client = TestClient(main.app, raise_server_exceptions=False)
+        invalid_json = client.post("/dedup", json={"text": "raw text"})
+        unexpected_shape = client.post("/dedup", json={"text": "raw text"})
+
+    assert len(requests) == 2
+    for response in (invalid_json, unexpected_shape):
+        assert response.status_code == 502
+        assert response.json()["error"]
+    # The provider label in these details is protocol-owned and pinned
+    # elsewhere; assert the stable suffix here so the shared decode path stays
+    # covered for every protocol.
+    assert invalid_json.json()["error"].endswith("API returned invalid JSON")
+    assert unexpected_shape.json()["error"].endswith(
+        "API returned an unexpected response shape"
+    )
+
+
+def _run_repair(
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str | None,
+    route: str,
+    *,
+    truncation_text: str,
+) -> tuple[httpx.Response, list[str]]:
+    """Drive one repair route through the real facade against a recording transport.
+
+    Every request carries the protocol's truncation signal, and the response text
+    for each call is chosen by the caller: the first reply is ``truncation_text``
+    and later replies echo their own input.  A non-empty ``truncation_text`` is
+    what proves the stop signal (not blankness) forced the split.
+    """
+
+    monkeypatch.setattr(main, "load_config", lambda: _route_config(endpoint))
+    seen: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        chunk = _user_text(endpoint, json.loads(request.content))
+        seen.append(chunk)
+        if len(seen) == 1:
+            return httpx.Response(
+                200, json=_protocol_envelope(endpoint, truncation_text, truncated=True)
+            )
+        return httpx.Response(200, json=_protocol_envelope(endpoint, chunk))
+
+    with _mocked_provider(handler):
+        payload = (
+            {"text": _REPAIR_SOURCE, "prompt": "format prompt"}
+            if route == "/format"
+            else {"text": _REPAIR_SOURCE, "language": "French", "prompt": "translate prompt"}
+        )
+        response = TestClient(main.app, raise_server_exceptions=False).post(
+            route, json=payload
+        )
+
+    return response, seen
+
+
+@pytest.mark.parametrize("route", ["/format", "/translate"])
+@pytest.mark.parametrize("endpoint", _PROTOCOL_ENDPOINTS, ids=_PROTOCOL_IDS)
+def test_nonempty_truncation_signal_forces_split_through_real_transport(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str | None, route: str
+) -> None:
+    response, seen = _run_repair(
+        monkeypatch, endpoint, route, truncation_text=_REPAIR_SOURCE
+    )
+
+    # The truncated reply is non-empty and would pass the normal completeness
+    # check, so only the forwarded stop signal can produce child requests.
+    assert len(seen) == 3
+    assert seen[0] == _REPAIR_SOURCE
+    assert sorted(len(chunk) for chunk in seen[1:]) == [145, 146]
+    assert response.status_code == 200
+    assert main._content_only(response.json()["text"]) == main._content_only(
+        _REPAIR_SOURCE
+    )
+    assert response.json()["tokens_used"] == 15
+
+
+def test_responses_empty_truncation_reaches_format_repair_through_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response, seen = _run_repair(monkeypatch, "/v1/responses", "/format", truncation_text="")
+
+    assert len(seen) == 3
+    assert response.status_code == 200
+    assert main._content_only(response.json()["text"]) == main._content_only(
+        _REPAIR_SOURCE
+    )
+
+
+def test_responses_empty_truncation_reaches_translate_repair_through_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response, seen = _run_repair(
+        monkeypatch, "/v1/responses", "/translate", truncation_text=""
+    )
+
+    assert len(seen) == 3
+    assert response.status_code == 200
+    assert main._content_only(response.json()["text"]) == main._content_only(
+        _REPAIR_SOURCE
+    )
+
+
+def test_messages_max_tokens_reaches_existing_route_parser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for route in ("/format", "/translate"):
+        response, seen = _run_repair(
+            monkeypatch, "/v1/messages", route, truncation_text=""
+        )
+
+        assert len(seen) == 3
+        assert response.status_code == 200
+        assert main._content_only(response.json()["text"]) == main._content_only(
+            _REPAIR_SOURCE
+        )
+
+
+@pytest.mark.parametrize("endpoint", _PROTOCOL_ENDPOINTS, ids=_PROTOCOL_IDS)
+def test_blank_truncation_is_502_for_ocr_and_dedup(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str | None
+) -> None:
+    monkeypatch.setattr(main, "load_config", lambda: _route_config(endpoint))
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_protocol_envelope(endpoint, "", truncated=True))
+
+    with _mocked_provider(handler) as requests:
+        client = TestClient(main.app, raise_server_exceptions=False)
+        ocr_response = client.post(
+            "/ocr", files={"image": ("page.png", _png_bytes(), "image/png")}
+        )
+        dedup_response = client.post("/dedup", json={"text": "raw text"})
+
+    assert len(requests) == 2
+    for response in (ocr_response, dedup_response):
+        assert response.status_code == 502
+        assert response.json()["error"] == (
+            "OpenAI API response contains no text content"
+        )
+
+
+@pytest.mark.parametrize("endpoint", _PROTOCOL_ENDPOINTS, ids=_PROTOCOL_IDS)
+def test_normal_blank_completion_is_502_for_all_protocols(
+    monkeypatch: pytest.MonkeyPatch, endpoint: str | None
+) -> None:
+    """A blank non-truncated completion is never a successful empty response."""
+
+    monkeypatch.setattr(main, "load_config", lambda: _route_config(endpoint))
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_protocol_envelope(endpoint, ""))
+
+    with _mocked_provider(handler) as requests:
+        client = TestClient(main.app, raise_server_exceptions=False)
+        ocr_response = client.post(
+            "/ocr", files={"image": ("page.png", _png_bytes(), "image/png")}
+        )
+        dedup_response = client.post("/dedup", json={"text": "raw text"})
+
+    assert len(requests) == 2
+    for response in (ocr_response, dedup_response):
+        assert response.status_code == 502
+        assert response.json()["error"]
+
+
+# ── shared transport: retry, deadline, and pooled client ─────────
+
+
+def _call_facade(
+    config: main.AIConfig,
+    handler: Callable[[httpx.Request], Awaitable[httpx.Response]],
+) -> tuple[main._ChatCompletion | None, BaseException | None]:
+    """Run the real facade against a mock transport, returning result or error."""
+
+    result: main._ChatCompletion | None = None
+    error: BaseException | None = None
+
+    async def run() -> None:
+        nonlocal result, error
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        previous = main._http_client
+        main._http_client = client
+        try:
+            result = await main._request_chat_completion(
+                config, [{"role": "user", "content": "hello"}]
+            )
+        except BaseException as exc:  # noqa: BLE001 - asserted by the caller
+            error = exc
+        finally:
+            main._http_client = previous
+            await client.aclose()
+
+    asyncio.run(run())
+    return result, error
+
+
+def _spy_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    return delays
+
+
+def _spy_wait_for(monkeypatch: pytest.MonkeyPatch) -> list[float | None]:
+    recorded: list[float | None] = []
+    real_wait_for = asyncio.wait_for
+
+    async def spy(awaitable, timeout=None):
+        recorded.append(timeout)
+        return await real_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", spy)
+    return recorded
+
+
+def test_connect_error_retries_exactly_twice(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays = _spy_sleep(monkeypatch)
+    calls: list[int] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "done"}, "finish_reason": "stop"}],
+                "model": "test-model",
+                "usage": {"total_tokens": 1},
+            },
+        )
+
+    result, error = _call_facade(_provider_config(), handler)
+
+    assert error is None
+    assert result is not None
+    assert result.text == "done"
+    assert len(calls) == 2
+    assert delays == [1]
+
+
+def test_other_request_errors_are_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays = _spy_sleep(monkeypatch)
+    calls: list[int] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    _result, error = _call_facade(_provider_config(), handler)
+
+    assert isinstance(error, main.HTTPException)
+    assert error.status_code == 502
+    assert error.detail == "OpenAI API request failed: ReadTimeout: read timed out"
+    assert len(calls) == 1
+    assert delays == []
+
+
+def test_deadline_is_read_timeout_plus_sixty(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorded = _spy_wait_for(monkeypatch)
+    timeouts: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        timeouts.append(dict(request.extensions["timeout"]))
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]},
+        )
+
+    config = _provider_config(
+        timeout=main.TimeoutConfig(connect=1.5, read=7.5, write=2.5, pool=3.5)
+    )
+    result, error = _call_facade(config, handler)
+
+    assert error is None
+    assert result is not None and result.text == "ok"
+    assert recorded == [67.5]
+    assert timeouts == [{"connect": 1.5, "read": 7.5, "write": 2.5, "pool": 3.5}]
+
+
+def test_deadline_expiry_maps_to_504(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays = _spy_sleep(monkeypatch)
+    calls: list[int] = []
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        raise asyncio.TimeoutError("deadline expired")
+
+    _result, error = _call_facade(_provider_config(), handler)
+
+    assert isinstance(error, main.HTTPException)
+    assert error.status_code == 504
+    assert error.detail == "OpenAI API did not respond within 660.0s"
+    assert len(calls) == 1
+    assert delays == []
+
+
+def test_malformed_envelope_does_not_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    delays = _spy_sleep(monkeypatch)
+    calls: list[int] = []
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(200, json={"model": "test"})
+
+    _result, error = _call_facade(_provider_config(), handler)
+
+    assert isinstance(error, main.HTTPException)
+    assert error.status_code == 502
+    assert "missing choices" in error.detail
+    assert len(calls) == 1
+    assert delays == []
+
+
+def test_shared_pooled_client_is_reused() -> None:
+    """Two sequential lookups share one client, rebuilt only after it is closed."""
+
+    async def run() -> None:
+        main._http_client = None
+        try:
+            first = await main._get_http_client()
+            second = await main._get_http_client()
+            assert first is second
+
+            # The pool limits live behind httpx internals; the repository pins
+            # httpx==0.28.1, and a dependency bump must revisit this assertion.
+            pool = first._transport._pool  # type: ignore[attr-defined]
+            assert pool._max_connections == 20
+            assert pool._max_keepalive_connections == 10
+
+            await first.aclose()
+            replacement = await main._get_http_client()
+            assert replacement is not first
+            assert replacement.is_closed is False
+            await replacement.aclose()
+        finally:
+            main._http_client = None
+
+    asyncio.run(run())

@@ -805,3 +805,265 @@ def test_provider_headers_never_include_adapter_content_type():
     assert list(messages["headers"]) == ["x-api-key", "anthropic-version"]
     for request in (responses, messages):
         assert "content-type" not in {name.lower() for name in request["headers"]}
+
+
+# ── exact per-protocol wire shapes and token-limit fields ────────
+
+_PROTOCOL_CASES = [
+    (None, providers.ChatCompletionsAdapter),
+    ("/v1/chat/completions", providers.ChatCompletionsAdapter),
+    ("/v1/responses", providers.ResponsesAdapter),
+    ("/v1/messages", providers.MessagesAdapter),
+]
+
+
+@pytest.mark.parametrize(("endpoint", "adapter_type"), _PROTOCOL_CASES)
+def test_protocol_request_body_key_order_and_token_limit(endpoint, adapter_type):
+    adapter = adapter_type()
+    without_limit = adapter.build_request(
+        config=_config(endpoint=endpoint), system_prompt="sys", content="body"
+    )
+    expected_order = {
+        providers.ChatCompletionsAdapter: ["model", "messages"],
+        providers.ResponsesAdapter: ["model", "instructions", "input", "store"],
+        providers.MessagesAdapter: ["model", "system", "messages", "max_tokens"],
+    }[adapter_type]
+    assert list(without_limit["body"]) == expected_order
+
+    limit_key = {
+        providers.ChatCompletionsAdapter: "max_tokens",
+        providers.ResponsesAdapter: "max_output_tokens",
+        providers.MessagesAdapter: "max_tokens",
+    }[adapter_type]
+    with_limit = adapter.build_request(
+        config=_config(endpoint=endpoint, max_tokens=2048),
+        system_prompt=None,
+        content="body",
+    )
+    assert with_limit["body"][limit_key] == 2048
+    if adapter_type is not providers.MessagesAdapter:
+        assert limit_key not in without_limit["body"]
+
+
+def test_messages_always_sends_max_tokens_from_the_messages_fallback():
+    fallback = providers.MessagesAdapter().build_request(
+        config=_config(endpoint="/v1/messages", messages_default_max_tokens=777),
+        system_prompt=None,
+        content="body",
+    )
+    assert fallback["body"]["max_tokens"] == 777
+
+    override = providers.MessagesAdapter().build_request(
+        config=_config(
+            endpoint="/v1/messages", max_tokens=11, messages_default_max_tokens=777
+        ),
+        system_prompt=None,
+        content="body",
+    )
+    assert override["body"]["max_tokens"] == 11
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "adapter_type", "auth_headers"),
+    [
+        (None, providers.ChatCompletionsAdapter, {"Authorization": "Bearer test-key"}),
+        (
+            "/v1/responses",
+            providers.ResponsesAdapter,
+            {"Authorization": "Bearer test-key"},
+        ),
+        (
+            "/v1/messages",
+            providers.MessagesAdapter,
+            {"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+        ),
+    ],
+)
+def test_protocol_auth_headers_are_exact(endpoint, adapter_type, auth_headers):
+    request = adapter_type().build_request(
+        config=_config(endpoint=endpoint), system_prompt="sys", content="body"
+    )
+    assert request["headers"] == auth_headers
+    names = {name.lower() for name in request["headers"]}
+    assert "content-type" not in names
+    if adapter_type is providers.MessagesAdapter:
+        assert "authorization" not in names
+    else:
+        assert "x-api-key" not in names
+
+
+def test_responses_omits_instructions_when_no_system_prompt():
+    request = providers.ResponsesAdapter().build_request(
+        config=_config(endpoint="/v1/responses"), system_prompt=None, content="body"
+    )
+    assert "instructions" not in request["body"]
+    assert request["body"] == {"model": "test-model", "input": "body", "store": False}
+
+
+# ── malformed envelopes are protocol errors, never bare exceptions ──
+
+_UNUSABLE_RESPONSES = [
+    {},
+    {"status": None},
+    {"status": 7},
+    {"status": ["completed"]},
+    {"status": "failed", "output": []},
+    {"status": "cancelled", "output": []},
+    {"status": "in_progress", "output": []},
+    {"status": "queued", "output": []},
+    {"status": "unknown", "output": []},
+    {"status": "incomplete"},
+    {"status": "incomplete", "incomplete_details": None},
+    {"status": "incomplete", "incomplete_details": {"reason": "content_filter"}},
+    {"status": "incomplete", "incomplete_details": {"reason": None}},
+    {"status": "incomplete", "incomplete_details": []},
+    {
+        "status": "completed",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "x"}]}],
+    },
+    {
+        "status": "completed",
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "  "}]}],
+    },
+    {"status": "completed"},
+    {"status": "completed", "output": {}},
+    {"status": "completed", "output": ["not-an-object"]},
+    {"status": "completed", "output": [{"type": "message"}]},
+    {
+        "status": "completed",
+        "output": [{"type": "message", "content": {"type": "output_text"}}],
+    },
+    {
+        "status": "completed",
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": None}]}],
+    },
+]
+
+
+@pytest.mark.parametrize("payload", _UNUSABLE_RESPONSES)
+def test_responses_unusable_envelopes_raise_protocol_error(payload):
+    with pytest.raises(providers.ProviderProtocolError):
+        providers.ResponsesAdapter().parse_response(payload, configured_model="cfg")
+
+
+_UNUSABLE_MESSAGES = [
+    {},
+    {"content": None},
+    {"content": {}},
+    {"content": "text"},
+    {"content": ["not-an-object"]},
+    {"content": [{"type": "text"}]},
+    {"content": [{"type": "text", "text": 5}]},
+    {"content": [{"type": "thinking", "thinking": "no"}]},
+    {"content": [], "stop_reason": "end_turn"},
+    {"content": [{"type": "text", "text": "   "}], "stop_reason": "end_turn"},
+    {"content": [{"type": "text", "text": "ok"}], "stop_reason": "pause_turn"},
+    {"content": [{"type": "text", "text": "ok"}], "stop_reason": "tool_use"},
+    {"content": [{"type": "text", "text": "ok"}], "stop_reason": "refusal"},
+    {"content": [{"type": "text", "text": "ok"}], "stop_reason": "unknown"},
+    {"content": [{"type": "text", "text": "ok"}], "stop_reason": None},
+    {"content": [{"type": "text", "text": "ok"}], "stop_reason": 7},
+    {"content": [{"type": "text", "text": "ok"}], "usage": []},
+    {"content": [{"type": "text", "text": "ok"}], "usage": {"input_tokens": True}},
+    {"content": [{"type": "text", "text": "ok"}], "usage": {"output_tokens": -1}},
+    {"content": [{"type": "text", "text": "ok"}], "usage": {"input_tokens": "7"}},
+]
+
+
+@pytest.mark.parametrize("payload", _UNUSABLE_MESSAGES)
+def test_messages_unusable_envelopes_raise_protocol_error(payload):
+    with pytest.raises(providers.ProviderProtocolError):
+        providers.MessagesAdapter().parse_response(payload, configured_model="cfg")
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "adapter_type", "payload"),
+    [
+        (None, providers.ChatCompletionsAdapter, {"model": "test"}),
+        ("/v1/responses", providers.ResponsesAdapter, {"model": "test", "status": "completed"}),
+        ("/v1/messages", providers.MessagesAdapter, {"model": "test"}),
+    ],
+)
+def test_non_object_payloads_are_protocol_errors(endpoint, adapter_type, payload):
+    for payload_value in ([], "text", 7, None):
+        with pytest.raises(providers.ProviderProtocolError):
+            adapter_type().parse_response(payload_value, configured_model="cfg")
+
+
+@pytest.mark.parametrize(
+    ("adapter_type", "payload", "expected_text", "expected_finish"),
+    [
+        (
+            providers.ChatCompletionsAdapter,
+            {
+                "choices": [
+                    {"message": {"content": "cut"}, "finish_reason": "length"}
+                ]
+            },
+            "cut",
+            "length",
+        ),
+        (
+            providers.ResponsesAdapter,
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "cut"}],
+                    }
+                ],
+            },
+            "cut",
+            "length",
+        ),
+        (
+            providers.MessagesAdapter,
+            {"content": [{"type": "text", "text": "cut"}], "stop_reason": "max_tokens"},
+            "cut",
+            "length",
+        ),
+    ],
+)
+def test_every_protocol_normalizes_its_truncation_signal_to_length(
+    adapter_type, payload, expected_text, expected_finish
+):
+    result = adapter_type().parse_response(payload, configured_model="cfg")
+    assert (result.text, result.finish_reason) == (expected_text, expected_finish)
+
+
+@pytest.mark.parametrize(
+    ("adapter_type", "payload"),
+    [
+        (
+            providers.ChatCompletionsAdapter,
+            {
+                "choices": [
+                    {"message": {"content": "ok"}, "finish_reason": "stop"}
+                ]
+            },
+        ),
+        (
+            providers.ResponsesAdapter,
+            {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "ok"}],
+                    }
+                ],
+            },
+        ),
+        (
+            providers.MessagesAdapter,
+            {"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn"},
+        ),
+    ],
+)
+def test_every_protocol_reports_a_non_truncation_finish_reason(adapter_type, payload):
+    result = adapter_type().parse_response(payload, configured_model="cfg")
+    assert result.text == "ok"
+    assert result.finish_reason != "length"
