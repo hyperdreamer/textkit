@@ -563,7 +563,7 @@ async def _resolve_text_settings(
     return _ResolvedTextSettings(
         config=effective_ai,
         prompt=prompt,
-        provider_endpoint=f"{effective_ai.api_base}/v1/chat/completions",
+        provider_endpoint=resolve_endpoint(effective_ai),
     )
 
 
@@ -588,6 +588,10 @@ def _cache_identity(
     }
     if operation == "translate":
         canonical["language"] = language
+    if settings.config.endpoint == "/v1/messages":
+        canonical["messages_default_max_tokens"] = (
+            settings.config.messages_default_max_tokens
+        )
     serialized = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
