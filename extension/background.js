@@ -320,41 +320,64 @@ async function ensureBackendPermission() {
   return chrome.permissions.request({ origins });
 }
 
-chrome.commands.onCommand.addListener(async (command) => {
-  if (command !== 'start-region-capture') return;
-  try {
-    await startupReadiness;
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab?.id) {
-      return;
-    }
-    const state = getState(tab.id);
-    if (state.active || state.captureInFlight || state.status === 'Selecting') {
-      console.warn('A capture is already active for this tab.');
-      return;
-    }
-    if (!await ensureBackendPermission()) throw new Error('Backend permission was not granted.');
-    await abortDownstreamOperations(tab.id);
-    await ensureContentScript(tab.id);
-    state.operationBackend = await snapshotBackendSettings();
-    invalidateBackendEndpointCache();
-    state.operationPrompts = await snapshotCapturePrompts();
-    state.selectionToken = createSelectionToken();
+chrome.commands.onCommand.addListener(async (command, tab) => {
+  if (command === 'start-region-capture') {
+    try {
+      await startupReadiness;
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.id) {
+        return;
+      }
+      const state = getState(tab.id);
+      if (state.active || state.captureInFlight || state.status === 'Selecting') {
+        console.warn('A capture is already active for this tab.');
+        return;
+      }
+      if (!await ensureBackendPermission()) throw new Error('Backend permission was not granted.');
+      await abortDownstreamOperations(tab.id);
+      await ensureContentScript(tab.id);
+      state.operationBackend = await snapshotBackendSettings();
+      invalidateBackendEndpointCache();
+      state.operationPrompts = await snapshotCapturePrompts();
+      state.selectionToken = createSelectionToken();
 
-    updateState(tab.id, { active: true, status: 'Selecting', progress: 'Drag a rectangle.' });
-    await chrome.tabs.sendMessage(tab.id, {
-      type: 'selection:start',
-      lastRegion: state.lastRegion || undefined,
-      selectionToken: state.selectionToken
-    });
-  } catch (e) {
-    console.error('Command handler failed:', e);
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id) {
-      getState(tab.id).selectionToken = null;
-      updateState(tab.id, { active: false, status: 'Error', error: e.message, progress: 'Failed.' });
+      updateState(tab.id, { active: true, status: 'Selecting', progress: 'Drag a rectangle.' });
+      await chrome.tabs.sendMessage(tab.id, {
+        type: 'selection:start',
+        lastRegion: state.lastRegion || undefined,
+        selectionToken: state.selectionToken
+      });
+    } catch (e) {
+      console.error('Command handler failed:', e);
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab?.id) {
+        getState(tab.id).selectionToken = null;
+        updateState(tab.id, { active: false, status: 'Error', error: e.message, progress: 'Failed.' });
+      }
     }
+    return;
   }
+  if (command !== 'confirm-region-capture') return;
+  void (async () => {
+    let target = tab;
+    if (!target?.id) {
+      try {
+        [target] = await chrome.tabs.query({ active: true, currentWindow: true });
+      } catch {
+        return;
+      }
+    }
+    if (!target?.id) return;
+    try {
+      await chrome.tabs.sendMessage(
+        target.id,
+        { type: 'selection:confirm' },
+        { frameId: 0 }
+      );
+    } catch {
+      // Failed delivery has no confirmation effect.
+    }
+  })();
 });
 
 // ── message routing ────────────────────────────────────────────

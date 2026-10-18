@@ -48,7 +48,7 @@ function createEvent() {
     addListener(listener) { listeners.add(listener); },
     removeListener(listener) { listeners.delete(listener); },
     emit(...args) {
-      for (const listener of [...listeners]) listener(...args);
+      return [...listeners].map((listener) => listener(...args));
     }
   };
 }
@@ -2140,4 +2140,185 @@ test('W15 manifest declares two commands without changing other metadata', () =>
   assert.deepEqual(current, pinned);
   assert.equal(currentText.slice(0, currentText.indexOf('  "commands":')),
     pinnedText.slice(0, pinnedText.indexOf('  "commands":')));
+});
+
+function plain(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+async function shortcutWorker(options = {}) {
+  const h = createBackgroundHarness(options);
+  await vm.runInContext('startupReadiness', h.context);
+  h.queries = [];
+  h.sends = [];
+  h.effects = [];
+  h.deliver = async () => ({ ok: true });
+  const c = h.context.chrome;
+  c.tabs.query = async (query) => {
+    h.queries.push(plain(query));
+    return [{ id: 11 }];
+  };
+  c.tabs.sendMessage = async (tabId, message, sendOptions) => {
+    h.sends.push({ tabId, message: plain(message), options: plain(sendOptions || {}) });
+    return h.deliver(tabId, message, sendOptions);
+  };
+  for (const [owner, name] of [
+    [c.permissions, 'contains'], [c.permissions, 'request'],
+    [c.scripting, 'executeScript'], [c.scripting, 'insertCSS'],
+    [c.storage.local, 'set'], [c.storage.local, 'remove'],
+    [c.storage.sync, 'set']
+  ]) {
+    const original = owner[name].bind(owner);
+    owner[name] = (...args) => {
+      h.effects.push(name);
+      return original(...args);
+    };
+  }
+  h.context.__shortcutEffects = h.effects;
+  vm.runInContext(`
+    const shortcutOriginalUpdateState = updateState;
+    updateState = (...args) => {
+      __shortcutEffects.push('updateState');
+      return shortcutOriginalUpdateState(...args);
+    };
+    runCaptureLoop = async () => { __shortcutEffects.push('runCaptureLoop'); };
+  `, h.context);
+  const beforeStates = vm.runInContext('JSON.stringify([...states])', h.context);
+  const beforeStorage = JSON.stringify(h.localData);
+  const beforeBroadcasts = h.runtimeMessages.length;
+  h.assertQuiet = () => {
+    assert.deepEqual(h.effects, []);
+    assert.equal(vm.runInContext('JSON.stringify([...states])', h.context), beforeStates);
+    assert.equal(JSON.stringify(h.localData), beforeStorage);
+    assert.equal(h.runtimeMessages.length, beforeBroadcasts);
+    assert.equal(h.captureCalls.length, 0);
+  };
+  return h;
+}
+
+const CONFIRM_SEND = {
+  tabId: 11, message: { type: 'selection:confirm' }, options: { frameId: 0 }
+};
+
+test('W01 supplied tab receives exactly one top-frame confirmation', async () => {
+  const h = await shortcutWorker();
+  await Promise.all(h.events.command.emit('confirm-region-capture', { id: 11 }));
+  assert.equal(h.sends.length, 1, 'W01 expected one top-frame send');
+  assert.deepEqual(h.sends, [CONFIRM_SEND]);
+  assert.deepEqual(h.queries, []);
+  h.assertQuiet();
+});
+
+test('W02 absent or falsy supplied ID uses one exact fallback query', async () => {
+  for (const supplied of [undefined, {}, { id: 0 }]) {
+    const h = await shortcutWorker();
+    await Promise.all(h.events.command.emit('confirm-region-capture', supplied));
+    await delay();
+    assert.deepEqual(h.queries, [{ active: true, currentWindow: true }]);
+    assert.deepEqual(h.sends, [CONFIRM_SEND]);
+    h.assertQuiet();
+  }
+});
+
+test('W03 rejected query settles silently without delivery or side effects', async () => {
+  const h = await shortcutWorker();
+  h.context.chrome.tabs.query = async (query) => {
+    h.queries.push(plain(query));
+    throw new Error('query failed');
+  };
+  await Promise.all(h.events.command.emit('confirm-region-capture'));
+  await delay();
+  assert.deepEqual(h.queries, [{ active: true, currentWindow: true }]);
+  assert.deepEqual(h.sends, []);
+  h.assertQuiet();
+});
+
+test('W04 empty or unusable first query result never retries', async () => {
+  for (const rows of [[], [{}], [{ id: 0 }, { id: 11 }]]) {
+    const h = await shortcutWorker();
+    h.context.chrome.tabs.query = async (query) => {
+      h.queries.push(plain(query));
+      return rows;
+    };
+    await Promise.all(h.events.command.emit('confirm-region-capture'));
+    await delay();
+    assert.deepEqual(h.queries, [{ active: true, currentWindow: true }]);
+    assert.deepEqual(h.sends, []);
+    h.assertQuiet();
+  }
+});
+
+test('W05 missing content receiver is swallowed without fallback actions', async () => {
+  const h = await shortcutWorker();
+  h.deliver = async () => { throw new Error('no receiver'); };
+  await Promise.all(h.events.command.emit('confirm-region-capture', { id: 11 }));
+  await delay();
+  assert.deepEqual(h.sends, [CONFIRM_SEND]);
+  assert.deepEqual(h.queries, []);
+  h.assertQuiet();
+});
+
+test('W06 unrelated command has no confirmation effect or binding lookup', async () => {
+  const h = await shortcutWorker();
+  h.context.chrome.commands.getAll = () => assert.fail('unexpected binding lookup');
+  await Promise.all(h.events.command.emit('unrelated', { id: 11 }));
+  await delay();
+  assert.deepEqual(h.queries, []);
+  assert.deepEqual(h.sends, []);
+  h.assertQuiet();
+});
+
+test('W07 confirmation sends before unresolved startup readiness', async () => {
+  const h = await shortcutWorker();
+  const readiness = deferred();
+  h.context.__heldReadiness = readiness.promise;
+  vm.runInContext('startupReadiness = __heldReadiness;', h.context);
+  const results = h.events.command.emit('confirm-region-capture', { id: 11 });
+  assert.deepEqual(h.sends, [CONFIRM_SEND]);
+  assert.deepEqual(h.queries, []);
+  h.assertQuiet();
+  readiness.resolve();
+  await Promise.all(results);
+});
+
+test('W08 launch retains readiness permission injection and token flow', async () => {
+  const h = createBackgroundHarness({
+    syncValues: { backendHost: '127.0.0.1', backendPort: 9876 },
+    localData: { ocrPrompt: 'ocr', dedupPrompt: 'dedup' },
+    permissionContains: async () => false,
+    permissionRequest: async () => true
+  });
+  await vm.runInContext('startupReadiness', h.context);
+  const gate = deferred();
+  h.context.__launchGate = gate.promise;
+  vm.runInContext('startupReadiness = __launchGate;', h.context);
+  const queries = [];
+  const injections = [];
+  const c = h.context.chrome;
+  c.tabs.query = async (query) => { queries.push(plain(query)); return [{ id: 1 }]; };
+  c.scripting.executeScript = async (args) => { injections.push(plain(args)); };
+  c.scripting.insertCSS = async (args) => { injections.push(plain(args)); };
+  h.messageCalls.length = 0;
+  const results = h.events.command.emit('start-region-capture');
+  assert.deepEqual(queries, []);
+  assert.equal(h.permissionContainsCalls.length, 0);
+  assert.deepEqual(injections, []);
+  gate.resolve();
+  await Promise.all(results);
+  assert.deepEqual(queries, [{ active: true, currentWindow: true }]);
+  assert.deepEqual(plain(h.permissionRequestCalls), [{ origins: ['http://127.0.0.1/*'] }]);
+  assert.deepEqual(injections, [
+    { target: { tabId: 1 }, files: ['content.js'] },
+    { target: { tabId: 1 }, files: ['overlay.css'] }
+  ]);
+  const state = h.context.getState(1);
+  assert.equal(state.status, 'Selecting');
+  assert.equal(state.active, true);
+  assert.ok(typeof state.selectionToken === 'string' && state.selectionToken.length > 0);
+  assert.deepEqual(plain(state.operationBackend), { host: '127.0.0.1', port: 9876 });
+  assert.deepEqual(plain(state.operationPrompts), { ocr: 'ocr', dedup: 'dedup' });
+  assert.deepEqual(plain(h.messageCalls), [{
+    tabId: 1,
+    message: { type: 'selection:start', selectionToken: state.selectionToken }
+  }]);
 });
