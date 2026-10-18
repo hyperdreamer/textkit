@@ -16,6 +16,7 @@ const fileBridgeHostInput = document.getElementById('file-bridge-host');
 const fileBridgePortInput = document.getElementById('file-bridge-port');
 const settingsGear = document.getElementById('settings-gear');
 const settingsPanel = document.getElementById('backend-settings-panel');
+const appVersionEl = document.getElementById('app-version');
 const autoscrollCheckbox = document.getElementById('ocr-autoscroll');
 const lastRegionEl = document.getElementById('last-region');
 
@@ -434,6 +435,11 @@ chrome.runtime.onMessage.addListener((message) => {
 
 // ── Init ──────────────────────────────────────────────────────
 async function init() {
+  // The header version must track manifest.json; a hardcoded literal drifts on
+  // every release bump.
+  const manifestVersion = chrome.runtime?.getManifest?.()?.version;
+  if (manifestVersion) appVersionEl.textContent = `v${manifestVersion}`;
+
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   currentTabId = tab?.id || null;
 

@@ -110,6 +110,10 @@ function createPopupHarness(options = {}) {
     runtime: {
       lastError: options.runtimeLastError,
       onMessage: runtimeMessage,
+      getManifest() {
+        if (options.getManifest) return options.getManifest();
+        return { manifest_version: 3, version: '9.9.9' };
+      },
       sendMessage(message) {
         runtimeMessages.push(message);
         return options.runtimeSendMessage ? options.runtimeSendMessage(message) : Promise.resolve({ ok: true });
@@ -368,6 +372,20 @@ test('popup restores persisted OCR status before rendering Idle state', async ()
 
   assert.equal(harness.elements.get('status').textContent, 'Done');
   assert.equal(harness.elements.get('result').value, 'restored result');
+});
+
+test('popup header version is derived from the extension manifest', async () => {
+  const harness = createPopupHarness({
+    getManifest: () => ({ manifest_version: 3, version: '2.1.2' }),
+    runtimeSendMessage: async (message) => message.type === 'popup:get-state'
+      ? { ok: true, tabId: 1, state: { status: 'Idle', active: false, progress: 'Ready' } }
+      : { ok: true },
+    fetch: async () => ({ ok: false, status: 503 })
+  });
+
+  await harness.context.init();
+
+  assert.equal(harness.elements.get('app-version').textContent, 'v2.1.2');
 });
 
 test('popup preserves terminal translation and format errors when no operation is active', async () => {
