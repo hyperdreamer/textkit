@@ -1001,6 +1001,165 @@ def test_legacy_chat_request_body_and_headers_are_unchanged(
     assert "temperature" not in request["body"]
 
 
+# ── legacy Chat wire goldens (captured before protocol adapters) ──
+
+LEGACY_CASES: dict[str, tuple[list[dict], bytes]] = {
+    "ocr": (
+        [
+            {
+                "role": "user",
+                "content": [
+                    main.TextPart("OCR prompt"),
+                    main.ImagePart("data:image/png;base64,AA=="),
+                ],
+            }
+        ],
+        b'{"model":"test-model","messages":[{"role":"user","content":[{"type":"text","text":"OCR prompt"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}',
+    ),
+    "dedup": (
+        [
+            {"role": "system", "content": "Dedup prompt"},
+            {"role": "user", "content": "first page\nsecond page"},
+        ],
+        b'{"model":"test-model","messages":[{"role":"system","content":"Dedup prompt"},{"role":"user","content":"first page\\nsecond page"}]}',
+    ),
+    "translate": (
+        [
+            {"role": "system", "content": "Translate to English"},
+            {"role": "user", "content": "Hello\nworld"},
+        ],
+        b'{"model":"test-model","messages":[{"role":"system","content":"Translate to English"},{"role":"user","content":"Hello\\nworld"}]}',
+    ),
+    "format": (
+        [
+            {"role": "system", "content": "Format prompt"},
+            {"role": "user", "content": "Hello\nworld"},
+        ],
+        b'{"model":"test-model","messages":[{"role":"system","content":"Format prompt"},{"role":"user","content":"Hello\\nworld"}]}',
+    ),
+}
+
+
+def _default_accept_encoding() -> bytes:
+    """Read the ``Accept-Encoding`` httpx derives from installed decoders.
+
+    It is ``gzip, deflate`` here and ``gzip, deflate, br, zstd`` where brotli or
+    zstandard is installed, so a literal would only pin this machine.
+    """
+
+    async def run() -> bytes:
+        client = httpx.AsyncClient()
+        try:
+            return httpx.Headers(client.headers.raw)["accept-encoding"].encode()
+        finally:
+            await client.aclose()
+
+    return asyncio.run(run())
+
+
+def _expected_legacy_raw_headers(
+    body: bytes, *, idempotency_key: str | None = None
+) -> list[tuple[bytes, bytes]]:
+    raw = [
+        (b"Host", b"example.invalid"),
+        (b"Accept", b"*/*"),
+        (b"Accept-Encoding", _default_accept_encoding()),
+        (b"Connection", b"keep-alive"),
+        (b"User-Agent", b"python-httpx/" + httpx.__version__.encode("ascii")),
+        (b"Authorization", b"Bearer test-key"),
+    ]
+    if idempotency_key is not None:
+        raw.append((b"Idempotency-Key", idempotency_key.encode("ascii")))
+    raw.append((b"Content-Length", str(len(body)).encode("ascii")))
+    raw.append((b"Content-Type", b"application/json"))
+    return raw
+
+
+def _capture_legacy_chat_request(
+    messages: list[dict], *, idempotency_key: str | None = None
+) -> httpx.Request:
+    seen: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": "ok"}, "finish_reason": "stop"}
+                ],
+                "model": "test-model",
+                "usage": {"total_tokens": 1},
+            },
+        )
+
+    async def run() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        previous = main._http_client
+        main._http_client = client
+        try:
+            await main._request_chat_completion(
+                main.AIConfig(
+                    api_base="https://example.invalid",
+                    api_key="test-key",
+                    model="test-model",
+                ),
+                messages,
+                idempotency_key=idempotency_key,
+            )
+        finally:
+            main._http_client = previous
+            await client.aclose()
+
+    asyncio.run(run())
+    assert len(seen) == 1
+    return seen[0]
+
+
+@pytest.mark.parametrize("operation", sorted(LEGACY_CASES))
+def test_legacy_chat_wire_goldens_match_pre_change_bytes(operation: str) -> None:
+    messages, expected_body = LEGACY_CASES[operation]
+    request = _capture_legacy_chat_request(messages)
+
+    assert str(request.url) == "https://example.invalid/v1/chat/completions"
+    assert request.content == expected_body
+    raw = list(request.headers.raw)
+    expected_raw = _expected_legacy_raw_headers(expected_body)
+    assert dict(raw) == dict(expected_raw)
+    # ``Accept-Encoding`` is host-derived; every other pair is pinned exactly and
+    # in order, including the four after httpx's own default headers.
+    assert [pair for pair in raw if pair[0] != b"Accept-Encoding"] == [
+        pair for pair in expected_raw if pair[0] != b"Accept-Encoding"
+    ]
+    names = [name for name, _ in raw]
+    assert names.index(b"Authorization") < names.index(b"Content-Length")
+    assert names.index(b"Content-Length") < names.index(b"Content-Type")
+    assert (b"Content-Type", b"application/json") in raw
+    assert b"temperature" not in request.content
+
+
+def test_legacy_chat_wire_golden_includes_idempotency_without_reordering_json_headers() -> (
+    None
+):
+    messages, expected_body = LEGACY_CASES["ocr"]
+    request = _capture_legacy_chat_request(messages, idempotency_key="ocr-op-1")
+
+    raw = list(request.headers.raw)
+    names = [name for name, _ in raw]
+    assert (b"Idempotency-Key", b"ocr-op-1") in raw
+    assert names.index(b"Authorization") < names.index(b"Idempotency-Key")
+    assert names.index(b"Idempotency-Key") < names.index(b"Content-Length")
+    assert names.index(b"Content-Length") < names.index(b"Content-Type")
+    assert request.content == expected_body
+    expected_raw = _expected_legacy_raw_headers(
+        expected_body, idempotency_key="ocr-op-1"
+    )
+    assert dict(raw) == dict(expected_raw)
+    assert [pair for pair in raw if pair[0] != b"Accept-Encoding"] == [
+        pair for pair in expected_raw if pair[0] != b"Accept-Encoding"
+    ]
+
+
 def test_facade_routes_to_the_configured_messages_protocol(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
