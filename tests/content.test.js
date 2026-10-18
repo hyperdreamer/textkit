@@ -731,3 +731,253 @@ test('C07 page Ctrl+Space and Ctrl+Shift+Space no longer confirm OCR', async () 
   assert.equal(h.completions().length, 1);
   assert.equal(h.current.removed, true);
 });
+
+const HINTS = {
+  fresh: {
+    checking: 'Drag to select OCR region. Confirmation shortcut checking… Set it at chrome://extensions/shortcuts. Esc to cancel.',
+    assigned: 'Drag to select OCR region. Alt+Shift+O to confirm. Esc to cancel.',
+    unassigned: 'Drag to select OCR region. Confirmation shortcut not set; set “Confirm selected OCR region” at chrome://extensions/shortcuts. Esc to cancel.',
+    unavailable: 'Drag to select OCR region. Confirmation shortcut unavailable; check “Confirm selected OCR region” at chrome://extensions/shortcuts. Esc to cancel.'
+  },
+  saved: {
+    checking: 'Drag to adjust. Confirmation shortcut checking… Set it at chrome://extensions/shortcuts. Esc to cancel.',
+    assigned: 'Drag to adjust. Alt+Shift+O to confirm. Esc to cancel.',
+    unassigned: 'Drag to adjust. Confirmation shortcut not set; set “Confirm selected OCR region” at chrome://extensions/shortcuts. Esc to cancel.',
+    unavailable: 'Drag to adjust. Confirmation shortcut unavailable; check “Confirm selected OCR region” at chrome://extensions/shortcuts. Esc to cancel.'
+  }
+};
+const HINT_DIAGNOSTIC = 'Selection confirmation is stale or unauthorized. Adjust the region and try again.';
+async function rejectSelection(h) {
+  h.completeSend = () => Promise.resolve({
+    ok: false, error: 'Selection confirmation is stale or unauthorized.'
+  });
+  assertConfirmReply(h);
+  await h.finish();
+  assert.equal(h.current.style.display, '');
+  assert.equal(h.current.removed, false);
+  assert.equal(h.current.hint.textContent, HINT_DIAGNOSTIC);
+}
+
+for (const [kind, saved, checkingID, assignedID, unassignedID, unavailableID] of [
+  ['fresh', undefined, 'C11', 'C13', 'C15', 'C17'],
+  ['saved', SELECTION_R, 'C12', 'C14', 'C16', 'C18']
+]) {
+  test(`${checkingID} ${kind} checking is synchronous and requests once`, () => {
+    const h = selectionHarness();
+    assert.deepEqual(h.start(saved), { returns: [false], responses: [{ ok: true }] });
+    assert.equal(h.current.hint.textContent, HINTS[kind].checking,
+      `${checkingID} must render ${kind} checking text synchronously`);
+    assert.deepEqual(h.sends, [{ type: 'commands:binding' }]);
+    assert.equal(h.bindings.length, 1);
+    assert.equal(h.current.hint.textContent.includes('Ctrl+Space'), false);
+    assert.equal(h.current.hint.textContent.includes('Ctrl+Shift+Space'), false);
+    if (saved) {
+      assert.equal(h.current.selection.style.left, '100px');
+      assert.equal(h.current.selection.style.top, '100px');
+      assert.equal(h.current.selection.style.width, '200px');
+      assert.equal(h.current.selection.style.height, '150px');
+    }
+  });
+  test(`${assignedID} ${kind} assigned renders Chrome label verbatim as text`, async () => {
+    const h = selectionHarness();
+    h.start(saved);
+    h.bindings[0].resolve({ state: 'assigned', label: 'Alt+Shift+O' });
+    await selectionSettled();
+    assert.equal(h.current.hint.textContent, HINTS[kind].assigned);
+    const literal = selectionHarness();
+    literal.start(saved);
+    literal.bindings[0].resolve({ state: 'assigned', label: ' <b>Alt+O</b> ' });
+    await selectionSettled();
+    const prefix = kind === 'saved' ? 'Drag to adjust.' : 'Drag to select OCR region.';
+    assert.equal(literal.current.hint.textContent, `${prefix}  <b>Alt+O</b>  to confirm. Esc to cancel.`);
+  });
+  test(`${unassignedID} ${kind} unassigned is explicit and preserves initial verb`, async () => {
+    const h = selectionHarness();
+    h.start(saved);
+    h.bindings[0].resolve({ state: 'unassigned' });
+    await selectionSettled();
+    assert.equal(h.current.hint.textContent, HINTS[kind].unassigned);
+  });
+  test(`${unavailableID} ${kind} unavailable differs from intentionally unassigned`, async () => {
+    const h = selectionHarness();
+    h.start(saved);
+    h.bindings[0].resolve({ state: 'unavailable' });
+    await selectionSettled();
+    assert.equal(h.current.hint.textContent, HINTS[kind].unavailable);
+    assert.notEqual(h.current.hint.textContent, HINTS[kind].unassigned);
+  });
+}
+
+test('C19 rejected binding transport shows unavailable and still permits confirmation', async () => {
+  const h = selectionHarness();
+  h.start();
+  assert.equal(h.current.hint.textContent, HINTS.fresh.checking);
+  h.bindings[0].reject(new Error('binding transport rejected'));
+  await selectionSettled();
+  assert.equal(h.current.hint.textContent, HINTS.fresh.unavailable);
+  h.draw();
+  assertConfirmReply(h);
+  await h.finish();
+  assert.equal(h.completions().length, 1);
+});
+
+test('C20 synchronous binding transport throw is unavailable immediately', async () => {
+  const h = selectionHarness();
+  h.bindingSend = () => { throw new Error('binding transport threw'); };
+  assert.deepEqual(h.start(), { returns: [false], responses: [{ ok: true }] });
+  assert.equal(h.current.hint.textContent, HINTS.fresh.unavailable);
+  assert.equal(h.bindings.length, 1);
+  h.draw();
+  assertConfirmReply(h);
+  await h.finish();
+  assert.equal(h.completions().length, 1);
+});
+
+test('C21 malformed binding replies normalize to unavailable', async () => {
+  for (const reply of [
+    undefined, null, {}, { state: 'mystery' }, { state: 'checking' },
+    { state: 'assigned' }, { state: 'assigned', label: '' },
+    { state: 'assigned', label: 7 }, { state: 'assigned', label: null }
+  ]) {
+    const h = selectionHarness();
+    h.start();
+    h.bindings[0].resolve(reply);
+    await selectionSettled();
+    assert.equal(h.current.hint.textContent, HINTS.fresh.unavailable);
+  }
+});
+
+test('C22 closed A reply cannot repaint detached A or checking B', async () => {
+  const h = selectionHarness();
+  h.start();
+  const a = h.current;
+  h.deliver({ type: 'selection:cancel' });
+  h.start(SELECTION_R, 'B');
+  const b = h.current;
+  const aWrites = a.writes.length;
+  const bWrites = b.writes.length;
+  h.bindings[0].resolve({ state: 'assigned', label: 'Old+A' });
+  await selectionSettled();
+  assert.equal(a.removed, true);
+  assert.equal(a.writes.length, aWrites);
+  assert.equal(b.writes.length, bWrites);
+  assert.equal(b.hint.textContent, HINTS.saved.checking);
+  h.bindings[1].resolve({ state: 'assigned', label: 'Alt+Shift+O' });
+  await selectionSettled();
+  assert.equal(b.hint.textContent, HINTS.saved.assigned);
+});
+
+test('C23 stale success or rejection cannot overwrite assigned B', async () => {
+  for (const outcome of ['resolve', 'reject']) {
+    const h = selectionHarness();
+    h.start();
+    const a = h.current;
+    h.start(SELECTION_R, 'B');
+    const b = h.current;
+    h.bindings[1].resolve({ state: 'assigned', label: 'Alt+Shift+O' });
+    await selectionSettled();
+    const aWrites = a.writes.length;
+    const bWrites = b.writes.length;
+    h.bindings[0][outcome](outcome === 'resolve'
+      ? { state: 'assigned', label: 'Old+A' } : new Error('old failure'));
+    await selectionSettled();
+    assert.equal(a.writes.length, aWrites);
+    assert.equal(b.writes.length, bWrites);
+    assert.equal(b.hint.textContent, HINTS.saved.assigned);
+  }
+});
+
+test('C24 diagnostic precedes later binding success or failure', async () => {
+  for (const outcome of ['resolve', 'reject']) {
+    const h = selectionHarness();
+    h.start(SELECTION_R);
+    await rejectSelection(h);
+    const writes = h.current.writes.length;
+    h.bindings[0][outcome](outcome === 'resolve'
+      ? { state: 'assigned', label: 'Alt+Shift+O' } : new Error('lookup failed'));
+    await selectionSettled();
+    assert.equal(h.current.hint.textContent, HINT_DIAGNOSTIC);
+    assert.equal(h.current.writes.length, writes);
+    h.pointer('pointerdown', 150, 150);
+    h.pointer('pointermove', 170, 180);
+    h.pointer('pointerup', 170, 180);
+    assert.equal(h.current.hint.textContent, outcome === 'resolve'
+      ? HINTS.saved.assigned : HINTS.saved.unavailable);
+  }
+});
+
+test('C25 diagnostic replaces an earlier assigned binding', async () => {
+  const h = selectionHarness();
+  h.start(SELECTION_R);
+  h.bindings[0].resolve({ state: 'assigned', label: 'Alt+Shift+O' });
+  await selectionSettled();
+  assert.equal(h.current.hint.textContent, HINTS.saved.assigned);
+  await rejectSelection(h);
+  await selectionSettled();
+  assert.equal(h.current.hint.textContent, HINT_DIAGNOSTIC);
+  assert.equal(h.bindings.length, 1);
+});
+
+test('C26 only trusted actual rectangle changes clear diagnostic', async () => {
+  for (const bound of [false, true]) {
+    const h = selectionHarness();
+    h.start(SELECTION_R);
+    await rejectSelection(h);
+    if (bound) {
+      h.bindings[0].resolve({ state: 'assigned', label: 'Alt+Shift+O' });
+      await selectionSettled();
+    }
+    h.pointer('pointerdown', 400, 400, false);
+    assert.equal(h.current.hint.textContent, HINT_DIAGNOSTIC);
+    h.pointer('pointerdown', 150, 150);
+    h.pointer('pointermove', 150, 150);
+    h.pointer('pointerup', 150, 150);
+    assert.equal(h.current.hint.textContent, HINT_DIAGNOSTIC);
+    h.pointer('pointerdown', 150, 150);
+    h.pointer('pointermove', 170, 180, false);
+    assert.equal(h.current.hint.textContent, HINT_DIAGNOSTIC);
+    h.pointer('pointermove', 170, 180);
+    h.pointer('pointerup', 170, 180);
+    assert.equal(h.current.hint.textContent, bound ? HINTS.saved.assigned : HINTS.saved.checking);
+  }
+  const h = selectionHarness();
+  h.start(SELECTION_R);
+  await rejectSelection(h);
+  h.pointer('pointerdown', 400, 400);
+  assert.equal(h.current.hint.textContent, HINTS.saved.checking,
+    'a new-region pointerdown that actually changes geometry also clears diagnostic');
+});
+
+test('C27 reopening resets ownership diagnostic and binding snapshot', async () => {
+  const h = selectionHarness();
+  h.start(SELECTION_R);
+  h.bindings[0].resolve({ state: 'assigned', label: 'Alt+Shift+O' });
+  await selectionSettled();
+  await rejectSelection(h);
+  const old = h.current;
+  h.deliver({ type: 'selection:cancel' });
+  h.start();
+  assert.notEqual(h.current, old);
+  assert.equal(h.current.hint.textContent, HINTS.fresh.checking);
+  assert.equal(h.bindings.length, 2);
+  h.bindings[1].resolve({ state: 'assigned', label: 'Ctrl+Shift+Space' });
+  await selectionSettled();
+  assert.equal(h.current.hint.textContent,
+    'Drag to select OCR region. Ctrl+Shift+Space to confirm. Esc to cancel.');
+  h.draw();
+  await selectionSettled();
+  assert.equal(h.bindings.length, 2);
+});
+
+test('C36 injected closed-root and external hint styles both allow wrapping', () => {
+  const h = selectionHarness();
+  h.start();
+  assert.equal(h.current.shadowMode, 'closed');
+  const external = fs.readFileSync(path.join(ROOT, 'extension', 'overlay.css'), 'utf8');
+  for (const source of [h.current.root.innerHTML, external]) {
+    const rule = source.match(/\.textkit-hint\s*\{([^}]+)\}/)[1];
+    assert.match(rule, /max-width:\s*calc\(100vw - 32px\);/);
+    assert.match(rule, /overflow-wrap:\s*anywhere;/);
+    assert.doesNotMatch(rule, /white-space:\s*nowrap/);
+  }
+});
