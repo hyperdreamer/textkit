@@ -1,0 +1,13 @@
+{
+  "type": "selection:complete",
+  "region": {
+    "x": 100,
+    "y": 100,
+    "width": 200,
+    "height": 150,
+    "viewportWidth": 1200,
+    "viewportHeight": 800,
+    "devicePixelRatio": 1
+  },
+  "selectionToken": "confirm-token"
+}

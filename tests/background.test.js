@@ -2420,3 +2420,218 @@ test('W14 replied latch defeats a second failure path', async () => {
   assert.equal(calls, 1, 'latch is set before sendResponse can throw');
   h.assertQuiet();
 });
+
+function commandReceiver() {
+  const filename = path.join(ROOT, 'tests', 'content.test.js');
+  const localRequire = require('node:module').createRequire(filename);
+  const receiverModule = { exports: {} };
+  const source = fs.readFileSync(filename, 'utf8') + '\nmodule.exports = { selectionHarness };\n';
+  const evaluate = new Function('require', 'module', 'exports', '__dirname', '__filename', source);
+  evaluate(
+    (name) => name === 'node:test' ? () => {} : localRequire(name),
+    receiverModule, receiverModule.exports, path.dirname(filename), filename
+  );
+  return receiverModule.exports.selectionHarness();
+}
+
+async function admissionHarness(seed = true) {
+  const h = createBackgroundHarness();
+  await vm.runInContext('startupReadiness', h.context);
+  if (seed) Object.assign(h.context.getState(1), {
+    status: 'Selecting', active: true, selectionToken: 'expected'
+  });
+  h.admissions = [];
+  h.admissionEvents = [];
+  h.context.__admissions = h.admissions;
+  h.context.__admissionEvents = h.admissionEvents;
+  vm.runInContext(`
+    runCaptureLoop = async (tab, region) => {
+      __admissionEvents.push('pipeline');
+      __admissions.push({ tab, region, tokenAtLaunch: getState(tab.id).selectionToken });
+    };
+  `, h.context);
+  h.probe = (region = REGION, token = 'expected', sender = {
+    tab: { id: 1, windowId: 10, active: true }
+  }) => {
+    const responses = [];
+    const returns = h.events.runtimeMessage.emit({
+      type: 'selection:complete', region, selectionToken: token
+    }, sender, (reply) => {
+      h.admissionEvents.push('reply');
+      responses.push(plain(reply));
+    });
+    return { returns, responses };
+  };
+  return h;
+}
+
+test('W16 worker admits valid completion consumes token saves and acknowledges before capture', async () => {
+  for (const [token, region] of [
+    ['expected', { ...REGION, devicePixelRatio: 1 }],
+    ['new-doc', { x: 30, y: 40, width: 80, height: 60,
+      viewportWidth: 1200, viewportHeight: 800, devicePixelRatio: 1 }],
+    ['expected', { x: '-5', y: '-6', width: '100', height: '80',
+      viewportWidth: '1200', viewportHeight: '800', devicePixelRatio: 'unexamined' }]
+  ]) {
+    const h = await admissionHarness();
+    h.context.getState(1).selectionToken = token;
+    const result = h.probe(region, token);
+    assert.deepEqual(result, { returns: [false], responses: [{ ok: true }] });
+    assert.deepEqual(h.admissionEvents, ['reply', 'pipeline']);
+    assert.equal(h.context.getState(1).selectionToken, null);
+    const saved = { x: region.x, y: region.y, width: region.width, height: region.height };
+    assert.deepEqual(plain(h.localData.lastRegion), saved);
+    assert.deepEqual(plain(h.context.getState(1).lastRegion), saved);
+    assert.equal(h.admissions.length, 1);
+    assert.deepEqual(plain(h.admissions[0].region), region);
+    assert.equal(h.admissions[0].tab.id, 1);
+    assert.equal(h.admissions[0].tokenAtLaunch, null);
+  }
+});
+
+test('W17 supplied tab stays the receiver after focus changes before delivery', async () => {
+  const h = await shortcutWorker({ tabs: [
+    { id: 11, windowId: 10, active: true },
+    { id: 12, windowId: 10, active: false }
+  ] });
+  const t = commandReceiver();
+  const u = commandReceiver();
+  const rT = { x: 100, y: 100, width: 200, height: 150 };
+  const rU = { x: 30, y: 40, width: 80, height: 60 };
+  t.start(rT, 'T');
+  u.start(rU, 'U');
+  const delivery = deferred();
+  let focus = 11;
+  h.context.chrome.tabs.query = async (query) => {
+    h.queries.push(plain(query));
+    return [{ id: focus }];
+  };
+  h.deliver = async (tabId, message, options) => {
+    await delivery.promise;
+    assert.deepEqual(plain(options), { frameId: 0 });
+    const receiver = tabId === 11 ? t : u;
+    const result = receiver.deliver(plain(message));
+    assert.deepEqual(result, { returns: [false], responses: [{ ok: true }] });
+    return result.responses[0];
+  };
+  await Promise.all(h.events.command.emit('confirm-region-capture', { id: 11 }));
+  focus = 12;
+  assert.deepEqual(h.sends, [CONFIRM_SEND]);
+  assert.deepEqual(h.queries, []);
+  assert.deepEqual(t.completions(), []);
+  delivery.resolve();
+  await delay();
+  await t.finish();
+  assert.deepEqual(t.completions(), [{
+    type: 'selection:complete',
+    region: { ...rT, viewportWidth: 1200, viewportHeight: 800, devicePixelRatio: 1 },
+    selectionToken: 'T'
+  }]);
+  assert.deepEqual(u.completions(), []);
+  assert.equal(u.frames.length, 0);
+  h.assertQuiet();
+});
+
+test('W18 one delayed fallback query resolves to newly focused live receiver', async () => {
+  const h = await shortcutWorker({ tabs: [
+    { id: 11, windowId: 10, active: true },
+    { id: 12, windowId: 10, active: false }
+  ] });
+  const t = commandReceiver();
+  const u = commandReceiver();
+  const rU = { x: 30, y: 40, width: 80, height: 60 };
+  t.start({ x: 100, y: 100, width: 200, height: 150 }, 'T');
+  u.start(rU, 'U');
+  const query = deferred();
+  let focus = 11;
+  h.context.chrome.tabs.query = (args) => {
+    h.queries.push(plain(args));
+    return query.promise;
+  };
+  h.deliver = async (tabId, message, options) => {
+    assert.deepEqual(plain(options), { frameId: 0 });
+    const result = (tabId === 12 ? u : t).deliver(plain(message));
+    assert.deepEqual(result, { returns: [false], responses: [{ ok: true }] });
+    return result.responses[0];
+  };
+  await Promise.all(h.events.command.emit('confirm-region-capture'));
+  assert.deepEqual(h.queries, [{ active: true, currentWindow: true }]);
+  assert.deepEqual(h.sends, []);
+  focus = 12;
+  query.resolve([{ id: focus }]);
+  await delay();
+  assert.deepEqual(h.sends, [{
+    tabId: 12, message: { type: 'selection:confirm' }, options: { frameId: 0 }
+  }]);
+  assert.equal(h.queries.length, 1);
+  await u.finish();
+  assert.deepEqual(u.completions(), [{
+    type: 'selection:complete',
+    region: { ...rU, viewportWidth: 1200, viewportHeight: 800, devicePixelRatio: 1 },
+    selectionToken: 'U'
+  }]);
+  assert.deepEqual(t.completions(), []);
+  assert.equal(t.frames.length, 0);
+  h.assertQuiet();
+});
+
+test('W19 invalid shape takes precedence over forged token and retains Error update', async () => {
+  const h = await admissionHarness();
+  assert.deepEqual(h.probe({ ...REGION, width: 0 }, 'forged'), {
+    returns: [false], responses: [{ ok: false, error: 'Invalid selected region.' }]
+  });
+  assert.equal(h.context.getState(1).status, 'Error');
+  assert.equal(h.context.getState(1).active, false);
+  assert.equal(h.context.getState(1).selectionToken, 'expected');
+  assert.deepEqual(h.admissions, []);
+});
+
+test('W20 stale token rejects with matching worker token retained', async () => {
+  const h = await admissionHarness();
+  assert.deepEqual(h.probe(REGION, 'forged'), {
+    returns: [false], responses: [{
+      ok: false, error: 'Selection confirmation is stale or unauthorized.'
+    }]
+  });
+  assert.equal(h.context.getState(1).selectionToken, 'expected');
+  assert.deepEqual(h.admissions, []);
+});
+
+test('W21 consumed completion token cannot launch capture twice', async () => {
+  const h = await admissionHarness();
+  assert.deepEqual(h.probe(), { returns: [false], responses: [{ ok: true }] });
+  assert.deepEqual(h.probe(), {
+    returns: [false], responses: [{
+      ok: false, error: 'Selection confirmation is stale or unauthorized.'
+    }]
+  });
+  assert.equal(h.admissions.length, 1);
+  assert.deepEqual(h.admissionEvents, ['reply', 'pipeline', 'reply']);
+});
+
+test('W22 fresh-worker loss and non-Selecting state reject old authorization', async () => {
+  const fresh = await admissionHarness(false);
+  assert.equal(fresh.context.getState(1).status, 'Idle');
+  assert.equal(fresh.context.getState(1).selectionToken, null);
+  const idle = await admissionHarness();
+  Object.assign(idle.context.getState(1), { status: 'Idle', active: false });
+  for (const h of [fresh, idle]) {
+    assert.deepEqual(h.probe(), {
+      returns: [false], responses: [{
+        ok: false, error: 'Selection confirmation is stale or unauthorized.'
+      }]
+    });
+    assert.deepEqual(h.admissions, []);
+    assert.equal(h.localData.lastRegion, undefined);
+  }
+});
+
+test('W23 completion without sender tab rejects before capture', async () => {
+  const h = await admissionHarness();
+  assert.deepEqual(h.probe(REGION, 'expected', {}), {
+    returns: [false], responses: [{ ok: false, error: 'No sender tab found.' }]
+  });
+  assert.deepEqual(h.admissions, []);
+  assert.equal(h.context.getState(1).selectionToken, 'expected');
+  assert.equal(h.localData.lastRegion, undefined);
+});
