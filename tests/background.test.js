@@ -2120,9 +2120,17 @@ test('W15 manifest declares two commands without changing other metadata', () =>
   const { execFileSync } = require('node:child_process');
   const manifestPath = path.join(ROOT, 'extension', 'manifest.json');
   const currentText = fs.readFileSync(manifestPath, 'utf8');
-  const pinnedText = execFileSync('git', [
-    'show', 'c47dec6a24b42bcdb25f2c4fbe731deca8ce4431:extension/manifest.json'
-  ], { cwd: ROOT, encoding: 'utf8' });
+  // Prefer the real pinned object; fall back to the committed copy so this
+  // test also passes in a shallow clone or CI checkout without that commit.
+  let pinnedText;
+  try {
+    pinnedText = execFileSync('git', [
+      'show', 'c47dec6a24b42bcdb25f2c4fbe731deca8ce4431:extension/manifest.json'
+    ], { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch {
+    pinnedText = fs.readFileSync(
+      path.join(ROOT, 'tests', 'fixtures', 'manifest-at-c47dec6a.json'), 'utf8');
+  }
   const current = JSON.parse(currentText);
   const pinned = JSON.parse(pinnedText);
   assert.deepEqual(current.commands, {
