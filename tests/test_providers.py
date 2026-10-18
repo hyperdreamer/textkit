@@ -12,6 +12,8 @@ import pytest
 
 from backend import providers
 
+_OMITTED = object()
+
 
 def _config(**overrides):
     values = {
@@ -20,15 +22,24 @@ def _config(**overrides):
         "model": "test-model",
     }
     values.update(overrides)
+    for key, value in overrides.items():
+        if value is _OMITTED:
+            values.pop(key, None)
     from backend import main
 
     return main.AIConfig(**values)
 
 
+def test_omitted_endpoint_defaults_to_none_without_being_explicitly_set():
+    config = _config(endpoint=_OMITTED)
+    assert config.endpoint is None
+    assert "endpoint" not in config.model_fields_set
+
+
 @pytest.mark.parametrize(
     ("endpoint", "expected"),
     [
-        (None, "https://example.invalid/v1/chat/completions"),
+        (_OMITTED, "https://example.invalid/v1/chat/completions"),
         ("/v1/chat/completions", "https://example.invalid/v1/chat/completions"),
         ("/v1/responses", "https://example.invalid/v1/responses"),
         ("/v1/messages", "https://example.invalid/v1/messages"),
@@ -41,7 +52,7 @@ def test_resolve_endpoint_is_plain_concatenation(endpoint, expected):
 @pytest.mark.parametrize(
     ("endpoint", "adapter_type"),
     [
-        (None, providers.ChatCompletionsAdapter),
+        (_OMITTED, providers.ChatCompletionsAdapter),
         ("/v1/chat/completions", providers.ChatCompletionsAdapter),
         ("/v1/responses", providers.ResponsesAdapter),
         ("/v1/messages", providers.MessagesAdapter),
