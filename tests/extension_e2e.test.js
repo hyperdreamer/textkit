@@ -73,6 +73,7 @@ test('unpacked MV3 extension loads in Chromium and survives a worker restart', {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'textkit-chromium-'));
   const browser = spawn(chromium, [
     '--headless=new',
+    '--lang=en-US',
     '--no-sandbox',
     '--disable-gpu',
     `--disable-extensions-except=${EXTENSION}`,
@@ -120,16 +121,20 @@ test('unpacked MV3 extension loads in Chromium and survives a worker restart', {
   }, 'Popup did not finish loading');
 
   const snapshot = await popup.send('Runtime.evaluate', {
-    expression: `(() => ({
+    expression: `(async () => ({
       title: document.title,
       mainCount: document.querySelectorAll('main').length,
       tabs: [...document.querySelectorAll('[role="tab"]')].map((tab) => tab.getAttribute('aria-selected')),
       panels: document.querySelectorAll('[role="tabpanel"]').length,
       liveRegions: document.querySelectorAll('[aria-live="polite"]').length,
-      manifest: chrome.runtime.getManifest()
+      manifest: chrome.runtime.getManifest(),
+      platform: await chrome.runtime.getPlatformInfo(),
+      commands: await chrome.commands.getAll()
     }))()`,
+    awaitPromise: true,
     returnByValue: true
   });
+  assert.equal(snapshot.exceptionDetails, undefined);
   const value = snapshot.result.value;
   assert.equal(value.title, 'TextKit');
   assert.equal(value.mainCount, 1);
@@ -138,7 +143,34 @@ test('unpacked MV3 extension loads in Chromium and survives a worker restart', {
   assert.ok(value.liveRegions >= 3);
   assert.equal(value.manifest.manifest_version, 3);
   assert.equal(value.manifest.minimum_chrome_version, '116');
-  assert.equal(value.manifest.permissions.includes('tabs'), false);
+  assert.deepEqual(value.manifest.permissions, [
+    'activeTab', 'scripting', 'downloads', 'storage', 'offscreen',
+    'clipboardWrite', 'notifications'
+  ]);
+  assert.deepEqual(value.manifest.optional_host_permissions, [
+    'http://localhost/*', 'http://127.0.0.1/*', 'http://[::1]/*'
+  ]);
+  const expectedCommands = {
+    'start-region-capture': {
+      suggested_key: { default: 'Ctrl+Shift+S', mac: 'Command+Shift+S' },
+      description: 'Select a region and start OCR capture'
+    },
+    'confirm-region-capture': {
+      suggested_key: { default: 'Ctrl+Shift+Space', mac: 'Command+Shift+Space' },
+      description: 'Confirm selected OCR region'
+    }
+  };
+  assert.deepEqual(value.manifest.commands, expectedCommands);
+  const effective = value.platform.os === 'mac'
+    ? { 'start-region-capture': '⇧⌘S', 'confirm-region-capture': '⇧⌘Space' }
+    : { 'start-region-capture': 'Ctrl+Shift+S', 'confirm-region-capture': 'Ctrl+Shift+Space' };
+  for (const [name, declared] of Object.entries(expectedCommands)) {
+    const rows = value.commands.filter((row) => row.name === name);
+    assert.equal(rows.length, 1, `one registered row for ${name}`);
+    assert.equal(rows[0].description, declared.description);
+    assert.equal(rows[0].shortcut, effective[name], `effective shortcut for ${name}`);
+    assert.ok(rows[0].shortcut.length > 0);
+  }
 
   let targets = await fetch(`${base}/json/list`).then((response) => response.json());
   const worker = await waitFor(
