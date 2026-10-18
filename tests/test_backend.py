@@ -2098,6 +2098,27 @@ def test_connect_error_retries_exactly_twice(monkeypatch: pytest.MonkeyPatch) ->
     assert delays == [1]
 
 
+def test_connect_error_exhausts_after_exactly_two_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every attempt failing pins the ceiling: exactly two calls, one delay."""
+
+    delays = _spy_sleep(monkeypatch)
+    calls: list[int] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        raise httpx.ConnectError("connection refused", request=request)
+
+    result, error = _call_facade(_provider_config(), handler)
+
+    assert result is None
+    assert isinstance(error, main.HTTPException)
+    assert error.status_code == 502
+    assert len(calls) == 2, f"expected exactly two attempts, got {len(calls)}"
+    assert delays == [1], f"expected exactly one retry delay, got {delays}"
+
+
 def test_other_request_errors_are_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
     delays = _spy_sleep(monkeypatch)
     calls: list[int] = []
