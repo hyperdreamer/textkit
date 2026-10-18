@@ -1,0 +1,185 @@
+source_plan:
+  path: docs/superpowers/plans/2026-10-18-upstream-protocol-adapters.md
+  sha256: 062b7070f44ef7c97d51bb96cc2e525cdfbdbb7876087a0e6ab64f794e6bd5cd
+  commit_oid: 9fe5307
+schema_version: 1
+
+lanes:
+  - id: upstream-protocol-sequential
+    task_ids: [T-001, T-002, T-003, T-004, T-005, T-006, T-007, T-008, T-009]
+    owns:
+      - "backend/providers.py"
+      - "backend/main.py"
+      - "backend/config.example.yaml"
+      - "README.md"
+      - "tests/test_providers.py"
+      - "tests/test_backend.py"
+      - "tests/test_prompt_snapshot.py"
+    resources: []
+
+tasks:
+  - id: T-001
+    plan_task: 1
+    title: "Provider module types, URL resolver, and adapters"
+    lane: upstream-protocol-sequential
+    sequence: 1
+    depends_on: []
+    produces: [I-001]
+    consumes: []
+    validation:
+      - ["python", "-m", "pytest", "tests/test_providers.py", "-v"]
+
+  - id: T-002
+    plan_task: 2
+    title: "Chat response normalization preserving legacy semantics"
+    lane: upstream-protocol-sequential
+    sequence: 2
+    depends_on: [T-001]
+    produces: [I-002]
+    consumes: [I-001]
+    validation:
+      - ["python", "-m", "pytest", "tests/test_providers.py", "-v"]
+
+  - id: T-003
+    plan_task: 3
+    title: "Responses and Messages adapters"
+    lane: upstream-protocol-sequential
+    sequence: 3
+    depends_on: [T-002]
+    produces: [I-003]
+    consumes: [I-001, I-002]
+    validation:
+      - ["python", "-m", "pytest", "tests/test_providers.py", "-v"]
+
+  - id: T-004
+    plan_task: 4
+    title: "Config fields, raw-YAML validation, and inheritance"
+    lane: upstream-protocol-sequential
+    sequence: 4
+    depends_on: [T-003]
+    produces: [I-004]
+    consumes: [I-001]
+    validation:
+      - ["python", "-m", "pytest", "tests/test_backend.py", "-v"]
+
+  - id: T-005
+    plan_task: 5
+    title: "Facade wiring, OCR parts, and blank-completion rejection"
+    lane: upstream-protocol-sequential
+    sequence: 5
+    depends_on: [T-004]
+    produces: [I-005]
+    consumes: [I-001, I-002, I-003, I-004]
+    validation:
+      - ["python", "-m", "pytest", "tests/", "-q"]
+
+  - id: T-006
+    plan_task: 6
+    title: "Cache identity and the two URL call sites"
+    lane: upstream-protocol-sequential
+    sequence: 6
+    depends_on: [T-005]
+    produces: [I-006]
+    consumes: [I-001, I-004, I-005]
+    validation:
+      - ["python", "-m", "pytest", "tests/test_backend.py", "tests/test_prompt_snapshot.py", "-v"]
+
+  - id: T-007
+    plan_task: 7
+    title: "Legacy byte-identity goldens"
+    lane: upstream-protocol-sequential
+    sequence: 7
+    depends_on: [T-006]
+    produces: []
+    consumes: [I-005, I-006]
+    validation:
+      - ["python", "-m", "pytest", "tests/", "-q"]
+
+  - id: T-008
+    plan_task: 8
+    title: "Per-protocol request, response, OCR, and truncation tests"
+    lane: upstream-protocol-sequential
+    sequence: 8
+    depends_on: [T-007]
+    produces: []
+    consumes: [I-001, I-002, I-003, I-005]
+    validation:
+      - ["python", "-m", "pytest", "tests/", "-q"]
+
+  - id: T-009
+    plan_task: 9
+    title: "Configuration error paths and documentation"
+    lane: upstream-protocol-sequential
+    sequence: 9
+    depends_on: [T-008]
+    produces: []
+    consumes: [I-004, I-005]
+    validation:
+      - ["python", "-m", "pytest", "tests/", "-v"]
+      - ["node", "tests/background.test.js"]
+      - ["node", "tests/popup.test.js"]
+      - ["node", "tests/content.test.js"]
+
+produces:
+  - id: I-001
+    name: ProviderProtocolSurface
+    signature: "providers = TextPart(text), ImagePart(data_url), ProviderRequest{url,headers,body}, ChatCompletion{text,model,tokens_used,finish_reason=None} frozen in that field order, ProviderProtocolError, ProtocolAdapter.build_request(config, system_prompt, content) and parse_response(payload, configured_model), resolve_endpoint(config)=api_base+(endpoint or '/v1/chat/completions'), select_adapter(config), and ChatCompletionsAdapter/ResponsesAdapter/MessagesAdapter with no constructor arguments."
+    sha256: 0dacb19ba23d10dd63db5c3e5485a617b6c60dd681d947fc67ae52cf455ea795
+    producer: T-001
+  - id: I-002
+    name: ChatLegacyNormalization
+    signature: "ChatCompletionsAdapter.parse_response(payload, configured_model) preserves legacy semantics: strip string content, reject blank/whitespace/null, join text parts with newline, total_tokens-only isinstance(int) usage including bool acceptance, native finish_reason passthrough, and ignores a populated error field. Helpers: _extract_chat_text, _chat_usage_tokens, _chat_finish_reason, _require_mapping, _require_model, _require_non_negative_int."
+    sha256: 4a135f92f5590be623d3d6d8381f1628ccfca9ee0eb3f592bf6b320a80c29803
+    producer: T-002
+  - id: I-003
+    name: ResponsesAndMessagesAdapters
+    signature: "ResponsesAdapter and MessagesAdapter parse_response with error-first rejection, status/stop_reason truncation mapped to finish_reason='length', strict exact-int usage, and allow_empty only for recognized truncation. Renderers: _render_chat_content, _render_responses_input (message-wrapped parts), _render_messages_content (base64 source object), _parse_messages_data_url(data_url)->(media_type,payload)."
+    sha256: b13a1bcb69dddd2753698a3152ac43cdc1f8b211c697e3fa318b08bed708aebe
+    producer: T-003
+  - id: I-004
+    name: EndpointConfiguration
+    signature: "AIConfig.endpoint: Literal['/v1/chat/completions','/v1/responses','/v1/messages'] | None = None; AIConfig.messages_default_max_tokens: int = Field(default=4096, strict=True, gt=0); SUPPORTED_ENDPOINTS tuple; load_config raw-YAML absent-vs-null validation raising RuntimeError 'Unsupported ai.endpoint value: <repr>. Use one of: ...'; _resolve_ai_config carries both fields."
+    sha256: 32a644d6caf587b0f67f2541338a374644cd3dc119489d50306b5f8e0392f464
+    producer: T-004
+  - id: I-005
+    name: ProtocolFacade
+    signature: "main._ChatCompletion is providers.ChatCompletion; main._extract_openai_text and main._extract_finish_reason remain importable wrappers; _request_chat_completion(config, messages, *, idempotency_key=None) keeps its signature and delegates through select_adapter with Idempotency-Key, shared _get_http_client, and _call_with_retry; _call_openai sends TextPart/ImagePart; _post_openai_chat_completion rejects blank text with 502."
+    sha256: ed956334dfb62069dcdc189b9ddc890bcbf69e261d3a2f9fcb42878e0d05e0e9
+    producer: T-005
+  - id: I-006
+    name: ProtocolCacheIdentity
+    signature: "_ResolvedTextSettings.provider_endpoint = resolve_endpoint(effective_ai); _cache_identity adds messages_default_max_tokens only when settings.config.endpoint == '/v1/messages', preserving legacy digest c80b950b5bce10ffac6026037fe4649111381531b1f932892844fc43cab0e1ff."
+    sha256: 265e5726406963e04a13fd10c21e01e6f47284e12a69a1474f65cfb62755d831
+    producer: T-006
+
+consumes:
+  - id: I-001
+    name: ProviderProtocolSurface
+    signature: "providers = TextPart(text), ImagePart(data_url), ProviderRequest{url,headers,body}, ChatCompletion{text,model,tokens_used,finish_reason=None} frozen in that field order, ProviderProtocolError, ProtocolAdapter.build_request(config, system_prompt, content) and parse_response(payload, configured_model), resolve_endpoint(config)=api_base+(endpoint or '/v1/chat/completions'), select_adapter(config), and ChatCompletionsAdapter/ResponsesAdapter/MessagesAdapter with no constructor arguments."
+    sha256: 0dacb19ba23d10dd63db5c3e5485a617b6c60dd681d947fc67ae52cf455ea795
+    producer: T-001
+  - id: I-002
+    name: ChatLegacyNormalization
+    signature: "ChatCompletionsAdapter.parse_response(payload, configured_model) preserves legacy semantics: strip string content, reject blank/whitespace/null, join text parts with newline, total_tokens-only isinstance(int) usage including bool acceptance, native finish_reason passthrough, and ignores a populated error field. Helpers: _extract_chat_text, _chat_usage_tokens, _chat_finish_reason, _require_mapping, _require_model, _require_non_negative_int."
+    sha256: 4a135f92f5590be623d3d6d8381f1628ccfca9ee0eb3f592bf6b320a80c29803
+    producer: T-002
+  - id: I-003
+    name: ResponsesAndMessagesAdapters
+    signature: "ResponsesAdapter and MessagesAdapter parse_response with error-first rejection, status/stop_reason truncation mapped to finish_reason='length', strict exact-int usage, and allow_empty only for recognized truncation. Renderers: _render_chat_content, _render_responses_input (message-wrapped parts), _render_messages_content (base64 source object), _parse_messages_data_url(data_url)->(media_type,payload)."
+    sha256: b13a1bcb69dddd2753698a3152ac43cdc1f8b211c697e3fa318b08bed708aebe
+    producer: T-003
+  - id: I-004
+    name: EndpointConfiguration
+    signature: "AIConfig.endpoint: Literal['/v1/chat/completions','/v1/responses','/v1/messages'] | None = None; AIConfig.messages_default_max_tokens: int = Field(default=4096, strict=True, gt=0); SUPPORTED_ENDPOINTS tuple; load_config raw-YAML absent-vs-null validation raising RuntimeError 'Unsupported ai.endpoint value: <repr>. Use one of: ...'; _resolve_ai_config carries both fields."
+    sha256: 32a644d6caf587b0f67f2541338a374644cd3dc119489d50306b5f8e0392f464
+    producer: T-004
+  - id: I-005
+    name: ProtocolFacade
+    signature: "main._ChatCompletion is providers.ChatCompletion; main._extract_openai_text and main._extract_finish_reason remain importable wrappers; _request_chat_completion(config, messages, *, idempotency_key=None) keeps its signature and delegates through select_adapter with Idempotency-Key, shared _get_http_client, and _call_with_retry; _call_openai sends TextPart/ImagePart; _post_openai_chat_completion rejects blank text with 502."
+    sha256: ed956334dfb62069dcdc189b9ddc890bcbf69e261d3a2f9fcb42878e0d05e0e9
+    producer: T-005
+  - id: I-006
+    name: ProtocolCacheIdentity
+    signature: "_ResolvedTextSettings.provider_endpoint = resolve_endpoint(effective_ai); _cache_identity adds messages_default_max_tokens only when settings.config.endpoint == '/v1/messages', preserving legacy digest c80b950b5bce10ffac6026037fe4649111381531b1f932892844fc43cab0e1ff."
+    sha256: 265e5726406963e04a13fd10c21e01e6f47284e12a69a1474f65cfb62755d831
+    producer: T-006

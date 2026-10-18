@@ -1,0 +1,26 @@
+digraph execution {
+  rankdir=LR;
+  node [shape=box, style=rounded];
+
+  subgraph cluster_upstream_protocol_sequential {
+    label="upstream-protocol-sequential";
+    "T-001" [label="Task 1: Provider module types, URL resolver, and adapters\nAdvanced\nproduces I-001"];
+    "T-002" [label="Task 2: Chat response normalization preserving legacy semantics\nAdvanced\ndepends T-001, produces I-002"];
+    "T-003" [label="Task 3: Responses and Messages adapters\nAdvanced\ndepends T-002, produces I-003"];
+    "T-004" [label="Task 4: Config fields, raw-YAML validation, and inheritance\nAdvanced\ndepends T-003, produces I-004"];
+    "T-005" [label="Task 5: Facade wiring, OCR parts, and blank-completion rejection\nAdvanced\ndepends T-004, produces I-005"];
+    "T-006" [label="Task 6: Cache identity and the two URL call sites\nStandard\ndepends T-005, produces I-006"];
+    "T-007" [label="Task 7: Legacy byte-identity goldens\nAdvanced\ndepends T-006, consumes I-005/I-006"];
+    "T-008" [label="Task 8: Per-protocol request, response, OCR, and truncation tests\nAdvanced\ndepends T-007, verifies I-001..I-005"];
+    "T-009" [label="Task 9: Configuration error paths and documentation\nStandard\ndepends T-008, verifies full gate"];
+  }
+
+  "T-001" -> "T-002";
+  "T-002" -> "T-003";
+  "T-003" -> "T-004";
+  "T-004" -> "T-005";
+  "T-005" -> "T-006";
+  "T-006" -> "T-007";
+  "T-007" -> "T-008";
+  "T-008" -> "T-009";
+}

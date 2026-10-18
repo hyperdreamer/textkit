@@ -2,7 +2,7 @@
 
 TextKit is a text capture and processing tool for reading long web pages through a browser extension and an AI-backed FastAPI service. The Chromium Manifest V3 extension lets you select a fixed region of the current page, capture that region page-by-page while scrolling, merge overlapping OCR fragments, optionally translate or format the result, and copy, download, or save the final text.
 
-The backend is provider-neutral: it calls OpenAI-compatible chat completion APIs, configured through `backend/config.yaml`.
+The backend is provider-neutral: it calls an upstream AI protocol configured through `backend/config.yaml` — OpenAI Chat Completions by default, or OpenAI Responses or Anthropic Messages when selected.
 
 ## Architecture
 
@@ -261,6 +261,10 @@ ai:
   api_key: "$OCR_API_KEY"
   model: "gpt-4.1-mini"
 
+  # Optional protocol selection; omit for legacy Chat Completions.
+  # endpoint: "/v1/chat/completions"  # or "/v1/responses" / "/v1/messages"
+  # messages_default_max_tokens: 4096  # Anthropic Messages only
+
   # Optional per-task overrides:
   # ocr:
   #   model: "gpt-4.1"
@@ -275,11 +279,26 @@ cache:
 
 Supported `ai` fields:
 
-- `api_base`: base provider URL without a trailing slash. Must expose `/v1/chat/completions`. HTTP is accepted for any host, but non-loopback HTTP is unencrypted and the backend logs a startup warning; prefer HTTPS.
+- `api_base`: base provider URL without a trailing slash; trailing slashes are removed before the endpoint is appended. Omitting `api_base` defaults to `https://api.openai.com` in both legacy and explicit modes. The protocol path is appended to this base in both modes, so gateway path prefixes such as `https://gateway.example.com/openai` survive. HTTP is accepted for any host, but non-loopback HTTP is unencrypted and the backend logs a startup warning; prefer HTTPS.
+- `endpoint` (optional): upstream protocol. Omitting it keeps the legacy behaviour — the backend appends `/v1/chat/completions` verbatim to the validated `api_base`, with no standalone `/v1` auto-append and no path normalization, so a base that already ends in `/v1` produces a doubled `/v1/v1` segment exactly as before. An explicit value selects one of exactly three protocols:
+  - `/v1/chat/completions` — OpenAI Chat Completions
+  - `/v1/responses` — OpenAI Responses
+  - `/v1/messages` — Anthropic Messages
+
+  The explicit endpoint is appended to `api_base` after trailing slashes are removed. Any other value — `null`, a non-string, an alias such as `chat/completions`, or a full URL — is a configuration error: startup refuses to run, and an invalid edit to a running backend fails the next request with the usual structured 500 envelope instead of calling the provider.
+
+  Auth follows the protocol: both OpenAI protocols send `Authorization: Bearer <key>`, while Messages sends `x-api-key: <key>` plus `anthropic-version: 2023-06-01`.
+
+  `endpoint` is a base `ai` field only; `ai.ocr` and `ai.text` cannot override it.
+- `messages_default_max_tokens` (default `4096`): token cap used only by Anthropic Messages, and only when no positive effective `max_tokens` exists. It must be a strict positive integer; Booleans, numeric strings, fractions, and `null` are rejected. OpenAI protocols ignore it.
 - `api_key`: the API key. Plaintext values are used directly. Prefix with `$` to treat the value as an environment variable name (e.g. `$OCR_API_KEY`). `api_key_env` is also accepted.
 - `model`: the model name to send to the provider. Fallback model used for all operations unless per-task overrides are set.
-- `ocr` (optional): nested section to override model/endpoint for vision (OCR) requests. Fields: `api_base`, `api_key`, `model`. Empty fields inherit from the parent `ai` section.
-- `text` (optional): nested section to override model/endpoint for text processing (dedup, translation, and format). Same fields as `ocr`.
+- `ocr` (optional): nested section to override model/base URL/key for vision (OCR) requests. Fields: `api_base`, `api_key`, `model`. Empty fields inherit from the parent `ai` section.
+- `text` (optional): nested section to override model/base URL/key for text processing (dedup, translation, and format). Same fields as `ocr`.
+
+Per-task overrides inherit everything they leave empty but cannot change the protocol: `ai.endpoint` is read from the base `ai` section only.
+
+The Chrome extension and every local route contract are unchanged by protocol selection: no request or response shape, header, cache header, or prompt precedence changes, and the configuration error paths use the existing error envelope.
 
 Supported `cache` fields:
 
