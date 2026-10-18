@@ -30,6 +30,11 @@
       sendResponse({ ok: true });
       return false;
     }
+    if (message?.type === 'selection:confirm') {
+      confirmSelection();
+      sendResponse({ ok: true });
+      return false;
+    }
     if (message?.type === 'selection:cancel') {
       removeOverlay();
       sendResponse({ ok: true });
