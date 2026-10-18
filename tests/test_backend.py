@@ -723,17 +723,40 @@ def test_load_config_accepts_each_supported_endpoint(
     assert main.load_config().ai.endpoint == endpoint
 
 
+def test_load_config_omitted_endpoint_selects_legacy_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "ai:\n"
+        '  api_base: "https://example.invalid"\n'
+        '  api_key: "test-key"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "_config_cache", None)
+
+    config = main.load_config()
+
+    assert config.ai is not None
+    assert config.ai.endpoint is None
+    assert config.ai.messages_default_max_tokens == 4096
+
+
 @pytest.mark.parametrize(
-    ("raw", "expected"),
+    ("raw", "expected_repr"),
     [
-        ("null", "Unsupported ai.endpoint value: None."),
-        ("/chat/completions", "Unsupported ai.endpoint value: '/chat/completions'."),
-        ("https://api.openai.com/v1/messages", "Unsupported ai.endpoint value:"),
-        ("123", "Unsupported ai.endpoint value: 123."),
+        ("null", "None"),
+        ("123", "123"),
+        ("true", "True"),
+        ("'chat/completions'", "'chat/completions'"),
+        ("'/responses'", "'/responses'"),
+        ("'https://api.openai.com/v1/messages'", "'https://api.openai.com/v1/messages'"),
+        ("'/v1/chat/completion'", "'/v1/chat/completion'"),
     ],
 )
-def test_load_config_rejects_present_invalid_endpoint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str, expected: str
+def test_load_config_rejects_invalid_endpoint_with_exact_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str, expected_repr: str
 ) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
@@ -745,8 +768,67 @@ def test_load_config_rejects_present_invalid_endpoint(
     )
     monkeypatch.setattr(main, "CONFIG_PATH", config_path)
     monkeypatch.setattr(main, "_config_cache", None)
-    with pytest.raises(RuntimeError, match=expected):
+
+    with pytest.raises(RuntimeError) as exc_info:
         main.load_config()
+
+    assert str(exc_info.value) == (
+        f"Unsupported ai.endpoint value: {expected_repr}. "
+        "Use one of: /v1/chat/completions, /v1/messages, /v1/responses"
+    )
+
+
+def test_rejected_endpoint_does_not_populate_config_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "ai:\n"
+        '  api_base: "https://example.invalid"\n'
+        '  api_key: "test-key"\n'
+        '  endpoint: "/nope"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "_config_cache", None)
+
+    with pytest.raises(RuntimeError):
+        main.load_config()
+
+    assert main._config_cache is None
+
+
+def test_valid_config_loads_after_a_rejected_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "ai:\n"
+        '  api_base: "https://example.invalid"\n'
+        '  api_key: "test-key"\n'
+        '  endpoint: "/nope"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(main, "_config_cache", None)
+
+    with pytest.raises(RuntimeError):
+        main.load_config()
+
+    config_path.write_text(
+        "ai:\n"
+        '  api_base: "https://example.invalid"\n'
+        '  api_key: "test-key"\n'
+        '  endpoint: "/v1/messages"\n'
+        "  messages_default_max_tokens: 2048\n",
+        encoding="utf-8",
+    )
+
+    config = main.load_config()
+
+    assert config.ai is not None
+    assert config.ai.endpoint == "/v1/messages"
+    assert config.ai.messages_default_max_tokens == 2048
 
 
 def test_resolve_ai_config_carries_endpoint_and_messages_default() -> None:
