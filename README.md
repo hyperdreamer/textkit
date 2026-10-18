@@ -15,8 +15,8 @@ Typical flow:
 
 1. Start the backend locally.
 2. Load the extension in Chrome or another Chromium browser.
-3. Press `Ctrl+Shift+S` or click `Select Region` in the popup.
-4. Draw or adjust the capture region and press `Ctrl+Space`.
+3. Press `Ctrl+Shift+S` (`Command+Shift+S` on macOS) or click `Select Region` in the popup.
+4. Draw or adjust the capture region, or use its restored saved rectangle, then press the configured confirmation shortcut: `Ctrl+Shift+Space` by default, or `Command+Shift+Space` on macOS.
 5. The extension captures the selected region, sends each page image to `POST /ocr`, merges fragments, sends merged text to `POST /dedup`, optionally sends the result to `POST /translate`, optionally formats the configured OCR or Translation source via `POST /format`, and stores the results per tab.
 
 The popup has four tabs:
@@ -330,7 +330,7 @@ The extension lives in `extension/` and uses Manifest V3.
 
 Main files:
 
-- `manifest.json`: extension metadata, permissions, host access, and keyboard command. The page content script and overlay CSS are injected on demand with `chrome.scripting`.
+- `manifest.json`: extension metadata, permissions, host access, and independent native keyboard commands for selection start and confirmation. The page content script and overlay CSS are injected on demand with `chrome.scripting`.
 - `popup.html` and `popup.js`: popup UI with four tabs (OCR, Translation, Format, Prompts) for status, backend settings, language selection, custom prompts, and output actions.
 - `background.js`: capture orchestration, backend calls, fragment merging, retry state, and persistence.
 - `content.js`: selection overlay, saved-region editing, viewport reporting, and page scrolling.
@@ -349,14 +349,29 @@ Backend and file-bridge host/port are stored in Chrome sync storage. The file-br
 
 ### Capture controls
 
-- Press `Ctrl+Shift+S` to open the region selection overlay. On macOS, the manifest suggests `Command+Shift+S`.
+- Press `Ctrl+Shift+S` to open the region selection overlay. On macOS, the suggested default is `Command+Shift+S`.
 - Click `Select Region` in the popup to start the same selection flow.
 - Drag on the page to draw the region.
-- If a region was previously saved, it is pre-drawn when selection starts.
+- If a region was previously saved, it is pre-drawn when selection starts; you can confirm it without drawing or adjusting it first.
 - The saved region has 8 resize handles: corners, edges, and side midpoints.
 - Drag inside the saved region to reposition it.
-- Press `Ctrl+Space` to confirm the selected region.
-- Press `Esc` to cancel selection.
+- Press the configured **Confirm selected OCR region** shortcut to confirm: the suggested default is `Ctrl+Shift+Space`, or `Command+Shift+Space` on macOS. The overlay shows the binding Chrome reports.
+- Press `Esc` to cancel selection before confirmation is pending.
+
+Ctrl+Space no longer confirms an OCR region. Space interception for scroll lock during active capture is unchanged.
+
+### Configure keyboard shortcuts
+
+1. Open `chrome://extensions/shortcuts`.
+2. Locate TextKit.
+3. Edit **Confirm selected OCR region** independently of **Select a region and start OCR capture**.
+4. Choose a Chrome-supported binding, such as `Alt+Shift+O`, and reopen selection to refresh the hint.
+
+Chrome owns shortcut editing, persistence, conflicts, clearing, and scope. Selection start and confirmation have separate rows. The overlay reads the confirmation binding once when it opens and does not automatically refresh while that overlay remains open; a Chrome reassignment can take effect immediately, so reopen selection to refresh the hint.
+
+A **not set** hint means the confirmation shortcut was cleared; assign it on the shortcuts page, then reopen selection. An **unavailable** hint means the binding lookup failed, so the shortcut may still be assigned and able to dispatch. There is no popup confirmation fallback.
+
+Confirmation acts on the overlay present in the resolved tab when the message arrives. A delayed command can confirm a selection opened or adjusted after the keypress, including a newly started selection in a replacement document. Delivery into a document without an overlay creates no selection. The service-worker hop has no guaranteed wall-clock deadline.
 
 ### Auto-scroll and page capture
 

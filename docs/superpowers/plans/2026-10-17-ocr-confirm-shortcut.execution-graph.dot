@@ -1,0 +1,25 @@
+digraph ocr_confirm_shortcut {
+  rankdir=TB;
+  node [shape=box, fontsize=10];
+  label="ocr-confirm-shortcut — 8 tasks, 1 sequential lane\nsource plan 6f326aa671c8e60d";
+  labelloc=t;
+  subgraph cluster_implementation {
+    label="lane: implementation (sequential)";
+    style=dashed;
+    T1 [label="T1. Declare the native confirmation command and verify Chromium registration\ntier: economy"];
+    T2 [label="T2. Route confirmation commands independently of worker readiness\ntier: standard"];
+    T3 [label="T3. Reply to binding lookups exactly once on every completed path\ntier: economy"];
+    T4 [label="T4. Add synchronous content confirmation and preserve admission guards\ntier: standard"];
+    T5 [label="T5. Remove page Ctrl+Space confirmation while retaining both key guards\ntier: economy"];
+    T6 [label="T6. Render binding hints with overlay ownership and diagnostic precedence\ntier: advanced"];
+    T7 [label="T7. Record the pinned oracle and prove delivery-time/admission semantics\ntier: advanced"];
+    T8 [label="T8. Document native shortcut setup and complete acceptance evidence\ntier: standard"];
+  T1 -> T2;
+  T2 -> T3;
+  T3 -> T4;
+  T4 -> T5;
+  T5 -> T6;
+  T6 -> T7;
+  T7 -> T8;
+  }
+}

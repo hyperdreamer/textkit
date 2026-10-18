@@ -6,6 +6,7 @@
   let overlayRoot = null;
   let selection = null;
   let hint = null;
+  let hintPresentation = null;
   let handles = [];
   let dragMode = null; // 'new' | 'move' | 'resize-nw' | 'resize-ne' | ...
   let dragStart = null;
@@ -27,6 +28,11 @@
         return false;
       }
       startSelectionMode(message.lastRegion || null, message.selectionToken);
+      sendResponse({ ok: true });
+      return false;
+    }
+    if (message?.type === 'selection:confirm') {
+      confirmSelection();
       sendResponse({ ok: true });
       return false;
     }
@@ -101,7 +107,8 @@
     .textkit-hint { position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
       padding: 8px 12px; border-radius: 6px; background: rgba(17, 24, 39, .94);
       color: #fff; font: 13px/1.4 system-ui, sans-serif; pointer-events: none;
-      white-space: nowrap; }
+      max-width: calc(100vw - 32px);
+      overflow-wrap: anywhere; }
   `;
 
   function startSelectionMode(saved, token) {
@@ -129,18 +136,18 @@
     hint = overlayRoot.querySelector('.textkit-hint');
 
     // Pre-draw saved region if available
-    if (saved && saved.width >= MIN_SIZE && saved.height >= MIN_SIZE) {
+    const restored = saved && saved.width >= MIN_SIZE && saved.height >= MIN_SIZE;
+    if (restored) {
       region = {
         x: clamp(saved.x, 0, Math.max(0, window.innerWidth - MIN_SIZE)),
         y: clamp(saved.y, 0, Math.max(0, window.innerHeight - MIN_SIZE)),
         width: clamp(saved.width, MIN_SIZE, Math.max(MIN_SIZE, window.innerWidth - clamp(saved.x, 0, window.innerWidth))),
         height: clamp(saved.height, MIN_SIZE, Math.max(MIN_SIZE, window.innerHeight - clamp(saved.y, 0, window.innerHeight)))
       };
-      hint.textContent = 'Drag to adjust. Ctrl+Space to confirm. Esc to cancel.';
     } else {
       region = { x: 0, y: 0, width: 0, height: 0 };
-      hint.textContent = 'Drag to select OCR region. Ctrl+Space to confirm. Esc to cancel.';
     }
+    initializeHint(overlay, hint, restored ? 'Drag to adjust.' : 'Drag to select OCR region.');
 
     drawRegion();
 
@@ -148,6 +155,65 @@
     overlay.addEventListener('pointermove', onPointerMove);
     overlay.addEventListener('pointerup', onPointerUp);
     window.addEventListener('keydown', onKeyDown, true);
+  }
+
+  function paintBindingHint(p) {
+    if (p.owner !== overlay || hintPresentation !== p || p.diagnostic !== null) return;
+    let clause;
+    if (p.binding.state === 'assigned') {
+      clause = `${p.binding.label} to confirm.`;
+    } else if (p.binding.state === 'unassigned') {
+      clause = 'Confirmation shortcut not set; set “Confirm selected OCR region” at chrome://extensions/shortcuts.';
+    } else if (p.binding.state === 'unavailable') {
+      clause = 'Confirmation shortcut unavailable; check “Confirm selected OCR region” at chrome://extensions/shortcuts.';
+    } else {
+      clause = 'Confirmation shortcut checking… Set it at chrome://extensions/shortcuts.';
+    }
+    if (p.owner !== overlay || hintPresentation !== p || p.diagnostic !== null) return;
+    p.node.textContent = `${p.prefix} ${clause} Esc to cancel.`;
+  }
+
+  function receiveBinding(p, reply) {
+    if (p.owner !== overlay || hintPresentation !== p) return;
+    if (reply?.state === 'assigned' && typeof reply.label === 'string' && reply.label.length > 0) {
+      p.binding = { state: 'assigned', label: reply.label };
+    } else if (reply?.state === 'unassigned') {
+      p.binding = { state: 'unassigned' };
+    } else {
+      p.binding = { state: 'unavailable' };
+    }
+    if (p.diagnostic !== null) return;
+    paintBindingHint(p);
+  }
+
+  function initializeHint(owner, node, prefix) {
+    const p = { owner, node, prefix, binding: { state: 'checking' }, diagnostic: null };
+    hintPresentation = p;
+    paintBindingHint(p);
+    try {
+      chrome.runtime.sendMessage({ type: 'commands:binding' })
+        .then((reply) => receiveBinding(p, reply))
+        .catch(() => receiveBinding(p, { state: 'unavailable' }));
+    } catch {
+      receiveBinding(p, { state: 'unavailable' });
+    }
+  }
+
+  function showHintDiagnostic(text) {
+    const p = hintPresentation;
+    if (!p || p.owner !== overlay) return;
+    p.diagnostic = text;
+    if (p.owner !== overlay || hintPresentation !== p || p.diagnostic !== text) return;
+    p.node.textContent = text;
+  }
+
+  function clearHintDiagnosticAfterChange(before) {
+    const p = hintPresentation;
+    if (!p || p.owner !== overlay || p.diagnostic === null || !region) return;
+    if (['x', 'y', 'width', 'height'].some((key) => before[key] !== region[key])) {
+      p.diagnostic = null;
+      paintBindingHint(p);
+    }
   }
 
   function getHandleAt(ex, ey) {
@@ -178,6 +244,7 @@
 
   function onPointerDown(event) {
     if (!overlay || event.isTrusted !== true || confirmPending) return;
+    const before = { ...region };
     overlay.setPointerCapture(event.pointerId);
     const ex = clamp(event.clientX, 0, window.innerWidth);
     const ey = clamp(event.clientY, 0, window.innerHeight);
@@ -199,11 +266,13 @@
       se: 'se-resize', s: 's-resize', sw: 'sw-resize', w: 'w-resize'
     };
     overlay.style.cursor = CURSOR_MAP[dragMode] || '';
+    clearHintDiagnosticAfterChange(before);
     drawRegion();
   }
 
   function onPointerMove(event) {
     if (event.isTrusted !== true || !dragMode || !dragStart) return;
+    const before = { ...region };
     const ex = clamp(event.clientX, 0, window.innerWidth);
     const ey = clamp(event.clientY, 0, window.innerHeight);
     const dx = ex - dragStart.ex;
@@ -255,6 +324,7 @@
           region.width = dragStart.rx + dragStart.rw - region.x;
           break;
       }
+    clearHintDiagnosticAfterChange(before);
     drawRegion();
   }
 
@@ -296,7 +366,7 @@
           confirmPending = false;
           if (!overlay) return;
           overlay.style.display = '';
-          if (hint) hint.textContent = `${error.message} Adjust the region and try again.`;
+          if (hint) showHintDiagnostic(`${error.message} Adjust the region and try again.`);
         });
       });
     });
@@ -308,10 +378,6 @@
       const cancelledToken = selectionToken;
       removeOverlay();
       chrome.runtime.sendMessage({ type: 'selection:cancelled', selectionToken: cancelledToken }).catch(() => {});
-    }
-    if (event.key === ' ' && event.ctrlKey) {
-      event.preventDefault();
-      confirmSelection();
     }
   }
 
@@ -354,6 +420,7 @@
     overlayRoot = null;
     selection = null;
     hint = null;
+    hintPresentation = null;
     handles = [];
     dragMode = null;
     dragStart = null;
