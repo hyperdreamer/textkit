@@ -1076,6 +1076,73 @@ def test_facade_reports_malformed_protocol_response_as_bad_gateway(
     )
 
 
+_MALFORMED_DATA_URL_DETAIL = (
+    "Unsupported image data URL: expected data:<media type>;base64,<payload>"
+)
+
+
+def test_facade_maps_request_construction_failure_to_bad_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested: list[str] = []
+
+    async def forbid_http_client() -> None:
+        requested.append("http client")
+        raise AssertionError("no network request should be attempted")
+
+    monkeypatch.setattr(main, "_get_http_client", forbid_http_client)
+
+    with pytest.raises(main.HTTPException) as exc_info:
+        asyncio.run(
+            main._request_chat_completion(
+                _provider_config(endpoint="/v1/messages"),
+                [
+                    {
+                        "role": "user",
+                        "content": [main.TextPart("prompt"), main.ImagePart("not-a-data-url")],
+                    }
+                ],
+            )
+        )
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail == _MALFORMED_DATA_URL_DETAIL
+    assert requested == []
+
+
+def test_ocr_maps_request_construction_failure_to_bad_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _app_config().model_copy(
+        update={"ai": _provider_config(endpoint="/v1/messages")}
+    )
+    monkeypatch.setattr(main, "load_config", lambda: config)
+    monkeypatch.setattr(
+        main, "_image_to_data_url", lambda *_args, **_kwargs: "not-a-data-url"
+    )
+    requested: list[str] = []
+
+    async def forbid_http_client() -> None:
+        requested.append("http client")
+        raise AssertionError("no network request should be attempted")
+
+    monkeypatch.setattr(main, "_get_http_client", forbid_http_client)
+
+    client = TestClient(main.app, raise_server_exceptions=False)
+    response = client.post(
+        "/ocr", files={"image": ("page.png", _png_bytes(), "image/png")}
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "text": "",
+        "model": "",
+        "tokens_used": 0,
+        "error": _MALFORMED_DATA_URL_DETAIL,
+    }
+    assert requested == []
+
+
 def test_ocr_sends_provider_neutral_parts_for_each_protocol(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

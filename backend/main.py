@@ -727,9 +727,12 @@ async def _request_chat_completion(
         system_prompt = messages[0].get("content")
     resolved = config.model_copy(update={"api_key": api_key})
     adapter = select_adapter(resolved)
-    request = adapter.build_request(
-        config=resolved, system_prompt=system_prompt, content=content
-    )
+    try:
+        request = adapter.build_request(
+            config=resolved, system_prompt=system_prompt, content=content
+        )
+    except ProviderProtocolError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     operation_id = _operation_id.get() if idempotency_key is None else idempotency_key
     if operation_id:
         request["headers"]["Idempotency-Key"] = operation_id
