@@ -479,11 +479,10 @@ test('selection confirmation uses double-requestAnimationFrame before sending', 
   assert.equal(h.completions().length, 0);
   assert.equal(h.frames.length, 1);
   await h.finish();
-  assert.deepEqual(h.completions(), [{
-    type: 'selection:complete',
-    region: { ...SELECTION_R, viewportWidth: 1200, viewportHeight: 800, devicePixelRatio: 1 },
-    selectionToken: 'confirm-token'
-  }]);
+  const fixture = JSON.parse(fs.readFileSync(
+    path.join(ROOT, 'tests', 'fixtures', 'selection-complete-baseline.json'), 'utf8'
+  ));
+  assert.deepEqual(h.completions(), [fixture]);
   assert.equal(owner.removed, true);
 });
 
@@ -980,4 +979,117 @@ test('C36 injected closed-root and external hint styles both allow wrapping', ()
     assert.match(rule, /overflow-wrap:\s*anywhere;/);
     assert.doesNotMatch(rule, /white-space:\s*nowrap/);
   }
+});
+
+const DELIVERY_B = { x: 30, y: 40, width: 80, height: 60 };
+function heldConfirm(receiver) {
+  const message = { type: 'selection:confirm' };
+  return () => {
+    const h = receiver();
+    assert.deepEqual(h.deliver(message), { returns: [false], responses: [{ ok: true }] });
+    return h;
+  };
+}
+function expectedCompletion(region, token, viewportWidth = 1200, viewportHeight = 800, devicePixelRatio = 1) {
+  return {
+    type: 'selection:complete',
+    region: { ...region, viewportWidth, viewportHeight, devicePixelRatio },
+    selectionToken: token
+  };
+}
+
+test('C28 held confirm with live A uses unchanged A region token and viewport', async () => {
+  const h = selectionHarness();
+  h.start(SELECTION_R, 'A');
+  const deliver = heldConfirm(() => h);
+  assert.deepEqual(h.completions(), []);
+  deliver();
+  await h.finish();
+  assert.deepEqual(h.completions(), [expectedCompletion(SELECTION_R, 'A')]);
+});
+
+test('C29 same-document A replacement confirms only current B', async () => {
+  const h = selectionHarness();
+  h.start(SELECTION_R, 'A');
+  const a = h.current;
+  const deliver = heldConfirm(() => h);
+  h.deliver({ type: 'selection:cancel' });
+  h.start(DELIVERY_B, 'B');
+  deliver();
+  await h.finish();
+  assert.equal(a.removed, true);
+  assert.equal(h.overlays.length, 2);
+  assert.deepEqual(h.completions(), [expectedCompletion(DELIVERY_B, 'B')]);
+});
+
+test('C30 press with no overlay may confirm one started before delivery', async () => {
+  const h = selectionHarness();
+  const deliver = heldConfirm(() => h);
+  assert.equal(h.overlays.length, 0);
+  h.start(DELIVERY_B, 'B');
+  deliver();
+  await h.finish();
+  assert.deepEqual(h.completions(), [expectedCompletion(DELIVERY_B, 'B')]);
+});
+
+test('C31 replacement top document without overlay creates and confirms nothing', () => {
+  let topDocument = selectionHarness();
+  const oldDocument = topDocument;
+  oldDocument.start(SELECTION_R, 'old-doc');
+  const deliver = heldConfirm(() => topDocument);
+  topDocument = selectionHarness();
+  deliver();
+  assert.equal(topDocument.overlays.length, 0);
+  assert.equal(topDocument.frames.length, 0);
+  assert.deepEqual(topDocument.completions(), []);
+  assert.deepEqual(oldDocument.completions(), []);
+});
+
+test('C32 replacement top document with a started overlay confirms its new token', async () => {
+  let topDocument = selectionHarness();
+  const oldDocument = topDocument;
+  oldDocument.start(SELECTION_R, 'old-doc');
+  const deliver = heldConfirm(() => topDocument);
+  topDocument = selectionHarness();
+  topDocument.start(DELIVERY_B, 'new-doc');
+  deliver();
+  await topDocument.finish();
+  assert.deepEqual(topDocument.completions(), [expectedCompletion(DELIVERY_B, 'new-doc')]);
+  assert.deepEqual(oldDocument.completions(), []);
+});
+
+test('C33 pre-delivery adjustment uses delivery-time rectangle viewport and DPR', async () => {
+  const h = selectionHarness();
+  h.start(SELECTION_R, 'A');
+  const deliver = heldConfirm(() => h);
+  h.pointer('pointerdown', 150, 150);
+  h.pointer('pointermove', 170, 180);
+  h.pointer('pointerup', 170, 180);
+  h.window.innerWidth = 1000;
+  h.window.innerHeight = 700;
+  h.window.devicePixelRatio = 2;
+  deliver();
+  await h.finish();
+  assert.deepEqual(h.completions(), [expectedCompletion(
+    { x: 120, y: 130, width: 200, height: 150 }, 'A', 1000, 700, 2
+  )]);
+});
+
+test('C34 restored region confirms before any pointer event and equals fixture', async () => {
+  const h = selectionHarness();
+  h.start(SELECTION_R);
+  assert.equal(h.current.selection.style.left, '100px');
+  assert.equal(h.current.selection.style.top, '100px');
+  assert.equal(h.current.selection.style.width, '200px');
+  assert.equal(h.current.selection.style.height, '150px');
+  assert.equal(h.pointerEvents, 0);
+  assert.equal(h.current.captures, 0);
+  assertConfirmReply(h);
+  await h.finish();
+  const fixture = JSON.parse(fs.readFileSync(
+    path.join(ROOT, 'tests', 'fixtures', 'selection-complete-baseline.json'), 'utf8'
+  ));
+  assert.equal(h.pointerEvents, 0);
+  assert.equal(h.current.captures, 0);
+  assert.deepEqual(h.completions(), [fixture]);
 });
