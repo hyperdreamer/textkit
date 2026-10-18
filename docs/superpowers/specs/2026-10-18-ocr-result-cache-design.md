@@ -212,10 +212,10 @@ Keys are namespaced and never collide with per-tab keys:
 - Pruning reads `ocrCacheIndex` and the records it names, never all of
   `chrome.storage.local`. `recoverPersistedOperations` already performs a `get(null)`
   at startup and must not gain megabyte-scale text scanning.
-- Index and records are reconciled on write: an index row whose record is missing is
-  dropped, and a record is always written before its index row so an interrupted
-  write leaves an orphan record (harmless, pruned later) rather than an index entry
-  pointing at nothing.
+- Index and records are reconciled on write: an index row whose record is missing or malformed
+  is dropped, and a record is always written before its index row, so an interrupted
+  write leaves a record that a later read re-indexes instead of an index row pointing at
+  nothing.
 - On a hit, `lastUsedAt` is bumped in the record and the index in one `set` call.
   A failed bump is ignored; it only degrades eviction order.
 - No `unlimitedStorage` permission is added.
