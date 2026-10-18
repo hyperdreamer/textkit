@@ -314,10 +314,6 @@
       removeOverlay();
       chrome.runtime.sendMessage({ type: 'selection:cancelled', selectionToken: cancelledToken }).catch(() => {});
     }
-    if (event.key === ' ' && event.ctrlKey) {
-      event.preventDefault();
-      confirmSelection();
-    }
   }
 
   function drawRegion() {

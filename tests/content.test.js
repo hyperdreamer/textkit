@@ -713,3 +713,21 @@ test('C35 rejected completion restores diagnostic without resend and permits lat
   assert.equal(h.completions().length, 2);
   assert.equal(h.current.removed, true);
 });
+
+test('C07 page Ctrl+Space and Ctrl+Shift+Space no longer confirm OCR', async () => {
+  const h = selectionHarness();
+  h.start();
+  h.draw();
+  for (const shiftKey of [false, true]) {
+    assert.equal(h.key({ key: ' ', ctrlKey: true, shiftKey }), false,
+      'C07 selection handler must leave the former confirmation key unhandled');
+    assert.equal(h.frames.length, 0);
+    assert.deepEqual(h.completions(), []);
+    assert.equal(h.current.removed, false);
+    assert.equal(h.current.style.display, '');
+  }
+  assertConfirmReply(h);
+  await h.finish();
+  assert.equal(h.completions().length, 1);
+  assert.equal(h.current.removed, true);
+});
