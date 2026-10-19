@@ -2145,9 +2145,15 @@ test('W15 manifest declares two commands without changing other metadata', () =>
   }, 'W15 requires both exact commands');
   delete current.commands;
   delete pinned.commands;
+  // The version field is defined to change on every release, so it is excluded
+  // from the comparison; every other byte of manifest metadata stays pinned.
+  delete current.version;
+  delete pinned.version;
   assert.deepEqual(current, pinned);
-  assert.equal(currentText.slice(0, currentText.indexOf('  "commands":')),
-    pinnedText.slice(0, pinnedText.indexOf('  "commands":')));
+  const maskVersion = (text) =>
+    text.replace(/^(\s*)"version": "[^"]*",$/m, '$1"version": "<version>",');
+  assert.equal(maskVersion(currentText.slice(0, currentText.indexOf('  "commands":'))),
+    maskVersion(pinnedText.slice(0, pinnedText.indexOf('  "commands":'))));
 });
 
 function plain(value) {
