@@ -34,9 +34,39 @@ max_concurrent_requests: 4
 
 # AI API settings — uses an OpenAI-compatible chat completions API.
 ai:
-  # Base URL for the provider API, without a trailing slash.
-  # OpenAI-compatible providers must expose /v1/chat/completions.
+  # Base URL for the provider API, without a trailing slash; trailing slashes are
+  # removed before the protocol path is appended. Omitting it defaults to
+  # https://api.openai.com in both legacy and explicit modes.
   api_base: "https://api.openai.com"
+
+  # Upstream protocol selection (optional).
+  #
+  # Omit this key to keep the legacy behaviour: the backend appends
+  # /v1/chat/completions verbatim to the validated api_base. There is no
+  # standalone "/v1" auto-append and no path normalization, so a base that
+  # already ends in /v1 produces a doubled /v1/v1 segment exactly as before.
+  #
+  # Accepted values are exactly these three strings:
+  #   /v1/chat/completions  OpenAI Chat Completions
+  #   /v1/responses         OpenAI Responses
+  #   /v1/messages          Anthropic Messages
+  #
+  # Any other value — null, a non-string, an alias such as "chat/completions",
+  # or a full URL — is a configuration error: startup refuses to run, and an
+  # invalid edit to a running backend fails the next request with the usual
+  # structured 500 envelope instead of calling the provider.
+  #
+  # Authentication follows the protocol: both OpenAI protocols send
+  # Authorization: Bearer <key>, while Messages sends x-api-key plus
+  # anthropic-version: 2023-06-01.
+  #
+  # This is a base "ai" field only; ai.ocr and ai.text cannot override it.
+  # endpoint: "/v1/chat/completions"
+
+  # Mandatory-token fallback for the Anthropic Messages protocol only. Messages
+  # requires max_tokens on every request, so this value is used when no positive
+  # ai.max_tokens or per-task max_tokens applies. Strict positive integer.
+  # messages_default_max_tokens: 4096
 
   # API key for the provider. Plaintext values are used directly.
   # Prefix with ``$`` to treat the value as an environment variable name
